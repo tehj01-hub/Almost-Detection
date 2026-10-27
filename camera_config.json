@@ -1,0 +1,16 @@
+{
+    "entrance": {
+        "name": "Entrance Cam",
+        "source": "rtsp://Jhetlogs:123456789ten@192.168.1.401:554/stream2",
+        "direction": "IN",
+        "flip_180": false,
+        "zoom_factor": 1.35
+    },
+    "exit": {
+        "name": "Exit Cam",
+        "source": "rtsp://Jhetlogs:123456789ten@192.168.1.40:554/stream2",
+        "direction": "OUT",
+        "flip_180": false,
+        "zoom_factor": 1.35
+    }
+}

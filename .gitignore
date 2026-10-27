@@ -1,0 +1,19 @@
+# Zip files
+*.zip
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Environment
+.env
+venv/
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# IDE
+.vscode/
+openai_config.json

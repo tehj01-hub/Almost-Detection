@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 1
+names: ['0']
+
+roboflow:
+  workspace: vishal-hwk3p
+  project: number-plate-h14v7
+  version: 1
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/vishal-hwk3p/number-plate-h14v7/dataset/1

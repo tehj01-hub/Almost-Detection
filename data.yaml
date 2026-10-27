@@ -1,0 +1,27 @@
+# =========================================================
+#  Number Plate Dataset Configuration
+#  For YOLOv10 Training
+# =========================================================
+
+# ---------------------------------------------------------
+#  LOCAL PATHS (Windows / XAMPP)
+#  Uncomment these when training locally
+# ---------------------------------------------------------
+# train: D:/xampp/htdocs/NewCapstone/numberplate_dataset/train/images
+# val: D:/xampp/htdocs/NewCapstone/numberplate_dataset/valid/images
+# test: D:/xampp/htdocs/NewCapstone/numberplate_dataset/test/images
+
+# ---------------------------------------------------------
+#  GOOGLE COLAB PATHS
+#  Use these when training on Colab
+# ---------------------------------------------------------
+train: /content/number_plate_dataset/train/images
+val: /content/number_plate_dataset/valid/images
+test: /content/number_plate_dataset/test/images
+
+# Number of classes
+nc: 1
+
+# Class names
+names: ['license']
+#   url: https://universe.roboflow.com/vishal-hwk3p/number-plate-h14v7/dataset/1

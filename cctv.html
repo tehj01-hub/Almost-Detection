@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>CCTV Live View | License Plate Detection</title>
+
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: Arial, sans-serif;
+            background: #111;
+            color: white;
+            min-height: 100vh;
+        }
+
+        h1 {
+            text-align: center;
+            margin: 20px;
+            font-size: 24px;
+        }
+
+        .container {
+            display: flex;
+            gap: 20px;
+            padding: 0 20px 20px;
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        /* Camera Feed */
+        .camera-section {
+            flex: 2;
+        }
+
+        .camera-container {
+            width: 100%;
+            position: relative;
+        }
+
+        #cctv {
+            width: 100%;
+            background: black;
+            border: 3px solid #444;
+            border-radius: 10px;
+        }
+
+        #status {
+            margin-top: 10px;
+            font-size: 16px;
+            text-align: center;
+        }
+
+        /* Detection Panel */
+        .detection-panel {
+            flex: 1;
+            max-width: 380px;
+        }
+
+        .panel-title {
+            font-size: 18px;
+            font-weight: bold;
+            margin-bottom: 12px;
+            padding: 12px 16px;
+            background: #1a1a2e;
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .detection-list {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            max-height: 500px;
+            overflow-y: auto;
+        }
+
+        .detection-card {
+            background: #1a1a2e;
+            border-radius: 8px;
+            padding: 12px 16px;
+            border-left: 4px solid #2f80ed;
+        }
+
+        .detection-card.registered {
+            border-left-color: #27ae60;
+        }
+
+        .detection-card.visitor {
+            border-left-color: #f39c12;
+        }
+
+        .plate-number {
+            font-size: 18px;
+            font-weight: bold;
+            letter-spacing: 2px;
+            margin-bottom: 4px;
+        }
+
+        .plate-info {
+            font-size: 13px;
+            color: #aaa;
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 11px;
+            font-weight: bold;
+            margin-top: 4px;
+        }
+
+        .badge.registered {
+            background: #27ae60;
+            color: white;
+        }
+
+        .badge.visitor {
+            background: #f39c12;
+            color: #111;
+        }
+
+        .badge.unknown {
+            background: #e74c3c;
+            color: white;
+        }
+
+        .no-detections {
+            color: #666;
+            text-align: center;
+            padding: 40px 16px;
+            font-style: italic;
+        }
+
+        /* System Info */
+        .system-info {
+            margin-top: 12px;
+            padding: 12px 16px;
+            background: #1a1a2e;
+            border-radius: 8px;
+            font-size: 13px;
+            color: #aaa;
+        }
+
+        .system-info .dot {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            margin-right: 6px;
+        }
+
+        .dot.green { background: #27ae60; }
+        .dot.red { background: #e74c3c; }
+    </style>
+</head>
+
+<body>
+
+    <h1>🚗 CCTV Monitoring | License Plate Detection</h1>
+
+    <div class="container">
+
+        <!-- Camera Feed -->
+        <div class="camera-section">
+            <div class="camera-container">
+                <img
+                    id="cctv"
+                    src="http://127.0.0.1:5000/video"
+                    alt="CCTV with License Plate Detection"
+                    onerror="this.style.display='none'; document.getElementById('status').innerHTML='🔴 Detection Server Offline'">
+            </div>
+
+            <p id="status">🟢 Detection Active</p>
+        </div>
+
+        <!-- Detection Panel -->
+        <div class="detection-panel">
+
+            <div class="panel-title">
+                🔍 Recent Detections
+            </div>
+
+            <div class="detection-list" id="detectionList">
+                <div class="no-detections">
+                    Waiting for plate detections...
+                </div>
+            </div>
+
+            <div class="system-info" id="systemInfo">
+                <div><span class="dot red" id="statusDot"></span> Connecting...</div>
+            </div>
+        </div>
+
+    </div>
+
+    <script>
+        // Poll for recent detections every 3 seconds
+        async function fetchDetections() {
+            try {
+                const response = await fetch('http://127.0.0.1:5000/api/detections');
+                const data = await response.json();
+
+                if (data.success && data.detections.length > 0) {
+                    renderDetections(data.detections);
+                }
+            } catch (err) {
+                // Server not available
+            }
+        }
+
+        async function fetchStatus() {
+            try {
+                const response = await fetch('http://127.0.0.1:5000/api/status');
+                const data = await response.json();
+
+                const dot = document.getElementById('statusDot');
+                const info = document.getElementById('systemInfo');
+
+                if (data.success && data.running) {
+                    dot.className = 'dot green';
+                    info.innerHTML = `
+                        <div><span class="dot green"></span> System Running</div>
+                        <div style="margin-top:4px">Camera: ${data.camera_connected ? '✅' : '❌'} |
+                        OCR: ${data.ocr_loaded ? '✅' : '❌'} |
+                        Plates: ${data.total_detections}</div>
+                    `;
+                } else {
+                    dot.className = 'dot red';
+                    info.innerHTML = '<div><span class="dot red"></span> System Offline</div>';
+                }
+            } catch (err) {
+                document.getElementById('systemInfo').innerHTML =
+                    '<div><span class="dot red"></span> Detection Server Offline</div>';
+            }
+        }
+
+        function renderDetections(detections) {
+            const list = document.getElementById('detectionList');
+            let html = '';
+
+            detections.slice(0, 10).forEach(d => {
+                const categoryClass = d.category.toLowerCase();
+                html += `
+                    <div class="detection-card ${categoryClass}">
+                        <div class="plate-number">${d.display_text || d.plate}</div>
+                        <div class="plate-info">
+                            ${d.vehicle_type} • ${d.timestamp}
+                        </div>
+                        <span class="badge ${categoryClass}">${d.category}</span>
+                        <span style="font-size:12px; color:#888; margin-left:8px">${(d.confidence * 100).toFixed(0)}%</span>
+                    </div>
+                `;
+            });
+
+            list.innerHTML = html || '<div class="no-detections">No detections yet</div>';
+        }
+
+        // Start polling
+        setInterval(fetchDetections, 3000);
+        setInterval(fetchStatus, 5000);
+
+        // Initial fetch
+        fetchDetections();
+        fetchStatus();
+    </script>
+
+</body>
+
+</html>
+</html>
