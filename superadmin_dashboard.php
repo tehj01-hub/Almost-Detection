@@ -2872,6 +2872,10 @@ document.addEventListener("DOMContentLoaded", initTapoCameras);
 
 </script>
 
+<!-- Shared Per-Duration Visitor Reminder & Overstay Alarm Engine -->
+<script>window.SECSYS_ALARM_ROLE = "Administrator";</script>
+<script src="visitor_duration_alarm.js"></script>
+
 <!-- Live auto-refresh (no full page reload) -->
 <script>window.AUTO_REFRESH_SECONDS = 5;</script>
 <script src="auto_refresh.js"></script>

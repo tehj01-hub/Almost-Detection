@@ -1,8 +1,0 @@
-{
-  "api_key": "your_openai_api_key_here",
-  "model": "gpt-4o-mini",
-  "enabled": true,
-  "timeout": 3.0,
-  "comment": "OpenAI API configuration for GPT Vision fourth reader (Hot-reload enabled)."
-}
-

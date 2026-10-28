@@ -1,20 +1,57 @@
-# Zip files
+# Local secrets and machine settings
+.env
+.env.*
+!.env.example
+!.env.sample
+/openai_config.json
+/camera_config.json
+
+# Dependencies and environments
+/vendor/
+node_modules/
+.venv/
+venv/
+env/
+
+# Python and notebook caches
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Downloaded models, datasets, and inference caches
+/.paddle_cache/
+/.openvino_cache/
+/.yolo_config/
+/datasets/
+/numberplate_dataset/
+/weights/
+*.pt
+*.pth
+*.onnx
+*.engine
 *.zip
 
-# Python
-__pycache__/
-*.pyc
-.ipynb_checkpoints/
+# Runtime uploads, training output, and experiments
+/uploads/
+/runs/
+/scratch/
+/test_result.jpg
+*.log
+*.tmp
+*.bak
 
-# Environment
-.env
-venv/
+# Locally downloaded repositories
+/superpowers/
+/yolov10/
 
-# OS files
-Thumbs.db
-.DS_Store
-
-# IDE
+# Editors and operating system files
 .vscode/
-openai_config.json
-openai_config.json
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo

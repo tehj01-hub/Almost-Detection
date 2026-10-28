@@ -92,7 +92,26 @@ if ($ajaxAction !== '') {
         if (!in_array($vehicleType, ['Car', 'Motorcycle', 'Truck'], true)) {
             $vehicleType = 'Car';
         }
-        $purpose = trim($_POST['purpose'] ?? '');
+        $purposeRaw = trim($_POST['purpose'] ?? '');
+        $customMinutes = isset($_POST['custom_minutes']) && (int)$_POST['custom_minutes'] > 0
+            ? max(1, min(2880, (int)$_POST['custom_minutes']))
+            : null;
+        $customPurposeText = trim($_POST['custom_purpose'] ?? '');
+
+        if ($purposeRaw === '__CUSTOM__') {
+            if ($customMinutes === null || $customMinutes <= 0) {
+                echo json_encode([
+                    'success' => false,
+                    'message' => 'Please enter a valid custom stay duration (in minutes or hours).'
+                ]);
+                $conn->close();
+                exit();
+            }
+            $baseLabel = $customPurposeText !== '' ? $customPurposeText : 'Custom Visit';
+            $purpose = $baseLabel . ' - ' . ucwords(secsysFormatDuration($customMinutes));
+        } else {
+            $purpose = $purposeRaw;
+        }
 
         if ($plateClean === '' || $purpose === '') {
             echo json_encode([
@@ -103,37 +122,19 @@ if ($ajaxAction !== '') {
             exit();
         }
 
-        // Allowed duration mapping
-        $purposeDurationMap = [
-            'Birthday - 12 Hours'          => 720,
-            'Visiting Resident - 12 Hours' => 720,
-            'Delivery - 20 Mins'           => 20,
-            'Drop - off/on - 15 Mins'      => 15,
-            'Service Maintenance - 8 Hours'=> 480,
-        ];
-        $allowedMinutes = $purposeDurationMap[$purpose] ?? null;
-        if ($allowedMinutes === null) {
-            $pLower = strtolower($purpose);
-            if (strpos($pLower, 'birthday') !== false || strpos($pLower, 'visiting') !== false) {
-                $allowedMinutes = 720;
-            } elseif (strpos($pLower, 'delivery') !== false) {
-                $allowedMinutes = 20;
-            } elseif (strpos($pLower, 'drop') !== false) {
-                $allowedMinutes = 15;
-            } elseif (strpos($pLower, 'service') !== false || strpos($pLower, 'maintenance') !== false) {
-                $allowedMinutes = 480;
-            } else {
-                $allowedMinutes = 720;
-            }
-        }
+        // Resolve duration & tailored reminder milestones via shared config
+        $resolvedDuration = secsysResolveVisitorDuration($purpose, $customMinutes);
+        $allowedMinutes = max(1, (int)$resolvedDuration['allowed_minutes']);
+        $purpose = $resolvedDuration['purpose_display'];
 
         // Step 1: Upsert into visitor_vehicles for today using indexed lookup
         $visitorVehicleId = null;
+        $visitorPrevStatus = 'IN';
         $findVv = $conn->prepare("
-            SELECT id
+            SELECT id, status
             FROM visitor_vehicles
-            WHERE (plate_number = ? OR plate_number = ?)
-              AND date_created >= CURDATE()
+            WHERE (plate_number = ? OR REPLACE(UPPER(plate_number), ' ', '') = ?)
+              AND (date_created >= CURDATE() OR date_in >= CURDATE() OR time_in >= CURDATE())
             ORDER BY id DESC
             LIMIT 1
         ");
@@ -143,21 +144,44 @@ if ($ajaxAction !== '') {
             $resVv = $findVv->get_result();
             if ($rowVv = $resVv->fetch_assoc()) {
                 $visitorVehicleId = (int)$rowVv['id'];
+                $visitorPrevStatus = strtoupper(trim((string)($rowVv['status'] ?? 'IN')));
             }
             $findVv->close();
         }
 
         if ($visitorVehicleId) {
-            $updVv = $conn->prepare("
-                UPDATE visitor_vehicles
-                SET plate_number = ?,
-                    vehicle_type = ?,
-                    purpose = ?,
-                    allowed_minutes = ?,
-                    date_in = COALESCE(date_in, CURDATE()),
-                    expected_time_out = DATE_ADD(COALESCE(time_in, NOW()), INTERVAL ? MINUTE)
-                WHERE id = ?
-            ");
+            if ($visitorPrevStatus === 'OUT') {
+                // Returning visitor entering again manually -> start fresh time_in & timer
+                $updVv = $conn->prepare("
+                    UPDATE visitor_vehicles
+                    SET plate_number = ?,
+                        vehicle_type = ?,
+                        purpose = ?,
+                        allowed_minutes = ?,
+                        status = 'IN',
+                        date_in = CURDATE(),
+                        time_in = NOW(),
+                        date_out = NULL,
+                        time_out = NULL,
+                        expected_time_out = DATE_ADD(NOW(), INTERVAL ? MINUTE)
+                    WHERE id = ?
+                ");
+            } else {
+                $updVv = $conn->prepare("
+                    UPDATE visitor_vehicles
+                    SET plate_number = ?,
+                        vehicle_type = ?,
+                        purpose = ?,
+                        allowed_minutes = ?,
+                        status = 'IN',
+                        date_in = COALESCE(date_in, CURDATE()),
+                        time_in = COALESCE(time_in, NOW()),
+                        date_out = NULL,
+                        time_out = NULL,
+                        expected_time_out = DATE_ADD(COALESCE(time_in, NOW()), INTERVAL ? MINUTE)
+                    WHERE id = ?
+                ");
+            }
             if ($updVv) {
                 $updVv->bind_param("sssiii", $plateClean, $vehicleType, $purpose, $allowedMinutes, $allowedMinutes, $visitorVehicleId);
                 $updVv->execute();
@@ -274,7 +298,9 @@ if ($ajaxAction !== '') {
             }
         }
 
-        echo json_encode([
+        $timerSnapshot = secsysFetchActiveVisitorTimers($conn);
+
+        echo json_encode(array_merge([
             'success' => true,
             'log' => [
                 'id' => $logId,
@@ -282,9 +308,10 @@ if ($ajaxAction !== '') {
                 'vehicle_category' => 'Visitor',
                 'vehicle_type' => $vehicleType,
                 'purpose' => $purpose,
+                'allowed_minutes' => $allowedMinutes,
                 'direction' => $direction
             ]
-        ]);
+        ], $timerSnapshot));
 
         $conn->close();
         exit();
@@ -336,7 +363,7 @@ if ($ajaxAction !== '') {
         $totalRegisteredToday = 0;
         $totalVisitorsToday = 0;
         $qTotals = $conn->query("
-            SELECT 
+            SELECT
                 COALESCE(SUM(CASE WHEN vehicle_category = 'Registered' AND direction = 'IN' THEN 1 ELSE 0 END), 0) AS reg_tot,
                 COALESCE(SUM(CASE WHEN vehicle_category = 'Visitor' AND direction = 'IN' THEN 1 ELSE 0 END), 0) AS vis_tot
             FROM vehicle_logs
@@ -347,51 +374,16 @@ if ($ajaxAction !== '') {
             $totalVisitorsToday = (int)$rowTot['vis_tot'];
         }
 
-        // Overstay checks (only if visitors exist)
-        $overdueVisitors = [];
-        $dueSoonVisitors = [];
+        // Second-precision per-duration reminders & overstay alarms
+        $timerSnapshot = secsysFetchActiveVisitorTimers($conn);
 
-        $stmtOverstay = $conn->prepare("
-            SELECT
-                vv.id,
-                vv.plate_number,
-                vv.vehicle_type,
-                vv.purpose,
-                vv.allowed_minutes,
-                DATE_FORMAT(vv.time_in, '%h:%i %p') AS time_in_formatted,
-                DATE_FORMAT(vv.expected_time_out, '%h:%i %p') AS expected_time_out_formatted,
-                TIMESTAMPDIFF(MINUTE, NOW(), vv.expected_time_out) AS minutes_remaining
-            FROM visitor_vehicles vv
-            WHERE vv.status = 'IN'
-              AND vv.date_created >= CURDATE()
-              AND vv.expected_time_out IS NOT NULL
-            ORDER BY vv.expected_time_out ASC
-        ");
-        if ($stmtOverstay) {
-            $stmtOverstay->execute();
-            $resOverstay = $stmtOverstay->get_result();
-            while ($rowO = $resOverstay->fetch_assoc()) {
-                $rem = (int)$rowO['minutes_remaining'];
-                if ($rem < 0) {
-                    $rowO['minutes_overdue'] = abs($rem);
-                    $overdueVisitors[] = $rowO;
-                } elseif ($rem <= 15) {
-                    $rowO['minutes_left'] = $rem;
-                    $dueSoonVisitors[] = $rowO;
-                }
-            }
-            $stmtOverstay->close();
-        }
-
-        echo json_encode([
+        echo json_encode(array_merge([
             'success' => true,
             'new_logs' => $newLogs,
             'max_id' => $maxId,
             'total_registered' => $totalRegisteredToday,
             'total_visitors' => $totalVisitorsToday,
-            'overdue_visitors' => $overdueVisitors,
-            'due_soon_visitors' => $dueSoonVisitors
-        ]);
+        ], $timerSnapshot));
 
         $conn->close();
         exit();
@@ -3979,11 +3971,15 @@ body {
 
                             <div class="vehicle-badges">
 
+                                <?php if (!$isOutVis): ?>
+                                    <span class="vda-inline-timer" data-vda-plate="<?php echo htmlspecialchars($vPlate, ENT_QUOTES); ?>" data-vda-status="IN" data-vda-compact="1" style="display:none;"></span>
+                                <?php endif; ?>
+
                                 <?php if ($isOutVis): ?>
                                     <span class="purpose-pill" style="background:#fee2e2; color:#991b1b; border:1px solid #f87171;" title="<?php echo htmlspecialchars($vPurpose !== '' ? $vPurpose : 'Exited', ENT_QUOTES); ?>">
                                         <?php echo htmlspecialchars($vPurpose !== '' ? $vPurpose : 'Exited'); ?>
                                     </span>
-                                <?php elseif ($vPurpose !== ''): ?>
+                                <?php elseif ($vPurpose !== '' && strtolower($vPurpose) !== 'visitor entry'): ?>
                                     <span class="purpose-pill" title="<?php echo htmlspecialchars($vPurpose, ENT_QUOTES); ?>">
                                         <?php echo htmlspecialchars($vPurpose); ?>
                                     </span>
@@ -4453,21 +4449,53 @@ body {
 
                     <label for="visitorPurposeInput">Purpose &amp; Allowed Time</label>
 
-                    <select id="visitorPurposeInput" name="purpose" required>
+                    <select id="visitorPurposeInput" name="purpose" onchange="onVisitorPurposeChange()" required>
                         <option value="" disabled selected>-- Select Purpose &amp; Time Limit --</option>
+                        <option value="Drop - off/on - 15 Mins">Drop - off/on - 15 Mins</option>
+                        <option value="Delivery - 20 Mins">Delivery - 20 Mins</option>
+                        <option value="Service Maintenance - 8 Hours">Service Maintenance - 8 Hours</option>
                         <option value="Birthday - 12 Hours">Birthday - 12 Hours</option>
                         <option value="Visiting Resident - 12 Hours">Visiting Resident - 12 Hours</option>
-                        <option value="Delivery - 20 Mins">Delivery - 20 Mins</option>
-                        <option value="Drop - off/on - 15 Mins">Drop - off/on - 15 Mins</option>
-                        <option value="Service Maintenance - 8 Hours">Service Maintenance - 8 Hours</option>
+                        <option value="__CUSTOM__">⏱️ Custom Duration / Other...</option>
                     </select>
 
                     <div class="visitor-purpose-chips">
+                        <span class="visitor-purpose-chip" onclick="setQuickPurpose('Drop - off/on - 15 Mins')">Drop - off/on - 15 Mins</span>
+                        <span class="visitor-purpose-chip" onclick="setQuickPurpose('Delivery - 20 Mins')">Delivery - 20 Mins</span>
+                        <span class="visitor-purpose-chip" onclick="setQuickPurpose('Service Maintenance - 8 Hours')">Service Maintenance - 8 Hours</span>
                         <span class="visitor-purpose-chip" onclick="setQuickPurpose('Birthday - 12 Hours')">Birthday - 12 Hours</span>
                         <span class="visitor-purpose-chip" onclick="setQuickPurpose('Visiting Resident - 12 Hours')">Visiting Resident - 12 Hours</span>
-                        <span class="visitor-purpose-chip" onclick="setQuickPurpose('Delivery - 20 Mins')">Delivery - 20 Mins</span>
-                        <span class="visitor-purpose-chip" onclick="setQuickPurpose('Drop - off/on - 15 Mins')">Drop - off/on - 15 Mins</span>
-                        <span class="visitor-purpose-chip" onclick="setQuickPurpose('Service Maintenance - 8 Hours')">Service Maintenance - 8 Hours</span>
+                        <span class="visitor-purpose-chip" onclick="setQuickPurpose('__CUSTOM__')" style="background:#eff6ff; color:#1d4ed8; border-color:#93c5fd;">⏱️ Custom Timer</span>
+                    </div>
+
+                    <!-- Custom Purpose & Duration Input (visible when Custom Duration is selected) -->
+                    <div id="customDurationFields" style="display:none; margin-top:10px; padding:10px 12px; background:#f8fafc; border:1px solid #cbd5e1; border-radius:10px;">
+                        <div style="margin-bottom:8px;">
+                            <label for="visitorCustomPurposeInput" style="font-size:11px; color:#334155; font-weight:700; display:block; margin-bottom:4px;">Visit Purpose Label</label>
+                            <input type="text" id="visitorCustomPurposeInput" placeholder="e.g. Pickup, Inquiry, Contractor..." style="width:100%; padding:7px 10px; border:1px solid #cbd5e1; border-radius:7px; font-size:12px;">
+                        </div>
+                        <div>
+                            <label style="font-size:11px; color:#334155; font-weight:700; display:block; margin-bottom:4px;">Allowed Stay Duration</label>
+                            <div style="display:flex; gap:8px; align-items:center;">
+                                <input type="number" id="visitorCustomDurationVal" min="1" max="1440" value="30" oninput="updateModalSchedulePreview()" style="width:90px; padding:7px 10px; border:1px solid #cbd5e1; border-radius:7px; font-size:13px; font-weight:700;">
+                                <select id="visitorCustomDurationUnit" onchange="updateModalSchedulePreview()" style="flex:1; padding:7px 10px; border:1px solid #cbd5e1; border-radius:7px; font-size:12px; background:#fff;">
+                                    <option value="minutes" selected>Minutes</option>
+                                    <option value="hours">Hours</option>
+                                </select>
+                            </div>
+                            <div style="display:flex; gap:5px; flex-wrap:wrap; margin-top:7px;">
+                                <span class="visitor-purpose-chip" onclick="setQuickCustomMinutes(5)">5m</span>
+                                <span class="visitor-purpose-chip" onclick="setQuickCustomMinutes(10)">10m</span>
+                                <span class="visitor-purpose-chip" onclick="setQuickCustomMinutes(30)">30m</span>
+                                <span class="visitor-purpose-chip" onclick="setQuickCustomMinutes(60)">1h</span>
+                                <span class="visitor-purpose-chip" onclick="setQuickCustomMinutes(120)">2h</span>
+                                <span class="visitor-purpose-chip" onclick="setQuickCustomMinutes(240)">4h</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Live Reminder & Overstay Alarm Schedule Preview -->
+                    <div id="visitorSchedulePreview" style="display:none; margin-top:10px; padding:9px 12px; background:#fffbeb; border:1px solid #fde68a; border-left:4px solid #f59e0b; border-radius:8px; font-size:11.5px; color:#78350f; line-height:1.45;">
                     </div>
 
                 </div>
@@ -5081,25 +5109,27 @@ function openVisitorModal(plateNumber, vehicleType, purpose, logId, isAutoDetect
         typeSelect.value = normalizedType;
     }
     if (purposeInput) {
-        if (purpose) {
+        const cleanPurp = (purpose && purpose.toLowerCase() !== "visitor entry") ? purpose : "";
+        if (cleanPurp) {
             let matched = false;
             for (let i = 0; i < purposeInput.options.length; i++) {
-                if (purposeInput.options[i].value === purpose) {
+                if (purposeInput.options[i].value === cleanPurp) {
                     matched = true;
                     break;
                 }
             }
             if (!matched) {
                 const opt = document.createElement("option");
-                opt.value = purpose;
-                opt.textContent = purpose;
-                purposeInput.appendChild(opt);
+                opt.value = cleanPurp;
+                opt.textContent = cleanPurp;
+                purposeInput.insertBefore(opt, purposeInput.options[purposeInput.options.length - 1]);
             }
-            purposeInput.value = purpose;
+            purposeInput.value = cleanPurp;
         } else {
             purposeInput.selectedIndex = 0;
         }
     }
+    onVisitorPurposeChange();
     if (badge) {
         badge.textContent = isAutoDetected ? "New Visitor Detected" : "Visitor Entry";
     }
@@ -5134,12 +5164,84 @@ function closeVisitorModal() {
     }
 }
 
+function getCustomDurationMinutesFromModal() {
+    const valEl = document.getElementById("visitorCustomDurationVal");
+    const unitEl = document.getElementById("visitorCustomDurationUnit");
+    const rawVal = valEl ? parseInt(valEl.value || "0", 10) : 0;
+    if (!rawVal || rawVal <= 0) return 0;
+    const isHours = unitEl && unitEl.value === "hours";
+    return Math.min(2880, isHours ? rawVal * 60 : rawVal);
+}
+
+function updateModalSchedulePreview() {
+    const purposeInput = document.getElementById("visitorPurposeInput");
+    const previewEl = document.getElementById("visitorSchedulePreview");
+    if (!purposeInput || !previewEl) return;
+
+    const val = purposeInput.value || "";
+    if (!val) {
+        previewEl.style.display = "none";
+        previewEl.innerHTML = "";
+        return;
+    }
+
+    const customMins = val === "__CUSTOM__" ? getCustomDurationMinutesFromModal() : 0;
+    if (val === "__CUSTOM__" && customMins <= 0) {
+        previewEl.style.display = "block";
+        previewEl.innerHTML = "⏱️ Enter a stay duration above to arm automatic reminders &amp; overstay alarm.";
+        return;
+    }
+
+    if (window.VisitorDurationAlarm && typeof window.VisitorDurationAlarm.getDurationScheduleInfo === "function") {
+        const info = window.VisitorDurationAlarm.getDurationScheduleInfo(val, customMins);
+        const now = new Date();
+        const dueDate = new Date(now.getTime() + info.minutes * 60000);
+        const dueStr = dueDate.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+        previewEl.style.display = "block";
+        previewEl.innerHTML =
+            "<strong>🔔 Armed Schedule (" + escapeHtmlText(info.durationLabel) + "):</strong> " +
+            escapeHtmlText(info.scheduleText) +
+            " &bull; <strong>Expected Out:</strong> ~" + escapeHtmlText(dueStr);
+    } else {
+        previewEl.style.display = "none";
+    }
+}
+
+function onVisitorPurposeChange() {
+    const purposeInput = document.getElementById("visitorPurposeInput");
+    const customBox = document.getElementById("customDurationFields");
+    if (customBox && purposeInput) {
+        customBox.style.display = purposeInput.value === "__CUSTOM__" ? "block" : "none";
+    }
+    updateModalSchedulePreview();
+}
+
+function setQuickCustomMinutes(mins) {
+    const valEl = document.getElementById("visitorCustomDurationVal");
+    const unitEl = document.getElementById("visitorCustomDurationUnit");
+    if (!valEl || !unitEl) return;
+    if (mins >= 60 && mins % 60 === 0) {
+        valEl.value = String(mins / 60);
+        unitEl.value = "hours";
+    } else {
+        valEl.value = String(mins);
+        unitEl.value = "minutes";
+    }
+    updateModalSchedulePreview();
+}
+
 function setQuickPurpose(purposeText) {
 
     const purposeInput = document.getElementById("visitorPurposeInput");
     if (purposeInput) {
         purposeInput.value = purposeText;
-        purposeInput.focus();
+        onVisitorPurposeChange();
+        if (purposeText === "__CUSTOM__") {
+            const customPurp = document.getElementById("visitorCustomPurposeInput");
+            if (customPurp) customPurp.focus();
+        } else {
+            purposeInput.focus();
+        }
     }
 }
 
@@ -5216,12 +5318,15 @@ function stackVehicleItem(logData) {
         }
 
         if (isVisitor) {
+            const badgesBox = existingItem.querySelector(".vehicle-badges");
+            let timerBadge = existingItem.querySelector("[data-vda-plate]");
             const pill = existingItem.querySelector(".purpose-pill");
             if (isOut) {
                 existingItem.classList.remove("visitor-item-row");
                 existingItem.classList.add("visitor-item-out");
                 existingItem.onclick = function() { openVisitorExitModalFromRow(existingItem); };
                 existingItem.setAttribute("title", "Visitor vehicle exited (Click to view exit details)");
+                if (timerBadge) timerBadge.remove();
                 if (pill) {
                     pill.className = "purpose-pill";
                     pill.style.background = "#fee2e2";
@@ -5234,11 +5339,22 @@ function stackVehicleItem(logData) {
                 existingItem.classList.remove("visitor-item-out");
                 existingItem.onclick = function() { openVisitorModalFromRow(existingItem); };
                 existingItem.setAttribute("title", "Click to enter or update visitor information");
+                if (!timerBadge && badgesBox) {
+                    timerBadge = document.createElement("span");
+                    timerBadge.className = "vda-inline-timer";
+                    timerBadge.setAttribute("data-vda-compact", "1");
+                    timerBadge.style.display = "none";
+                    badgesBox.insertBefore(timerBadge, badgesBox.firstChild);
+                }
+                if (timerBadge) {
+                    timerBadge.setAttribute("data-vda-plate", plate);
+                    timerBadge.setAttribute("data-vda-status", "IN");
+                }
                 if (pill) {
                     pill.style.background = "";
                     pill.style.color = "";
                     pill.style.border = "";
-                    if (purpose !== "") {
+                    if (purpose !== "" && purpose.toLowerCase() !== "visitor entry") {
                         pill.className = "purpose-pill";
                         pill.textContent = purpose;
                         pill.title = purpose;
@@ -5248,6 +5364,9 @@ function stackVehicleItem(logData) {
                         pill.removeAttribute("title");
                     }
                 }
+            }
+            if (window.VisitorDurationAlarm) {
+                window.VisitorDurationAlarm.updateInlineTimerBadges();
             }
         }
         return;
@@ -5270,6 +5389,7 @@ function stackVehicleItem(logData) {
         itemDiv.setAttribute("data-purpose", purpose);
 
         let pillHtml = "";
+        let timerHtml = "";
         if (isOut) {
             itemDiv.setAttribute("title", "Visitor vehicle exited (Click to view exit details)");
             itemDiv.onclick = function () {
@@ -5282,7 +5402,8 @@ function stackVehicleItem(logData) {
             itemDiv.onclick = function () {
                 openVisitorModalFromRow(itemDiv);
             };
-            pillHtml = purpose !== ""
+            timerHtml = '<span class="vda-inline-timer" data-vda-plate="' + escapeHtmlText(plate) + '" data-vda-status="IN" data-vda-compact="1" style="display:none;"></span>';
+            pillHtml = (purpose !== "" && purpose.toLowerCase() !== "visitor entry")
                 ? '<span class="purpose-pill" title="' + escapeHtmlText(purpose) + '">' + escapeHtmlText(purpose) + '</span>'
                 : '<span class="purpose-pill needs-info">Input Info</span>';
         }
@@ -5296,6 +5417,7 @@ function stackVehicleItem(logData) {
                 '</div>' +
             '</div>' +
             '<div class="vehicle-badges">' +
+                timerHtml +
                 pillHtml +
                 '<div class="captured">Captured</div>' +
             '</div>';
@@ -5340,10 +5462,21 @@ async function saveVisitorInfo(e) {
     const vType = (typeSelect ? typeSelect.value : "Car");
     const purpose = (purposeInput ? purposeInput.value.trim() : "");
     const logId = (logIdInput ? parseInt(logIdInput.value || "0", 10) : 0);
+    const customPurposeEl = document.getElementById("visitorCustomPurposeInput");
+    const customPurpose = customPurposeEl ? customPurposeEl.value.trim() : "";
+    const customMins = purpose === "__CUSTOM__" ? getCustomDurationMinutesFromModal() : 0;
 
     if (!plate || !purpose) {
         if (errBox) {
             errBox.textContent = "Please fill in the Plate Number, Vehicle Type, and Purpose.";
+            errBox.style.display = "block";
+        }
+        return;
+    }
+
+    if (purpose === "__CUSTOM__" && customMins <= 0) {
+        if (errBox) {
+            errBox.textContent = "Please enter a valid custom stay duration (at least 1 minute).";
             errBox.style.display = "block";
         }
         return;
@@ -5360,6 +5493,10 @@ async function saveVisitorInfo(e) {
         formData.append("plate_number", plate);
         formData.append("vehicle_type", vType);
         formData.append("purpose", purpose);
+        if (purpose === "__CUSTOM__") {
+            formData.append("custom_minutes", String(customMins));
+            formData.append("custom_purpose", customPurpose);
+        }
         formData.append("log_id", String(logId));
 
         const res = await fetch(window.location.pathname, {
@@ -5392,6 +5529,10 @@ async function saveVisitorInfo(e) {
                 direction: savedLog.direction || data.direction || "IN"
             });
 
+            if (window.VisitorDurationAlarm) {
+                window.VisitorDurationAlarm.ingestSnapshot(data, true);
+            }
+
             closeVisitorModal();
             pollLiveCaptures();
         }
@@ -5420,8 +5561,12 @@ async function pollLiveCaptures() {
 
         if (!data || !data.success) return;
 
-        // Update visitor stay limit reminders & trigger alarm if any overdue
-        handleOverstayReminders(data.overdue_visitors || [], data.due_soon_visitors || []);
+        // Feed second-precision per-duration reminders & overstay alarms to shared controller
+        if (window.VisitorDurationAlarm) {
+            window.VisitorDurationAlarm.ingestSnapshot(data, true);
+        } else {
+            handleOverstayReminders(data.overdue_visitors || [], data.due_soon_visitors || []);
+        }
 
         // Update total counts smoothly
         const visTotalEl = document.getElementById("totalVisitorsCount");
@@ -5535,24 +5680,14 @@ let lastOverstayAlarmSound = 0;
 let alarmAudioMuted = localStorage.getItem("guard_alarm_muted") === "true";
 
 function toggleOverstayAlarmAudio() {
+    if (window.VisitorDurationAlarm) {
+        window.VisitorDurationAlarm.toggleMute();
+        alarmAudioMuted = localStorage.getItem("guard_alarm_muted") === "true";
+        return;
+    }
     alarmAudioMuted = !alarmAudioMuted;
     localStorage.setItem("guard_alarm_muted", alarmAudioMuted ? "true" : "false");
     updateAlarmSoundButton();
-    if (!alarmAudioMuted) {
-        // Play a short chirp to confirm unmuted
-        try {
-            const ctx = new (window.AudioContext || window.webkitAudioContext)();
-            const osc = ctx.createOscillator();
-            const gain = ctx.createGain();
-            osc.frequency.setValueAtTime(880, ctx.currentTime);
-            gain.gain.setValueAtTime(0.15, ctx.currentTime);
-            gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.15);
-            osc.connect(gain);
-            gain.connect(ctx.destination);
-            osc.start();
-            osc.stop(ctx.currentTime + 0.15);
-        } catch(e) {}
-    }
 }
 
 function updateAlarmSoundButton() {
@@ -6148,6 +6283,10 @@ window.addEventListener("click", function(e) {
 document.addEventListener("DOMContentLoaded", function() { initTapoCameras(); loadStoredNotifications(); pollLiveCaptures(); });
 
 </script>
+
+<!-- Shared Per-Duration Visitor Reminder & Overstay Alarm Engine -->
+<script>window.SECSYS_ALARM_ROLE = "Security Guard";</script>
+<script src="visitor_duration_alarm.js"></script>
 
 <!-- Live auto-refresh (no full page reload) -->
 <script>window.AUTO_REFRESH_SECONDS = 5;</script>

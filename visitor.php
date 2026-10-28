@@ -2602,6 +2602,10 @@ body {
                         </th>
 
                         <th>
+                            Purpose &amp; Limit
+                        </th>
+
+                        <th>
                             Date
                         </th>
 
@@ -2611,6 +2615,10 @@ body {
 
                         <th>
                             Time Out
+                        </th>
+
+                        <th>
+                            Stay Timer
                         </th>
 
                     </tr>
@@ -2705,6 +2713,16 @@ body {
 
                             <td>
 
+                                <?= !empty($visitor["purpose"])
+                                    ? e($visitor["purpose"])
+                                    : "—"
+                                ?>
+
+                            </td>
+
+
+                            <td>
+
                                 <?= e(
                                     $logDate
                                 ) ?>
@@ -2731,6 +2749,16 @@ body {
                             </td>
 
 
+                            <td>
+                                <?php
+                                $visStatus = (strtoupper(trim((string)($visitor["status"] ?? "IN"))) === "OUT" || $timeOut !== "") ? "OUT" : "IN";
+                                ?>
+                                <span class="vda-inline-timer" data-vda-plate="<?= e($visitor["plate_number"]) ?>" data-vda-status="<?= $visStatus ?>">
+                                    <?= $visStatus === "IN" ? "⏱ Active" : "✓ Completed" ?>
+                                </span>
+                            </td>
+
+
                         </tr>
 
 
@@ -2743,7 +2771,7 @@ body {
                     <tr>
 
                         <td
-                            colspan="5"
+                            colspan="7"
                             class="empty"
                         >
 
@@ -3617,6 +3645,10 @@ function printArchive()
 }
 
 </script>
+
+<!-- Shared Per-Duration Visitor Reminder & Overstay Alarm Engine -->
+<script>window.SECSYS_ALARM_ROLE = "Administrator";</script>
+<script src="visitor_duration_alarm.js"></script>
 
 <!-- Live auto-refresh (no full page reload) -->
 <script>window.AUTO_REFRESH_SECONDS = 5;</script>
