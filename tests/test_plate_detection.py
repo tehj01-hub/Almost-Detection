@@ -3,8 +3,8 @@
 Quick Test Script: YOLOv10 License Plate Detection + OCR
 =============================================================================
 Usage:
-    python test_plate_detection.py
-    python test_plate_detection.py "path/to/any_car_image.jpg"
+    python tests/test_plate_detection.py
+    python tests/test_plate_detection.py "path/to/any_car_image.jpg"
 =============================================================================
 """
 
@@ -15,8 +15,10 @@ import cv2
 import torch
 import torch.serialization
 
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 # Ensure local yolov10 is importable
-yolov10_dir = os.path.join(os.path.dirname(__file__), "yolov10")
+yolov10_dir = os.path.join(PROJECT_ROOT, "yolov10")
 if yolov10_dir not in sys.path:
     sys.path.insert(0, yolov10_dir)
 
@@ -42,8 +44,8 @@ print("Testing YOLOv10 License Plate Detection")
 print("=" * 60)
 
 # 1. Determine Model Path
-model_path = os.path.join(os.path.dirname(__file__), "weights", "best.pt")
-fallback_path = os.path.join(os.path.dirname(__file__), "yolov10", "weights", "yolov10s.pt")
+model_path = os.path.join(PROJECT_ROOT, "weights", "best.pt")
+fallback_path = os.path.join(PROJECT_ROOT, "yolov10", "weights", "yolov10s.pt")
 
 if os.path.exists(model_path):
     print(f"[OK] Using trained weights: {model_path}")
@@ -61,12 +63,12 @@ if len(sys.argv) > 1 and os.path.exists(sys.argv[1]):
     image_path = sys.argv[1]
 else:
     # Pick the first image from test dataset
-    test_images = glob.glob("numberplate_dataset/test/images/*.*")
+    test_images = glob.glob(os.path.join(PROJECT_ROOT, "numberplate_dataset", "test", "images", "*.*"))
     if not test_images:
-        test_images = glob.glob("numberplate_dataset/valid/images/*.*")
+        test_images = glob.glob(os.path.join(PROJECT_ROOT, "numberplate_dataset", "valid", "images", "*.*"))
     if not test_images:
         print("[ERROR] No sample test images found in 'numberplate_dataset/test/images/'.")
-        print("Please provide an image: python test_plate_detection.py <image_path>")
+        print("Please provide an image: python tests/test_plate_detection.py <image_path>")
         sys.exit(1)
     image_path = test_images[0]
 
@@ -116,7 +118,8 @@ for idx, box in enumerate(results.boxes):
     cv2.putText(img, label, (x1, max(y1 - 10, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
 # 5. Save output
-output_file = "test_result.jpg"
+output_file = os.path.join(PROJECT_ROOT, "tests", "artifacts", "test_result.jpg")
+os.makedirs(os.path.dirname(output_file), exist_ok=True)
 cv2.imwrite(output_file, img)
 print(f"\n[SUCCESS] Annotated image saved to: {output_file}")
 print("=" * 60)

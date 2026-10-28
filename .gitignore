@@ -39,6 +39,7 @@ __pycache__/
 /runs/
 /scratch/
 /test_result.jpg
+/tests/artifacts/
 *.log
 *.tmp
 *.bak

@@ -54,20 +54,20 @@ Before connecting to the live camera, verify that your AI model and OCR read pla
 1. Open your VS Code terminal (or PowerShell).
 2. Run the test script:
    ```powershell
-   python test_plate_detection.py
+   python tests/test_plate_detection.py
    ```
 3. You will see:
    - Plate detection bounding box coordinates.
    - YOLO confidence percentage (e.g. `92%`).
    
    - OCR plate text (e.g. `ABC 1234`).
-   - An output image named `test_result.jpg` created in your folder showing the visual detection box.
+   - An output image at `tests/artifacts/test_result.jpg` showing the visual detection box.
 
 ---
 
 ### Step 3: Check Configuration in `detect_plate_server.py`
 
-Open [`detect_plate_server.py`](file:///d:/xampp/htdocs/NewCapstone/detect_plate_server.py) and confirm lines 30–75 match your setup:
+Open [`detect_plate_server.py`](../../detect_plate_server.py) and confirm lines 30–75 match your setup:
 
 ```python
 # 1. CCTV RTSP URL (Tapo C500)
@@ -180,8 +180,8 @@ When a license plate is detected and read:
 
 | File | Role |
 |------|------|
-| [`weights/best.pt`](file:///d:/xampp/htdocs/NewCapstone/weights/best.pt) | Your trained YOLOv10 license plate weights |
-| [`test_plate_detection.py`](file:///d:/xampp/htdocs/NewCapstone/test_plate_detection.py) | Standalone test script for single images |
-| [`detect_plate_server.py`](file:///d:/xampp/htdocs/NewCapstone/detect_plate_server.py) | Full backend: Camera + AI + OCR + MySQL |
-| [`cctv.html`](file:///d:/xampp/htdocs/NewCapstone/cctv.html) | Live web interface with video + detection logs |
-| [`guard_dashboard.php`](file:///d:/xampp/htdocs/NewCapstone/guard_dashboard.php) | Security guard web dashboard |
+| [`weights/best.pt`](../../weights/best.pt) | Your trained YOLOv10 license plate weights |
+| [`test_plate_detection.py`](../../tests/test_plate_detection.py) | Standalone test script for single images |
+| [`detect_plate_server.py`](../../detect_plate_server.py) | Full backend: Camera + AI + OCR + MySQL |
+| [`cctv.html`](../../cctv.html) | Live web interface with video + detection logs |
+| [`guard_dashboard.php`](../../guard_dashboard.php) | Security guard web dashboard |

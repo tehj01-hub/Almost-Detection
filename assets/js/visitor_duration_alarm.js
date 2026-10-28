@@ -48,7 +48,7 @@
     var isFetchingApi       = false;
 
     /* ---------------------------------------------------------------------
-       DURATION MILESTONE RULES (MIRRORS system_config.php)
+       DURATION MILESTONE RULES (MIRRORS app/system_config.php)
     --------------------------------------------------------------------- */
     var PRESET_DEFINITIONS = {
         "Drop - off/on - 15 Mins": {

@@ -1,6 +1,6 @@
 <?php
-require_once __DIR__ . '/session_helper.php';
-require_once __DIR__ . '/system_config.php';
+require_once __DIR__ . '/app/session_helper.php';
+require_once __DIR__ . '/app/system_config.php';
 secsysStartRoleSession('Administrator');
 
 /* =========================================================
@@ -5731,7 +5731,7 @@ document.addEventListener("DOMContentLoaded", function() {
 
 <!-- Live auto-refresh (no full page reload) -->
 <script>window.AUTO_REFRESH_SECONDS = 5;</script>
-<script src="auto_refresh.js"></script>
+<script src="assets/js/auto_refresh.js"></script>
 
 </body>
 

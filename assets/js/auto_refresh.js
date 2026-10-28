@@ -9,7 +9,7 @@
 
    Usage (before </body>):
      <script>window.AUTO_REFRESH_SECONDS = 5;</script>
-     <script src="auto_refresh.js"></script>
+     <script src="assets/js/auto_refresh.js"></script>
 
    The refresh is skipped while the user is busy:
      - typing in an input / textarea / select

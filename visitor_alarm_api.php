@@ -1,7 +1,7 @@
 <?php
 
-require_once __DIR__ . '/session_helper.php';
-require_once __DIR__ . '/system_config.php';
+require_once __DIR__ . '/app/session_helper.php';
+require_once __DIR__ . '/app/system_config.php';
 
 header('Content-Type: application/json; charset=utf-8');
 header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');

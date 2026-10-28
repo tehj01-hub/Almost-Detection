@@ -1,6 +1,6 @@
 <?php
-require_once __DIR__ . '/session_helper.php';
-require_once __DIR__ . '/system_config.php';
+require_once __DIR__ . '/app/session_helper.php';
+require_once __DIR__ . '/app/system_config.php';
 secsysStartRoleSession('Administrator');
 
 /* =========================================================
@@ -2189,7 +2189,7 @@ body {
         </div>
 
 
-        <!-- Live chart data (read by auto_refresh.js) -->
+        <!-- Live chart data (read by assets/js/auto_refresh.js) -->
         <script type="application/json" id="liveChartData" data-live><?php
             echo json_encode([
                 'labels' => $hours,
@@ -2874,11 +2874,11 @@ document.addEventListener("DOMContentLoaded", initTapoCameras);
 
 <!-- Shared Per-Duration Visitor Reminder & Overstay Alarm Engine -->
 <script>window.SECSYS_ALARM_ROLE = "Administrator";</script>
-<script src="visitor_duration_alarm.js"></script>
+<script src="assets/js/visitor_duration_alarm.js"></script>
 
 <!-- Live auto-refresh (no full page reload) -->
 <script>window.AUTO_REFRESH_SECONDS = 5;</script>
-<script src="auto_refresh.js"></script>
+<script src="assets/js/auto_refresh.js"></script>
 
 
 </body>

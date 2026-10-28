@@ -1,6 +1,6 @@
 <?php
 
-require_once __DIR__ . '/session_helper.php';
+require_once __DIR__ . '/app/session_helper.php';
 
 /* ===========================================================
    WHICH USER(S) ARE LOGGING OUT?

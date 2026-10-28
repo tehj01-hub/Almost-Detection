@@ -28,7 +28,7 @@ import cv2
 import numpy as np
 import torch
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
@@ -256,7 +256,7 @@ def main():
         lpr_raw = LPRNetRecognizer(checkpoint_path=args.weights, preprocessing_mode="raw_resize")
         results.append(evaluate_model("LPRNet (Ablation: Raw Resize)", lambda bgr: lpr_raw.recognize(bgr).raw_text, dataset))
     else:
-        print(f"[EVAL] LPRNet weights not found at {args.weights}. Train via train_lprnet_ph.py first.")
+        print(f"[EVAL] LPRNet weights not found at {args.weights}. Train via training/train_lprnet_ph.py first.")
 
     os.makedirs(os.path.dirname(os.path.abspath(args.output_report)), exist_ok=True)
     with open(args.output_report, "w", encoding="utf-8") as f:
