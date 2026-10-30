@@ -15,7 +15,7 @@ Arbitration Rules:
 """
 
 from dataclasses import dataclass, field
-import concurrent.futures
+from .reader_pool import BoundedReaderPool
 import json
 import os
 import re
@@ -219,7 +219,7 @@ def extract_best_template_match(raw_string: str, registered_plates: Optional[Dic
                 fixed, cost, disp = score_and_fix_syntax(sub, tpl)
                 if fixed:
                     is_reg = fixed in regs
-                    priority = cost - (100 if is_reg else 0)
+                    priority = cost  # Registration classifies a plate; it must not choose its OCR text.
                     candidates.append((priority, cost, -len(sub), fixed, disp, tpl[0], is_reg))
 
     if candidates:
@@ -362,7 +362,8 @@ class QuadReaderEnsemble:
         lprnet_recognizer=None,
         gpt_vision_reader: Optional[GPTVisionReader] = None,
         min_accept_confidence: float = 0.50,
-        min_sharpness: float = 8.0
+        min_sharpness: float = 8.0,
+        reader_pool: Optional[BoundedReaderPool] = None
     ):
         self.easyocr = easyocr_reader
         self.paddleocr = paddleocr_reader
@@ -370,6 +371,7 @@ class QuadReaderEnsemble:
         self.gpt_vision = gpt_vision_reader or GPTVisionReader()
         self.min_accept_confidence = min_accept_confidence
         self.min_sharpness = min_sharpness
+        self.reader_pool = reader_pool or BoundedReaderPool()
 
     @staticmethod
     def preprocess_crop(bgr_crop: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -378,7 +380,7 @@ class QuadReaderEnsemble:
             return bgr_crop, bgr_crop
 
         crop_h, crop_w = bgr_crop.shape[:2]
-        target_h = 70
+        target_h = 96
         scale = target_h / float(max(1, crop_h))
         target_w = max(10, int(crop_w * scale))
         resized = cv2.resize(bgr_crop, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
@@ -392,13 +394,19 @@ class QuadReaderEnsemble:
 
         return resized, sharpened_bgr
 
+    @staticmethod
+    def number_region(crop):
+        # Tall plate crops often contain a small registration header above the main line.
+        h, w = crop.shape[:2]
+        return crop[int(h * 0.25):, :] if w / max(1, h) < 2.7 else crop
+
     def read_with_easyocr(self, bgr_crop: np.ndarray) -> Tuple[str, float]:
         """Run EasyOCR on standardized CLAHE-enhanced & raw crop."""
         if self.easyocr is None:
             return "", 0.0
 
         try:
-            resized, sharpened_bgr = self.preprocess_crop(bgr_crop)
+            resized, sharpened_bgr = self.preprocess_crop(self.number_region(bgr_crop))
             sharpened_gray = cv2.cvtColor(sharpened_bgr, cv2.COLOR_BGR2GRAY)
 
             # Pass 1: Enhanced sharpened crop
@@ -428,19 +436,39 @@ class QuadReaderEnsemble:
             resized, sharpened_bgr = self.preprocess_crop(bgr_crop)
 
             res = None
-            try:
-                res = self.paddleocr.ocr(sharpened_bgr)
-            except Exception:
+            if getattr(self.paddleocr, 'plate_recognition_only', False):
+                res = self.paddleocr.predict(self.number_region(bgr_crop))
+            else:
                 try:
-                    res = self.paddleocr.predict(sharpened_bgr)
+                    res = self.paddleocr.ocr(sharpened_bgr)
                 except Exception:
-                    pass
+                    try:
+                        res = self.paddleocr.predict(sharpened_bgr)
+                    except Exception:
+                        pass
 
             if not res:
                 return "", 0.0
 
             tokens = []
             confs = []
+
+            # PaddleOCR 3 returns dictionaries with rec_texts/rec_scores arrays.
+            result_items = res if isinstance(res, (list, tuple)) else [res]
+            for item in result_items:
+                if isinstance(item, dict):
+                    data = item.get('res', item)
+                    texts = data.get('rec_texts', [])
+                    scores = data.get('rec_scores', [])
+                    if 'rec_text' in data:
+                        texts = [data['rec_text']]
+                        scores = [data.get('rec_score', 0.0)]
+                    for index, text in enumerate(texts):
+                        if str(text).strip():
+                            tokens.append(str(text).strip())
+                            confs.append(float(scores[index]) if index < len(scores) else 0.0)
+            if tokens:
+                return ' '.join(tokens), sum(confs) / len(confs)
 
             lines = res[0] if isinstance(res, list) and len(res) > 0 and isinstance(res[0], list) else res
             for line in lines:
@@ -463,7 +491,7 @@ class QuadReaderEnsemble:
 
     def read_with_lprnet(self, bgr_crop: np.ndarray) -> Tuple[str, float]:
         """Run LPRNet on plate crop."""
-        if self.lprnet is None:
+        if self.lprnet is None or getattr(self.lprnet, 'meta', {}).get('status') == 'uninitialized':
             return "", 0.0
 
         try:
@@ -512,38 +540,20 @@ class QuadReaderEnsemble:
                 review_reason=f"Plate image quality insufficient (sharpness={quality.sharpness:.1f}, flags={','.join(quality.quality_flags)})"
             )
 
-        # Run active readers in parallel via ThreadPoolExecutor for low latency
-        easy_raw, easy_conf = "", 0.0
-        pad_raw, pad_conf = "", 0.0
-        lpr_raw, lpr_conf = "", 0.0
-        gpt_raw, gpt_conf = "", 0.0
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-            fut_easy = executor.submit(self.read_with_easyocr, bgr_crop) if self.easyocr else None
-            fut_pad = executor.submit(self.read_with_paddleocr, bgr_crop) if self.paddleocr else None
-            fut_lpr = executor.submit(self.read_with_lprnet, bgr_crop) if self.lprnet else None
-            fut_gpt = executor.submit(self.read_with_gpt_vision, bgr_crop) if (self.gpt_vision and self.gpt_vision.is_configured()) else None
-
-            if fut_easy:
-                try:
-                    easy_raw, easy_conf = fut_easy.result(timeout=1.2)
-                except Exception:
-                    pass
-            if fut_pad:
-                try:
-                    pad_raw, pad_conf = fut_pad.result(timeout=1.2)
-                except Exception:
-                    pass
-            if fut_lpr:
-                try:
-                    lpr_raw, lpr_conf = fut_lpr.result(timeout=1.2)
-                except Exception:
-                    pass
-            if fut_gpt:
-                try:
-                    gpt_raw, gpt_conf = fut_gpt.result(timeout=1.5)
-                except Exception:
-                    pass
+        readers = {}
+        if self.easyocr:
+            readers['easyocr'] = self.read_with_easyocr
+        if self.paddleocr:
+            readers['paddleocr'] = self.read_with_paddleocr
+        if self.lprnet:
+            readers['lprnet'] = self.read_with_lprnet
+        if len(readers) < 2 and self.gpt_vision and self.gpt_vision.is_configured():
+            readers['gpt_vision'] = self.read_with_gpt_vision
+        predictions = self.reader_pool.read(readers, bgr_crop, timeout=4.0)
+        easy_raw, easy_conf = predictions.get('easyocr', ('', 0.0))
+        pad_raw, pad_conf = predictions.get('paddleocr', ('', 0.0))
+        lpr_raw, lpr_conf = predictions.get('lprnet', ('', 0.0))
+        gpt_raw, gpt_conf = predictions.get('gpt_vision', ('', 0.0))
 
         # Parse & extract candidate plates using Philippine templates
         easy_plate, easy_disp, easy_score, easy_fmt, _, easy_reg = extract_best_template_match(easy_raw, registered_plates)
@@ -585,23 +595,51 @@ class QuadReaderEnsemble:
                 review_reason="None of the active OCR engines detected legible characters"
             )
 
-        # Priority Check: Exact Registered Vehicle Match
-        for m_name, (plate, conf) in active_candidates.items():
-            if registered_plates and plate in registered_plates:
-                fmt_name = model_preds[m_name].get("format") or "registered"
-                disp_str = model_preds[m_name].get("display") or plate
-                return QuadEnsembleResult(
-                    decision="ACCEPT",
-                    final_plate=plate,
-                    display_plate=disp_str,
-                    confidence=max(0.95, conf),
-                    method="REGISTERED_MATCH",
-                    matched_format=fmt_name,
-                    model_predictions=model_preds,
-                    char_analysis=[],
-                    quality=quality,
-                    review_reason=None
-                )
+        # Require independently agreeing, sufficiently confident readers for automatic logging.
+        reliable = {name: value for name, value in active_candidates.items()
+                    if value[1] >= self.min_accept_confidence}
+        votes = {}
+        for name, (plate, confidence) in reliable.items():
+            votes.setdefault(plate, []).append(name)
+        best_support = max((len(names) for names in votes.values()), default=0)
+        leaders = [plate for plate, names in votes.items() if len(names) == best_support]
+        if best_support < 2 and len(reliable) >= 2:
+            glyphs = str.maketrans({'O':'0', 'D':'0', 'Q':'0', 'I':'1', 'L':'1', 'Z':'2', 'S':'5', 'G':'6', 'B':'8'})
+            families = {}
+            for name, (plate, confidence) in reliable.items():
+                key = (model_preds[name]['format'], plate.translate(glyphs))
+                families.setdefault(key, []).append(name)
+            supported = [names for names in families.values() if len(names) >= 2]
+            if len(supported) == 1:
+                names = sorted(supported[0], key=lambda name: reliable[name][1], reverse=True)
+                if reliable[names[0]][1] - reliable[names[1]][1] >= 0.02:
+                    name = names[0]
+                    plate, confidence = reliable[name]
+                    return QuadEnsembleResult(
+                        decision='ACCEPT', final_plate=plate, display_plate=model_preds[name]['display'],
+                        confidence=sum(reliable[n][1] for n in names)/len(names),
+                        method='INDEPENDENT_CONFUSABLE_AGREEMENT', matched_format=model_preds[name]['format'],
+                        model_predictions=model_preds, char_analysis=[], quality=quality, review_reason=None)
+        # One trained recognizer can nominate a very strong reading; the live tracker
+        # logs clear 80%+ readings immediately and confirms lower scores across frames.
+        if len(reliable) == 1 and 'paddleocr' in reliable and reliable['paddleocr'][1] >= 0.70:
+            plate, confidence = reliable['paddleocr']
+            return QuadEnsembleResult(
+                decision='ACCEPT', final_plate=plate, display_plate=model_preds['paddleocr']['display'],
+                confidence=confidence, method='STRONG_PADDLE_TEMPORAL_CANDIDATE',
+                matched_format=model_preds['paddleocr']['format'], model_predictions=model_preds,
+                char_analysis=[], quality=quality, review_reason=None)
+        if best_support < 2 or len(leaders) != 1:
+            name, (plate, confidence) = max(active_candidates.items(), key=lambda item: item[1][1])
+            return QuadEnsembleResult(
+                decision='NEEDS_REVIEW', final_plate=plate,
+                display_plate=model_preds[name].get('display') or plate,
+                confidence=confidence, method='INSUFFICIENT_READER_AGREEMENT',
+                matched_format=model_preds[name].get('format'), model_predictions=model_preds,
+                char_analysis=[], quality=quality,
+                review_reason='At least two reliable readers must agree before automatic logging')
+        active_candidates = reliable
+        num_active = len(active_candidates)
 
         # Arbitration Step 1: Majority Voting (String-Level)
         plate_votes: Dict[str, List[str]] = {}

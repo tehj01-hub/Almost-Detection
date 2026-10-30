@@ -3733,7 +3733,7 @@ body {
             <div class="camera-card-header">
 
                 <div class="camera-title">
-                    <span>Entrance Cam</span>
+                    <span id="entranceCameraTitle">Entrance Cam</span>
                     <span class="camera-tag dir-badge-in" style="font-size:11px; padding:3px 10px; font-weight:800;">🟢 IN (Entrance)</span>
                 </div>
 
@@ -3819,7 +3819,7 @@ body {
             <div class="camera-card-header">
 
                 <div class="camera-title">
-                    <span>Exit Cam</span>
+                    <span id="exitCameraTitle">Exit Cam</span>
                     <span class="camera-tag dir-badge-out" style="font-size:11px; padding:3px 10px; font-weight:800;">🔴 OUT (Exit Only)</span>
                 </div>
 
@@ -4227,7 +4227,7 @@ body {
         <div class="tapo-modal-header">
 
             <div class="tapo-modal-title">
-                📹 Dual Camera System Setup (Entrance & Exit)
+                📹 Camera Setup (One or Two Cameras)
             </div>
 
             <button
@@ -4242,6 +4242,24 @@ body {
         </div>
 
         <div class="tapo-modal-body">
+
+            <div class="tapo-form-group">
+                <label for="cfgCameraMode">Number of cameras:</label>
+                <select id="cfgCameraMode" onchange="updateCameraModeControls()" style="width:100%; padding:8px;">
+                    <option value="single">1 camera - shared entrance and exit view</option>
+                    <option value="dual">2 cameras - separate entrance and exit</option>
+                </select>
+            </div>
+            <div class="tapo-form-group" id="singleDirectionControls">
+                <label for="cfgSingleDirection">Shared-camera logging:</label>
+                <select id="cfgSingleDirection" onchange="updateCameraModeControls()" style="width:100%; padding:8px;">
+                    <option value="AUTO">Automatic IN / OUT on each return</option>
+                    <option value="IN">IN - vehicles entering</option>
+                    <option value="OUT">OUT - vehicles leaving</option>
+                </select>
+                <p class="tapo-help-text">Automatic: the first appearance records IN; after the plate leaves view and returns, an open visit records OUT. Keep the plate out of view for at least three processed frames before scanning it again. IN or OUT can also be selected manually.</p>
+            </div>
+            <p id="cameraSettingsError" role="alert" style="color:#b91c1c;" hidden></p>
 
             <!-- Quick Presets -->
             <div style="margin-bottom: 14px;">
@@ -4265,8 +4283,8 @@ body {
             <div class="cam-section-card">
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
                     <div style="font-weight: 700; font-size: 13px; color: #0f172a; display: flex; align-items: center; gap: 8px;">
-                        <span>🟢 Entrance Camera (192.168.1.18)</span>
-                        <span style="background: #dcfce7; color: #15803d; padding: 2px 8px; border-radius: 9999px; font-size: 11px; font-weight: 700;">Direction: IN</span>
+                        <span id="settingsEntranceTitle">Entrance / Shared Camera</span>
+                        <span style="background: #dcfce7; color: #15803d; padding: 2px 8px; border-radius: 9999px; font-size: 11px; font-weight: 700;" id="settingsEntranceDirection">Direction: IN</span>
                     </div>
                     <span id="modalEntranceStatus" style="font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 9999px; background: #e2e8f0; color: #475569;">
                         Checking...
@@ -4278,10 +4296,10 @@ body {
                     <input
                         type="text"
                         id="cfgEntranceSource"
-                        placeholder="rtsp://Jhetlogs:123456789ten@192.168.1.18:554/stream2"
+                        placeholder="rtsp://username:password@CAMERA_IP:554/stream1"
                     >
                     <div class="tapo-help-text">
-                        For Tapo C500: <code>rtsp://username:password@IP:554/stream2</code> | For USB webcam: <code>0</code>
+                        For Tapo cameras: <code>rtsp://username:password@IP:554/stream2</code> | For USB webcam: <code>0</code>
                     </div>
                 </div>
 
@@ -4306,10 +4324,10 @@ body {
             </div>
 
             <!-- Exit Camera Card -->
-            <div class="cam-section-card">
+            <div class="cam-section-card" id="separateExitSettings">
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
                     <div style="font-weight: 700; font-size: 13px; color: #0f172a; display: flex; align-items: center; gap: 8px;">
-                        <span>🔴 Exit Camera (192.168.1.19 - EXIT ONLY)</span>
+                        <span>Exit Camera</span>
                         <span style="background: #ffedd5; color: #c2410c; padding: 2px 8px; border-radius: 9999px; font-size: 11px; font-weight: 700;">Direction: OUT</span>
                     </div>
                     <span id="modalExitStatus" style="font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 9999px; background: #e2e8f0; color: #475569;">
@@ -4318,14 +4336,15 @@ body {
                 </div>
 
                 <div class="tapo-form-group">
+                    <label style="display:block; margin-bottom:10px;"><input type="checkbox" id="cfgExitEnabled" checked> Enable exit camera (automatic OUT)</label>
                     <label for="cfgExitSource">Hardware Source (Tapo RTSP URL or USB Cam Index):</label>
                     <input
                         type="text"
                         id="cfgExitSource"
-                        placeholder="rtsp://Jhetlogs:123456789ten@192.168.1.19:554/stream2"
+                        placeholder="rtsp://username:password@SECOND_CAMERA_IP:554/stream1"
                     >
                     <div class="tapo-help-text">
-                        For 2nd Tapo C500: <code>rtsp://...IP:554/stream2</code> | For USB webcam: <code>0</code> or <code>1</code>
+                        For a second Tapo camera: <code>rtsp://...IP:554/stream2</code> | For USB webcam: <code>0</code> or <code>1</code>
                     </div>
                 </div>
 
@@ -6100,6 +6119,19 @@ function reloadCamStream(camKey) {
     img.src = savedUrl + cacheBuster;
 }
 
+function updateCameraModeControls() {
+    const single = document.getElementById("cfgCameraMode").value === "single";
+    document.getElementById("singleDirectionControls").hidden = !single;
+    document.getElementById("separateExitSettings").hidden = single;
+    document.getElementById("settingsEntranceTitle").textContent = single ? "Shared Camera" : "Entrance Camera";
+    document.getElementById("settingsEntranceDirection").textContent = "Direction: " + (single ? document.getElementById("cfgSingleDirection").value : "IN");
+}
+
+function updateCameraPanelTitles(mode, direction) {
+    document.getElementById("entranceCameraTitle").textContent = mode === "single" ? "Shared Camera - " + (direction === "AUTO" ? "Automatic IN / OUT" : direction) : "Entrance Cam - IN";
+    document.getElementById("exitCameraTitle").textContent = mode === "single" ? "Shared Camera - " + (direction === "AUTO" ? "Automatic IN / OUT" : direction) + " (same feed)" : "Exit Cam - OUT";
+}
+
 async function openTapoModal(targetCam) {
     const modal = document.getElementById("tapoSetupModal");
     const inputEntranceUrl = document.getElementById("cfgEntranceUrl");
@@ -6120,11 +6152,16 @@ async function openTapoModal(targetCam) {
         modal.classList.add("active");
     }
 
+    document.getElementById("cameraSettingsError").hidden = true;
     // Fetch live hardware camera sources & connection state from Python server
     try {
         const res = await fetch(API_BASE_URL + "/api/cameras", { cache: "no-store" });
         const data = await res.json();
         if (data.success && data.cameras) {
+            document.getElementById("cfgCameraMode").value = data.camera_mode || "dual";
+            document.getElementById("cfgSingleDirection").value = data.single_direction || "IN";
+            document.getElementById("cfgExitEnabled").checked = data.separate_exit_enabled !== false;
+            updateCameraModeControls();
             if (data.cameras.entrance && inputEntranceSrc) {
                 inputEntranceSrc.value = data.cameras.entrance.source || "";
                 if (data.cameras.entrance.zoom_factor && document.getElementById("cfgEntranceZoom")) {
@@ -6138,13 +6175,13 @@ async function openTapoModal(targetCam) {
                 }
             }
             if (data.cameras.exit && inputExitSrc) {
-                inputExitSrc.value = data.cameras.exit.source || "";
+                inputExitSrc.value = data.separate_exit_source || data.cameras.exit.source || "";
                 if (data.cameras.exit.zoom_factor && document.getElementById("cfgExitZoom")) {
-                    document.getElementById("cfgExitZoom").value = String(data.cameras.exit.zoom_factor);
+                    document.getElementById("cfgExitZoom").value = String(data.separate_exit_zoom || data.cameras.exit.zoom_factor);
                 }
                 if (statusExit) {
                     const isConn = data.cameras.exit.connected;
-                    statusExit.innerText = isConn ? "🟢 Connected" : "🔴 Offline";
+                    statusExit.innerText = data.separate_exit_enabled === false ? "Disabled - waiting for second camera" : (isConn ? "Connected" : "Offline");
                     statusExit.style.background = isConn ? "#dcfce7" : "#fee2e2";
                     statusExit.style.color = isConn ? "#15803d" : "#dc2626";
                 }
@@ -6164,6 +6201,8 @@ function closeTapoModal() {
 }
 
 function applyPresetDualTapo() {
+    document.getElementById("cfgCameraMode").value = "dual";
+    updateCameraModeControls();
     const entSrc = document.getElementById("cfgEntranceSource");
     const exitSrc = document.getElementById("cfgExitSource");
     const entUrl = document.getElementById("cfgEntranceUrl");
@@ -6176,6 +6215,8 @@ function applyPresetDualTapo() {
 }
 
 function applyPresetTapoAndWebcam() {
+    document.getElementById("cfgCameraMode").value = "dual";
+    updateCameraModeControls();
     const entSrc = document.getElementById("cfgEntranceSource");
     const exitSrc = document.getElementById("cfgExitSource");
     const entUrl = document.getElementById("cfgEntranceUrl");
@@ -6188,6 +6229,8 @@ function applyPresetTapoAndWebcam() {
 }
 
 function applyPresetDualWebcams() {
+    document.getElementById("cfgCameraMode").value = "dual";
+    updateCameraModeControls();
     const entSrc = document.getElementById("cfgEntranceSource");
     const exitSrc = document.getElementById("cfgExitSource");
     const entUrl = document.getElementById("cfgEntranceUrl");
@@ -6208,8 +6251,6 @@ async function saveTapoSettings() {
     const entranceUrlVal = (inputEntranceUrl && inputEntranceUrl.value.trim()) || DEFAULT_ENTRANCE_URL;
     const exitUrlVal = (inputExitUrl && inputExitUrl.value.trim()) || DEFAULT_EXIT_URL;
 
-    localStorage.setItem("tapo_entrance_url", entranceUrlVal);
-    localStorage.setItem("tapo_exit_url", exitUrlVal);
 
     // Push hardware camera sources & view/zoom to Python detection server live
     const entSrcVal = inputEntranceSrc ? inputEntranceSrc.value.trim() : "";
@@ -6218,18 +6259,27 @@ async function saveTapoSettings() {
     const exitZoomVal = document.getElementById("cfgExitZoom") ? parseFloat(document.getElementById("cfgExitZoom").value) : 1.35;
 
     try {
-        await fetch(API_BASE_URL + "/api/cameras", {
+        const res = await fetch(API_BASE_URL + "/api/cameras", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
+                camera_mode: document.getElementById("cfgCameraMode").value,
+                single_direction: document.getElementById("cfgSingleDirection").value,
                 entrance_source: entSrcVal,
-                exit_source: exitSrcVal,
-                entrance_zoom: entZoomVal,
-                exit_zoom: exitZoomVal
+                ...(document.getElementById("cfgCameraMode").value === "dual" ? { exit_source: exitSrcVal, exit_zoom: exitZoomVal, exit_enabled: document.getElementById("cfgExitEnabled").checked } : {}),
+                entrance_zoom: entZoomVal
             })
         });
+        const data = await res.json();
+        if (!res.ok || !data.success) throw new Error(data.message || "Camera settings were not saved.");
+        localStorage.setItem("tapo_entrance_url", entranceUrlVal);
+        localStorage.setItem("tapo_exit_url", exitUrlVal);
+        updateCameraPanelTitles(data.camera_mode, data.single_direction);
     } catch (e) {
-        console.warn("Could not push hardware sources to detection server:", e);
+        const error = document.getElementById("cameraSettingsError");
+        error.textContent = "Could not save camera settings: " + e.message;
+        error.hidden = false;
+        return;
     }
 
     closeTapoModal();
@@ -6243,6 +6293,7 @@ async function checkDetectionServerStatus() {
         const res = await fetch(API_BASE_URL + "/api/status", { cache: "no-store" });
         const data = await res.json();
         if (data.success && data.cameras) {
+            updateCameraPanelTitles(data.camera_mode, data.single_direction);
             const ent = data.cameras.entrance;
             const ex = data.cameras.exit;
 

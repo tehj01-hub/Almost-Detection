@@ -18,7 +18,14 @@
 #
 # =========================================================
 
+import os
+# Keep video decoding and parallel OCR from each claiming all CPU cores.
+for _thread_limit in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS'):
+    os.environ.setdefault(_thread_limit, '2')
 import cv2
+cv2.setNumThreads(2)
+from app.vehicle_visit_logger import record_vehicle_visit
+from lpr_engine.plate_tracker import PlateTracker
 import time
 import threading
 import os
@@ -53,7 +60,7 @@ if USE_CUDA:
         print("[INFO] *** GPU ACCELERATION ACTIVE (CUDA) ***")
 else:
     # Optimize PyTorch CPU thread allocation if running on CPU
-    torch.set_num_threads(4)
+    torch.set_num_threads(2)
     print("[INFO] CUDA GPU not detected by PyTorch. Running on CPU multi-threading.")
 
 # Allowlist YOLOv10 weights loading in PyTorch 2.6+
@@ -262,24 +269,18 @@ def load_ocr():
     except Exception as e:
         print(f"[WARNING] EasyOCR failed to load: {e}")
 
-    # 2. PaddleOCR
+    # 2. Recognition-only Paddle model: YOLO has already located the plate.
     paddle_reader = None
     try:
-        from paddleocr import PaddleOCR
-        try:
-            import paddle
-            if USE_CUDA and paddle.device.is_compiled_with_cuda():
-                paddle.device.set_device('gpu')
-                print(f"[INFO] Loading PaddleOCR on GPU (PP-OCRv6)...")
-            else:
-                paddle.device.set_device('cpu')
-                print(f"[INFO] Loading PaddleOCR on CPU (PP-OCRv6)...")
-        except Exception:
-            print("[INFO] Loading PaddleOCR (PP-OCRv6)...")
-        paddle_reader = PaddleOCR(use_angle_cls=False, lang='en')
-        print("[INFO] PaddleOCR loaded successfully!")
+        from paddleocr import TextRecognition
+        model_dir = os.path.join(BASE_DIR, '.paddle_cache', '.paddlex', 'official_models', 'PP-OCRv6_medium_rec')
+        paddle_reader = TextRecognition(
+            model_name='PP-OCRv6_medium_rec', model_dir=model_dir if os.path.isdir(model_dir) else None,
+            device='gpu:0' if USE_CUDA else 'cpu', cpu_threads=2, enable_mkldnn=False)
+        paddle_reader.plate_recognition_only = True
+        print('[INFO] PaddleOCR plate recognition model loaded (no redundant text detector).')
     except Exception as e:
-        print(f"[WARNING] PaddleOCR failed to load: {e}")
+        print(f'[WARNING] PaddleOCR failed to load: {e}')
 
     # 3. LPRNet
     lpr_recognizer = None
@@ -287,7 +288,7 @@ def load_ocr():
         from lpr_engine.recognizer import LPRNetRecognizer
         lprnet_weights = os.path.join(BASE_DIR, "weights", "lprnet_best.pth")
         if not os.path.exists(lprnet_weights):
-            lprnet_weights = None
+            raise FileNotFoundError('No trained LPRNet checkpoint found; excluding the untrained reader')
         lpr_device = torch.device(DEVICE)
         print(f"[INFO] Loading LPRNet Recognizer (Device: {DEVICE})...")
         lpr_recognizer = LPRNetRecognizer(checkpoint_path=lprnet_weights, device=lpr_device)
@@ -413,169 +414,19 @@ def check_plate_in_database(plate_number):
 
 
 def log_vehicle_detection(plate_number, db_info, direction='IN'):
-    """
-    Log a detected vehicle into vehicle_logs and vehicle_log_dates tables.
-    Supports both IN (Entrance Cam) and OUT (Exit Cam).
-    Exit Cam strictly logs OUT and closes sessions.
-    """
+    """Commit a fixed-direction event, or infer shared-camera direction from its open visit."""
     conn = get_db_connection()
     if not conn:
         return False
-
     try:
-        cursor = conn.cursor()
-
-        vehicle_category = db_info.get('category', 'Visitor')
-        vehicle_type = db_info.get('vehicle_type') or 'Car'
-        reg_id = db_info.get('registered_vehicle_id')
-        vis_id = db_info.get('visitor_vehicle_id')
-        purpose = db_info.get('purpose')
-        actual_plate = db_info.get('official_plate') or plate_number
-        norm_plate = normalize_plate(actual_plate)
-
-        # For visitors entering without prior visitor_vehicles record, auto-create one
-        if vehicle_category == 'Visitor' and not vis_id and direction == 'IN':
-            try:
-                cursor.execute(
-                    """
-                    INSERT INTO visitor_vehicles
-                        (visitor_name, address_to_visit, vehicle_type, plate_number, purpose, status, date_in, time_in, date_created)
-                    VALUES
-                        ('Visitor', '-', %s, %s, %s, 'IN', CURDATE(), NOW(), NOW())
-                    """,
-                    (vehicle_type, actual_plate, purpose or 'Visitor Entry')
-                )
-                conn.commit()
-                vis_id = cursor.lastrowid
-            except Exception as e:
-                print(f"[WARNING] Could not insert into visitor_vehicles: {e}")
-
-        # 1. Insert into vehicle_logs
-        if direction == 'OUT':
-            cursor.execute(
-                """
-                INSERT INTO vehicle_logs
-                    (plate_number, vehicle_category, vehicle_type,
-                     registered_vehicle_id, visitor_vehicle_id, visitor_name, purpose,
-                     direction, recognition_method, date_out, date_created)
-                VALUES
-                    (%s, %s, %s, %s, %s, %s, %s, 'OUT', 'OCR', CURDATE(), NOW())
-                """,
-                (
-                    actual_plate,
-                    vehicle_category,
-                    vehicle_type,
-                    reg_id,
-                    vis_id,
-                    'Visitor' if vehicle_category == 'Visitor' else None,
-                    purpose
-                )
-            )
-        else:
-            cursor.execute(
-                """
-                INSERT INTO vehicle_logs
-                    (plate_number, vehicle_category, vehicle_type,
-                     registered_vehicle_id, visitor_vehicle_id, visitor_name, purpose,
-                     direction, recognition_method, date_in, date_created)
-                VALUES
-                    (%s, %s, %s, %s, %s, %s, %s, 'IN', 'OCR', CURDATE(), NOW())
-                """,
-                (
-                    actual_plate,
-                    vehicle_category,
-                    vehicle_type,
-                    reg_id,
-                    vis_id,
-                    'Visitor' if vehicle_category == 'Visitor' else None,
-                    purpose
-                )
-            )
-
-        conn.commit()
-        inserted_id = cursor.lastrowid
-
-        # 2. Update or insert into vehicle_log_dates
-        if direction == 'OUT':
-            # Update latest open IN session
-            cursor.execute(
-                """
-                UPDATE vehicle_log_dates
-                SET date_out = CURDATE(), time_out = NOW(), status = 'OUT'
-                WHERE REPLACE(UPPER(plate_number), ' ', '') = %s
-                  AND (status = 'IN' OR time_out IS NULL)
-                ORDER BY id DESC LIMIT 1
-                """,
-                (norm_plate,)
-            )
-            conn.commit()
-
-            if cursor.rowcount == 0:
-                # No open IN session found; insert OUT record
-                try:
-                    cursor.execute(
-                        """
-                        INSERT INTO vehicle_log_dates
-                            (vehicle_log_id, plate_number, vehicle_category, vehicle_type,
-                             purpose, date_in, date_out, time_out, status)
-                        VALUES
-                            (%s, %s, %s, %s, %s, CURDATE(), CURDATE(), NOW(), 'OUT')
-                        """,
-                        (inserted_id, actual_plate, vehicle_category, vehicle_type, purpose)
-                    )
-                    conn.commit()
-                except Exception:
-                    pass
-
-            if vis_id:
-                try:
-                    cursor.execute(
-                        "UPDATE visitor_vehicles SET date_out = CURDATE(), time_out = NOW(), status = 'OUT' WHERE id = %s",
-                        (vis_id,)
-                    )
-                    conn.commit()
-                except Exception:
-                    pass
-
-        else:
-            # IN direction
-            try:
-                cursor.execute(
-                    """
-                    INSERT INTO vehicle_log_dates
-                        (vehicle_log_id, plate_number, vehicle_category, vehicle_type,
-                         purpose, date_in, time_in, status)
-                    VALUES
-                        (%s, %s, %s, %s, %s, CURDATE(), NOW(), 'IN')
-                    """,
-                    (inserted_id, actual_plate, vehicle_category, vehicle_type, purpose)
-                )
-                conn.commit()
-            except Exception:
-                pass
-
-            if vis_id:
-                try:
-                    cursor.execute(
-                        "UPDATE visitor_vehicles SET date_in = CURDATE(), time_in = NOW(), status = 'IN' WHERE id = %s",
-                        (vis_id,)
-                    )
-                    conn.commit()
-                except Exception:
-                    pass
-
-        print(
-            f"[DB] Logged detection ({direction}): "
-            f"{actual_plate} | {vehicle_category} | {vehicle_type} (id={inserted_id})"
-        )
-        return True
-
+        result = record_vehicle_visit(conn, plate_number, db_info, direction)
+        print(f"[DB] Logged detection ({result['direction']}): {plate_number} (id={result['log_id']})")
+        return result
     except Exception as e:
-        print(f"[ERROR] Failed to log detection: {e}")
+        print(f'[ERROR] Failed to log detection: {e}')
         return False
     finally:
-        if conn:
-            conn.close()
+        conn.close()
 
 
 # =========================================================
@@ -960,6 +811,7 @@ class CameraChannel:
         self.running = False
         self.connected = False
         self.capture_thread = None
+        self.reconnect_requested = threading.Event()
 
         # Frame state (updated by capture thread at camera FPS)
         self.raw_frame = None
@@ -1024,7 +876,8 @@ class CameraChannel:
                 return None
 
         # Try opening RTSP stream
-        cap = cv2.VideoCapture(src_clean, cv2.CAP_FFMPEG)
+        cap = cv2.VideoCapture(src_clean, cv2.CAP_FFMPEG, [
+            cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000, cv2.CAP_PROP_READ_TIMEOUT_MSEC, 3000])
         if cap.isOpened():
             ret, _ = cap.read()
             if ret:
@@ -1035,12 +888,12 @@ class CameraChannel:
         # If stream1 was requested and failed, auto-fallback to stream2 (H.264 substream)
         if "/stream1" in src_clean:
             fallback_url = src_clean.replace("/stream1", "/stream2")
-            cap2 = cv2.VideoCapture(fallback_url, cv2.CAP_FFMPEG)
+            cap2 = cv2.VideoCapture(fallback_url, cv2.CAP_FFMPEG, [
+                cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000, cv2.CAP_PROP_READ_TIMEOUT_MSEC, 3000])
             if cap2.isOpened():
                 ret, _ = cap2.read()
                 if ret:
                     print(f"[INFO] Camera [{self.name}] auto-switched to stable substream: {fallback_url}")
-                    self.source = fallback_url
                     cap2.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                     return cap2
                 cap2.release()
@@ -1052,75 +905,91 @@ class CameraChannel:
         failures = 0
         retry_delay = 1.0
 
-        while self.running:
-            if self.cap is None or not self.cap.isOpened():
-                time.sleep(retry_delay)
-                if not self.running:
-                    break
-                self.cap = self._open_capture(self.source)
-                self.connected = self.cap is not None and self.cap.isOpened()
-                if not self.connected:
-                    retry_delay = min(5.0, retry_delay + 0.5)
-                else:
-                    retry_delay = 1.0
-                    print(f"[INFO] Camera [{self.name} - {self.direction}] connected successfully: {self.source}")
-                continue
-
-            success, frame = self.cap.read()
-
-            if not success or frame is None:
-                failures += 1
-                if failures >= 15:
-                    self.connected = False
-                    print(f"[WARNING] Camera [{self.name}] stream interrupted, reconnecting...")
-                    failures = 0
-                    try:
+        try:
+            while self.running:
+                if self.reconnect_requested.is_set():
+                    self.reconnect_requested.clear()
+                    if self.cap is not None:
                         self.cap.release()
+                        self.cap = None
+                    self.connected = False
+                if self.cap is None or not self.cap.isOpened():
+                    time.sleep(retry_delay)
+                    if not self.running:
+                        break
+                    self.cap = self._open_capture(self.source)
+                    self.connected = self.cap is not None and self.cap.isOpened()
+                    if not self.connected:
+                        retry_delay = min(5.0, retry_delay + 0.5)
+                    else:
+                        retry_delay = 1.0
+                        print(f"[INFO] Camera [{self.name} - {self.direction}] connected successfully: {self.source}")
+                    continue
+
+                current_source = self.source
+                success, frame = self.cap.read()
+                if not self.running or current_source != self.source or self.reconnect_requested.is_set():
+                    continue
+
+                if not success or frame is None:
+                    failures += 1
+                    if failures >= 15:
+                        self.connected = False
+                        print(f"[WARNING] Camera [{self.name}] stream interrupted, reconnecting...")
+                        failures = 0
+                        try:
+                            self.cap.release()
+                        except Exception:
+                            pass
+                        self.cap = None
+                        time.sleep(0.5)
+                    else:
+                        time.sleep(0.01)
+                    continue
+
+                failures = 0
+                self.connected = True
+
+                if self.flip_180 or FLIP_CAMERA_180:
+                    frame = cv2.rotate(frame, cv2.ROTATE_180)
+
+                # Crop / Zoom into the vehicle lane (narrows wide-angle lens, focuses on car & plate)
+                if self.zoom_factor > 1.01:
+                    try:
+                        fh, fw = frame.shape[:2]
+                        cw = int(fw / self.zoom_factor)
+                        ch = int(fh / self.zoom_factor)
+                        cx1 = max(0, (fw - cw) // 2)
+                        cy1 = max(0, (fh - ch) // 2)
+                        frame = frame[cy1:cy1 + ch, cx1:cx1 + cw]
                     except Exception:
                         pass
-                    self.cap = None
-                    time.sleep(0.5)
-                else:
-                    time.sleep(0.01)
-                continue
 
-            failures = 0
-            self.connected = True
-
-            if self.flip_180 or FLIP_CAMERA_180:
-                frame = cv2.rotate(frame, cv2.ROTATE_180)
-
-            # Crop / Zoom into the vehicle lane (narrows wide-angle lens, focuses on car & plate)
-            if self.zoom_factor > 1.01:
+                # Quick motion detection on downscaled 160x90 grayscale (< 1ms)
                 try:
-                    fh, fw = frame.shape[:2]
-                    cw = int(fw / self.zoom_factor)
-                    ch = int(fh / self.zoom_factor)
-                    cx1 = max(0, (fw - cw) // 2)
-                    cy1 = max(0, (fh - ch) // 2)
-                    frame = frame[cy1:cy1 + ch, cx1:cx1 + cw]
+                    small = cv2.resize(frame, (160, 90))
+                    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+                    if self.prev_gray_thumb is not None:
+                        diff = cv2.absdiff(self.prev_gray_thumb, gray)
+                        score = float(np.mean(diff))
+                        if score > 2.2:
+                            self.last_motion_time = time.time()
+                            self.has_motion = True
+                        else:
+                            self.has_motion = False
+                    self.prev_gray_thumb = gray
                 except Exception:
                     pass
 
-            # Quick motion detection on downscaled 160x90 grayscale (< 1ms)
-            try:
-                small = cv2.resize(frame, (160, 90))
-                gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-                if self.prev_gray_thumb is not None:
-                    diff = cv2.absdiff(self.prev_gray_thumb, gray)
-                    score = float(np.mean(diff))
-                    if score > 2.2:
-                        self.last_motion_time = time.time()
-                        self.has_motion = True
-                    else:
-                        self.has_motion = False
-                self.prev_gray_thumb = gray
-            except Exception:
-                pass
-
-            with self.frame_lock:
-                self.raw_frame = frame
-                self.frame_seq += 1
+                with self.frame_lock:
+                    self.raw_frame = frame
+                    self.frame_seq += 1
+        finally:
+            # VideoCapture is owned by this thread. Never release it from an HTTP worker.
+            if self.cap is not None:
+                self.cap.release()
+                self.cap = None
+            self.connected = False
 
     def draw_overlays(self, frame, overlays):
         """Draw bounding boxes and plate labels onto a frame."""
@@ -1240,17 +1109,12 @@ class CameraChannel:
         self.broadcast_thread.start()
 
     def stop(self):
-        """Stop capture, broadcast, and release camera resources."""
+        """Signal capture to stop; its owner releases the stream after read returns."""
         self.running = False
+        self.connected = False
+        self.reconnect_requested.set()
         with self.broadcast_lock:
             self.broadcast_cond.notify_all()
-        if self.cap:
-            try:
-                self.cap.release()
-            except Exception:
-                pass
-            self.cap = None
-        self.connected = False
 
     def set_source(self, new_source, flip_180=None):
         """Update camera source dynamically without restarting the server."""
@@ -1267,15 +1131,13 @@ class CameraChannel:
             changed = True
 
         if changed:
-            if self.cap:
-                try:
-                    self.cap.release()
-                except Exception:
-                    pass
-                self.cap = None
+            self.reconnect_requested.set()
             self.connected = False
             with self.frame_lock:
                 self.raw_frame = None
+            with self.broadcast_lock:
+                self.latest_jpeg_bytes = None
+                self.broadcast_cond.notify_all()
 
 
 # =========================================================
@@ -1296,33 +1158,14 @@ class PlateDetector:
         self.inference_lock = threading.Lock()
         self.running = False
 
-        self.detected_plates = {}  # f"{channel}:{plate}" -> last_seen datetime
+        self.detected_plates = {}  # f"{direction}:{plate}" -> last_seen datetime
         self.recent_detections = []
+        self.plate_tracker = PlateTracker()
+        self.last_ocr_diagnostics = {}
 
-        # Load camera configurations
-        self.config = load_camera_config()
+        self.config = {}
         self.channels = {}
-
-        ent_cfg = self.config.get("entrance", {})
-        exit_cfg = self.config.get("exit", {})
-
-        self.channels["entrance"] = CameraChannel(
-            channel_id="entrance",
-            name=ent_cfg.get("name", "Entrance Cam"),
-            source=ent_cfg.get("source", DEFAULT_ENTRANCE_RTSP_URL),
-            direction="IN",
-            flip_180=ent_cfg.get("flip_180", False),
-            zoom_factor=ent_cfg.get("zoom_factor", 1.35)
-        )
-
-        self.channels["exit"] = CameraChannel(
-            channel_id="exit",
-            name=exit_cfg.get("name", "Exit Cam"),
-            source=exit_cfg.get("source", DEFAULT_EXIT_RTSP_URL),
-            direction="OUT",
-            flip_180=exit_cfg.get("flip_180", False),
-            zoom_factor=exit_cfg.get("zoom_factor", 1.35)
-        )
+        self.apply_camera_config(load_camera_config())
 
         self.inference_thread = None
 
@@ -1344,7 +1187,15 @@ class PlateDetector:
             return "", "", 0.0, "NEEDS_REVIEW", "TOO_SMALL", "Plate crop too small"
 
         reg_cache = get_cached_registered_plates()
+        started = time.monotonic()
         result = self.ensemble.recognize_ensemble(plate_crop, registered_plates=reg_cache)
+        self.last_ocr_diagnostics = {
+            "updated_at": time.time(), "elapsed_ms": round((time.monotonic()-started)*1000),
+            "decision": result.decision, "plate": result.final_plate, "method": result.method,
+            "reason": result.review_reason, "quality": vars(result.quality),
+            "readers": result.model_predictions,
+            "busy": {name:self.ensemble.reader_pool.busy(name) for name in ("easyocr","paddleocr","gpt_vision")}
+        }
 
         disp = result.display_plate
         norm = result.final_plate
@@ -1352,30 +1203,6 @@ class PlateDetector:
         decision = result.decision
         method = result.method
         reason = result.review_reason
-
-        # Robust safety net: if ensemble yielded no plate, fallback to clean_and_select_plate_text
-        if (not norm or len(norm) < 5) and self.ocr is not None:
-            try:
-                scale = 70.0 / float(crop_h)
-                resized = cv2.resize(plate_crop, (max(10, int(crop_w * scale)), 70), interpolation=cv2.INTER_CUBIC)
-                gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
-                clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
-                enhanced = clahe.apply(gray)
-                gaussian = cv2.GaussianBlur(enhanced, (0, 0), 1.5)
-                sharpened = cv2.addWeighted(enhanced, 1.4, gaussian, -0.4, 0)
-                ocr_res = self.ocr.readtext(sharpened, allowlist="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ", paragraph=False)
-                if not ocr_res:
-                    ocr_res = self.ocr.readtext(resized, allowlist="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ", paragraph=False)
-                fb_disp, fb_norm, fb_conf = clean_and_select_plate_text(ocr_res)
-                if fb_norm and is_valid_plate(fb_norm):
-                    disp = fb_disp
-                    norm = fb_norm
-                    conf = max(0.65, fb_conf)
-                    decision = "ACCEPT"
-                    method = "FALLBACK_SYNTAX_PARSER"
-                    reason = None
-            except Exception as e:
-                print(f"[OCR-FALLBACK] Error: {e}")
 
         return (disp, norm, conf, decision, method, reason)
 
@@ -1472,7 +1299,7 @@ class PlateDetector:
 
     def process_frame(self, frame):
         """Run YOLOv10 detection + Triple Ensemble OCR on a single frame (used by /api/detect)."""
-        overlays, plates_found = self.detect_plates_on_frame(frame, channel_direction="IN")
+        overlays, plates_found = self.detect_plates_on_frame(frame, channel_direction=self.channels['entrance'].direction)
         channel = self.channels.get("entrance")
         annotated_frame = channel.draw_overlays(frame, overlays) if channel else frame
         return annotated_frame, plates_found
@@ -1481,8 +1308,8 @@ class PlateDetector:
         """Handle a detected plate on a specific camera channel."""
         plate = plate_info['normalized']
         channel_key = channel.channel_id
-        direction = 'OUT' if channel_key == 'exit' else 'IN'
-        cooldown_key = f"{channel_key}:{plate}"
+        direction = channel.direction
+        cooldown_key = f"{direction}:{plate}"
         now = datetime.now()
 
         decision = plate_info.get('decision', 'ACCEPT')
@@ -1494,19 +1321,14 @@ class PlateDetector:
             ex_ch, existing_plate = existing_key.split(":", 1)
             elapsed = (now - last_seen).total_seconds()
             if elapsed < PLATE_COOLDOWN_SECONDS:
-                if (ex_ch == channel_key or (ex_ch == 'entrance' and direction == 'IN') or (ex_ch == 'exit' and direction == 'OUT')):
+                if direction != 'AUTO' and ex_ch == direction:
                     if plates_are_similar(plate, existing_plate):
                         return
 
         # 2. Database-backed cooldown check (prevents duplicates across restarts or prolonged gate waits)
-        if is_plate_recently_logged_in_db(plate, direction, cooldown_seconds=PLATE_COOLDOWN_SECONDS):
+        if direction != 'AUTO' and is_plate_recently_logged_in_db(plate, direction, cooldown_seconds=PLATE_COOLDOWN_SECONDS):
             self.detected_plates[cooldown_key] = now
             return
-
-        self.detected_plates[cooldown_key] = now
-        # Clean up stale memory (> 10 minutes old)
-        cutoff = now - timedelta(minutes=10)
-        self.detected_plates = {k: v for k, v in self.detected_plates.items() if v > cutoff}
 
         # 3. Database lookup: strict registered vs visitor
         db_info = check_plate_in_database(plate)
@@ -1518,11 +1340,15 @@ class PlateDetector:
         if decision == 'NEEDS_REVIEW':
             db_info['purpose'] = f"Needs Review: {review_reason or 'Verify plate'}"
 
-        # Enforce direction: Exit Cam is STRICTLY OUT
-        direction = 'OUT' if channel_key == 'exit' else 'IN'
 
         # Always log to MySQL so the guard dashboard and live feed reflect every vehicle
-        log_vehicle_detection(actual_plate, db_info, direction)
+        result = log_vehicle_detection(actual_plate, db_info, direction)
+        if not result:
+            return False
+        direction = result['direction']
+        self.detected_plates[f'{direction}:{plate}'] = now
+        cutoff = now - timedelta(minutes=10)
+        self.detected_plates = {k: v for k, v in self.detected_plates.items() if v > cutoff}
 
         detection = {
             'plate': actual_plate,
@@ -1547,6 +1373,7 @@ class PlateDetector:
             f"[DETECTION] [{channel.name} - {direction}] {actual_plate} ({method}) | "
             f"{category} | {vehicle_type} | {plate_info.get('confidence', 0.0):.0%}"
         )
+        return True
 
     def inference_loop(self):
         """
@@ -1562,7 +1389,9 @@ class PlateDetector:
 
             # Rank channels by activity: active channels (motion or bounding box) come first
             channels_to_check = []
-            for ch_id, ch in self.channels.items():
+            for ch_id, ch in list(self.channels.items()):
+                if ch_id != ch.channel_id:
+                    continue  # Shared preview alias must never run inference twice.
                 if ch.running:
                     active = ch.is_active()
                     channels_to_check.append((1 if active else 0, ch_id, ch))
@@ -1588,18 +1417,23 @@ class PlateDetector:
                     last_inference_time[ch_id] = time.time()
                     try:
                         with self.inference_lock:
+                            if self.channels.get(ch_id) is not ch or not ch.running:
+                                continue
                             overlays, plates = self.detect_plates_on_frame(frame_to_proc, channel_direction=ch.direction)
 
-                        with ch.overlay_lock:
-                            if overlays:
-                                ch.active_overlays = overlays
-                                ch.last_overlay_time = time.time()
-                            elif (time.time() - ch.last_overlay_time) > OVERLAY_TTL_SECONDS:
-                                ch.active_overlays = []
+                            with ch.overlay_lock:
+                                if overlays:
+                                    ch.active_overlays = overlays
+                                    ch.last_overlay_time = time.time()
+                                elif (time.time() - ch.last_overlay_time) > OVERLAY_TTL_SECONDS:
+                                    ch.active_overlays = []
 
-                        for plate_info in plates:
-                            self.handle_detection(plate_info, ch)
-
+                            confirmed = self.plate_tracker.observe_frame(
+                                ch_id, ch.direction, plates, visible_boxes=[o['bbox'] for o in overlays],
+                                require_departure=(ch.direction == 'AUTO'))
+                            for plate_info in confirmed:
+                                if not self.handle_detection(plate_info, ch):
+                                    self.plate_tracker.retry_confirmation(ch_id, ch.direction, plate_info['normalized'])
                     except Exception as e:
                         print(f"[WARNING] Inference loop error on {ch_id}: {e}")
 
@@ -1674,7 +1508,8 @@ class PlateDetector:
                 lprnet_recognizer=lpr_recognizer,
                 gpt_vision_reader=gpt_reader,
                 min_accept_confidence=0.65,
-                min_sharpness=20.0
+                min_sharpness=20.0,
+                reader_pool=self.ensemble.reader_pool if self.ensemble else None
             )
             with self.inference_lock:
                 self.ensemble = new_ensemble
@@ -1685,31 +1520,73 @@ class PlateDetector:
             print(f"[HOT-RELOAD] Error reloading ensemble: {e}")
             return False
 
+    def apply_camera_config(self, cfg):
+        """Apply one shared capture or two independent captures atomically."""
+        mode = cfg.get('camera_mode', 'dual')
+        direction = cfg.get('single_direction', 'IN')
+        if mode not in ('single', 'dual') or direction not in ('AUTO', 'IN', 'OUT'):
+            raise ValueError('Choose single or dual cameras and AUTO, IN or OUT direction.')
+        for key in ('entrance', 'exit'):
+            if not str(cfg.get(key, {}).get('source', '')).strip():
+                raise ValueError('Camera sources cannot be empty.')
+        if (mode == 'dual' and cfg['entrance'].get('enabled', True) and cfg['exit'].get('enabled', True)
+                and cfg['entrance']['source'].strip() == cfg['exit']['source'].strip()):
+            raise ValueError('Two-camera mode needs different camera sources. Disable exit until the second camera is configured.')
+        with self.inference_lock:
+            rebuild = (not self.channels or mode != self.config.get('camera_mode', 'dual')
+                       or any(self.channels[key].enabled != cfg[key].get('enabled', True)
+                              for key in (('entrance',) if mode == 'single' else ('entrance', 'exit'))))
+            if rebuild:
+                for ch in set(self.channels.values()):
+                    ch.stop()
+                channels = {}
+                for key in (('entrance',) if mode == 'single' else ('entrance', 'exit')):
+                    c = cfg[key]
+                    channels[key] = CameraChannel(
+                        channel_id=key, name=c.get('name', key.title() + ' Cam'),
+                        source=c['source'], direction=direction if mode == 'single' else ('IN' if key == 'entrance' else 'OUT'),
+                        flip_180=c.get('flip_180', False), zoom_factor=c.get('zoom_factor', 1.35))
+                    channels[key].enabled = c.get('enabled', True)
+                if mode == 'single':
+                    channels['exit'] = channels['entrance']
+                self.channels = channels
+                if self.running:
+                    for ch in set(channels.values()):
+                        if ch.enabled:
+                            ch.start()
+            else:
+                keys = ('entrance',) if mode == 'single' else ('entrance', 'exit')
+                for key in keys:
+                    ch, c = self.channels[key], cfg[key]
+                    ch.set_source(c['source'], flip_180=c.get('flip_180', False))
+                    ch.zoom_factor = c.get('zoom_factor', 1.35)
+                    ch.enabled = c.get('enabled', True)
+                    if self.running and ch.enabled and not ch.running:
+                        ch.start()
+                    elif not ch.enabled and ch.running:
+                        ch.stop()
+                    ch.direction = direction if mode == 'single' else ('IN' if key == 'entrance' else 'OUT')
+                    with ch.overlay_lock:
+                        ch.active_overlays = []
+            self.config = cfg
+
     def reload_camera_config(self):
-        """Reload camera sources dynamically from camera_config.json."""
+        """Reload camera count, manual direction, and hardware sources live."""
         try:
-            self.config = load_camera_config()
-            for ch_key in ["entrance", "exit"]:
-                if ch_key in self.channels and ch_key in self.config:
-                    ch_cfg = self.config[ch_key]
-                    new_src = ch_cfg.get("source")
-                    flip = ch_cfg.get("flip_180", False)
-                    zoom = ch_cfg.get("zoom_factor", 1.35)
-                    if new_src:
-                        self.channels[ch_key].set_source(new_src, flip_180=flip)
-                        self.channels[ch_key].zoom_factor = zoom
-            print("[HOT-RELOAD] Camera configuration reloaded live.")
+            self.apply_camera_config(load_camera_config())
+            print('[HOT-RELOAD] Camera configuration reloaded live.')
             return True
         except Exception as e:
-            print(f"[HOT-RELOAD] Error reloading camera config: {e}")
+            print(f'[HOT-RELOAD] Error reloading camera config: {e}')
             return False
 
     def start(self):
         """Start both camera channels, shared AI worker, midnight monitor, and code auto-reloader."""
         self.running = True
 
-        for ch in self.channels.values():
-            ch.start()
+        for ch in set(self.channels.values()):
+            if ch.enabled:
+                ch.start()
 
         self.inference_thread = threading.Thread(
             target=self.inference_loop,
@@ -1737,7 +1614,7 @@ class PlateDetector:
         self.running = False
         if hasattr(self, 'reloader') and self.reloader:
             self.reloader.running = False
-        for ch in self.channels.values():
+        for ch in set(self.channels.values()):
             ch.stop()
         print("[INFO] Dual camera detection system stopped.")
 
@@ -1910,6 +1787,8 @@ def video_feed_channel(channel_id):
         return Response(f"Camera channel '{channel_id}' not found", status=404)
 
     ch = detector.channels[channel_id]
+    if not ch.enabled:
+        return Response('Camera disabled until configured.', status=503)
 
     if ch.raw_frame is None and not ch.connected:
         time.sleep(1.0)
@@ -1935,57 +1814,34 @@ def manage_cameras():
 
     if request.method == 'POST':
         data = request.get_json(silent=True) or request.form.to_dict()
-        cfg = detector.config
-
-        if 'entrance_source' in data and data['entrance_source']:
-            new_src = str(data['entrance_source']).strip()
-            cfg['entrance']['source'] = new_src
-            detector.channels['entrance'].set_source(new_src)
-
-        if 'exit_source' in data and data['exit_source']:
-            new_src = str(data['exit_source']).strip()
-            cfg['exit']['source'] = new_src
-            detector.channels['exit'].set_source(new_src)
-
-        if 'flip_entrance' in data:
-            val = str(data['flip_entrance']).lower() in ['true', '1', 'yes']
-            cfg['entrance']['flip_180'] = val
-            detector.channels['entrance'].flip_180 = val
-
-        if 'flip_exit' in data:
-            val = str(data['flip_exit']).lower() in ['true', '1', 'yes']
-            cfg['exit']['flip_180'] = val
-            detector.channels['exit'].flip_180 = val
-
-        if 'entrance_zoom' in data:
-            try:
-                z = max(1.0, min(3.0, float(data['entrance_zoom'])))
-                cfg['entrance']['zoom_factor'] = z
-                detector.channels['entrance'].zoom_factor = z
-            except Exception:
-                pass
-
-        if 'exit_zoom' in data:
-            try:
-                z = max(1.0, min(3.0, float(data['exit_zoom'])))
-                cfg['exit']['zoom_factor'] = z
-                detector.channels['exit'].zoom_factor = z
-            except Exception:
-                pass
-
-        # Ensure directions remain strict
-        cfg['entrance']['direction'] = 'IN'
-        cfg['exit']['direction'] = 'OUT'
-
+        cfg = json.loads(json.dumps(detector.config))
+        cfg['camera_mode'] = data.get('camera_mode', cfg.get('camera_mode', 'dual'))
+        cfg['single_direction'] = data.get('single_direction', cfg.get('single_direction', 'IN'))
+        try:
+            for key in ('entrance', 'exit'):
+                if key + '_source' in data:
+                    cfg[key]['source'] = str(data[key + '_source']).strip()
+                if key + '_enabled' in data:
+                    cfg[key]['enabled'] = str(data[key + '_enabled']).lower() in ('true', '1', 'yes')
+                if key + '_zoom' in data:
+                    cfg[key]['zoom_factor'] = max(1.0, min(3.0, float(data[key + '_zoom'])))
+                if 'flip_' + key in data:
+                    cfg[key]['flip_180'] = str(data['flip_' + key]).lower() in ('true', '1', 'yes')
+            detector.apply_camera_config(cfg)
+        except (ValueError, TypeError) as e:
+            return jsonify({'success': False, 'message': str(e)}), 400
         save_camera_config(cfg)
         return jsonify({
             'success': True,
+            'camera_mode': detector.config.get('camera_mode', 'dual'),
+            'single_direction': detector.config.get('single_direction', 'IN'),
             'message': 'Camera configurations updated successfully!',
             'cameras': {
                 k: {
                     'name': ch.name,
                     'source': ch.source,
                     'direction': ch.direction,
+                    'enabled': ch.enabled,
                     'connected': ch.connected,
                     'flip_180': ch.flip_180,
                     'zoom_factor': ch.zoom_factor
@@ -1997,12 +1853,18 @@ def manage_cameras():
     # GET
     return jsonify({
         'success': True,
+        'camera_mode': detector.config.get('camera_mode', 'dual'),
+        'single_direction': detector.config.get('single_direction', 'IN'),
+        'separate_exit_source': detector.config['exit']['source'],
+        'separate_exit_zoom': detector.config['exit'].get('zoom_factor', 1.35),
+        'separate_exit_enabled': detector.config['exit'].get('enabled', True),
         'cameras': {
             k: {
                 'name': ch.name,
                 'source': ch.source,
                 'direction': ch.direction,
-                'connected': ch.connected,
+                'enabled': ch.enabled,
+                    'connected': ch.connected,
                 'flip_180': ch.flip_180,
                 'zoom_factor': ch.zoom_factor,
                 'stream_url': f'/video/{k}'
@@ -2083,7 +1945,8 @@ def get_status():
             'name': ch.name,
             'source': ch.source,
             'direction': ch.direction,
-            'connected': ch.connected,
+            'enabled': ch.enabled,
+                    'connected': ch.connected,
             'active': ch.is_active(),
             'frame_count': ch.frame_seq
         }
@@ -2093,6 +1956,8 @@ def get_status():
     return jsonify({
         'success': True,
         'running': detector.running,
+        'camera_mode': detector.config.get('camera_mode', 'dual'),
+        'single_direction': detector.config.get('single_direction', 'IN'),
         'camera_connected': any_connected,
         'cameras': cam_status,
         'device': {
@@ -2120,6 +1985,7 @@ def get_status():
             'gpt_vision': (detector.ensemble.gpt_vision is not None and detector.ensemble.gpt_vision.is_configured()) if detector.ensemble else False,
         },
         'total_detections': len(detector.recent_detections),
+        'ocr_diagnostics': getattr(detector, 'last_ocr_diagnostics', {}),
         'active_plates': len(detector.detected_plates)
     })
 
