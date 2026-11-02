@@ -44,9 +44,10 @@ class PhilippinePlateValidator:
     DEFAULT_PATTERNS = {
         "lto_standard_4w": (r"^[A-Z]{3}[0-9]{4}$", "Standard 4-Wheel (AAA 1234)"),
         "lto_legacy_4w": (r"^[A-Z]{3}[0-9]{3}$", "Legacy 4-Wheel (AAA 123)"),
-        "lto_conduction": (r"^[A-Z]{1,2}[0-9]{3,4}[A-Z]{1,2}$", "Conduction / Temporary (A123BC / D566CP)"),
+        "lto_conduction": (r"^[A-Z]{1,2}[0-9]{3,4}[A-Z]{1,2}$", "Conduction / Temporary (A123BC)"),
         "lto_motorcycle_1": (r"^[0-9]{3}[A-Z]{3}$", "Motorcycle (123 ABC)"),
         "lto_motorcycle_2": (r"^[A-Z]{2}[0-9]{4,5}$", "Motorcycle (AB 12345)"),
+        "numeric_suffix_6": (r"^[0-9]{5}[A-Z]$", "Five digits + one letter (12345A)"),
     }
 
     def __init__(

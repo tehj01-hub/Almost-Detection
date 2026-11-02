@@ -388,6 +388,19 @@
         style.id = "vdaStylesheet";
         style.textContent = [
             "/* Visitor Duration Reminder & Overstay Alarm Styles */",
+            ".vda-markout-dialog { box-sizing:border-box; width:calc(100% - 32px); max-width:440px; margin:auto; padding:28px; border:1px solid #e2e8f0; border-radius:20px; background:#fff; color:#1e293b; box-shadow:0 24px 80px #0f172a40; font-family:inherit; }",
+            ".vda-markout-dialog::backdrop { background:#0f172a99; backdrop-filter:blur(4px); }",
+            ".vda-markout-icon { display:grid; place-items:center; width:48px; height:48px; border-radius:14px; background:#fef2f2; color:#dc2626; font-size:28px; margin-bottom:16px; }",
+            ".vda-markout-dialog h2 { margin:0 0 14px; font-size:22px; font-weight:800; }",
+            ".vda-markout-plate { display:inline-block; padding:8px 14px; border:1px solid #e2e8f0; border-radius:8px; background:#f8fafc; font-size:20px; font-weight:800; letter-spacing:2px; overflow-wrap:anywhere; }",
+            ".vda-markout-dialog p { font-size:14px; line-height:1.6; color:#64748b; margin:16px 0 24px; }",
+            ".vda-markout-dialog .vda-markout-error { color:#b91c1c; background:#fef2f2; padding:10px; border-radius:8px; }",
+            ".vda-markout-actions { display:flex; gap:10px; justify-content:flex-end; flex-wrap:wrap; }",
+            ".vda-markout-actions button { padding:11px 20px; border-radius:10px; font:inherit; font-size:14px; font-weight:700; cursor:pointer; border:1px solid #cbd5e1; background:#fff; color:#334155; }",
+            ".vda-markout-actions .vda-markout-confirm { background:#dc2626; border-color:#dc2626; color:#fff; }",
+            ".vda-markout-actions .vda-markout-confirm:hover { background:#b91c1c; }",
+            ".vda-markout-actions button:focus-visible { outline:3px solid #60a5fa; outline-offset:3px; }",
+            ".vda-markout-actions button:disabled { opacity:.6; cursor:wait; }",
             ".overstay-alert-banner {",
             "    border-radius: 12px;",
             "    padding: 12px 18px;",
@@ -974,32 +987,85 @@
         } catch (e) {}
     }
 
-    async function markVisitorExited(visitorId, plateNumber) {
-        if (!window.confirm("Mark visitor vehicle " + plateNumber + " as Exited (OUT) and clear its timer?")) {
-            return;
-        }
-        try {
-            var fd = new FormData();
-            fd.append("action", "mark_exited");
-            fd.append("role", detectPageRole());
-            fd.append("visitor_id", String(visitorId || 0));
-            fd.append("plate_number", String(plateNumber || ""));
-
-            var res = await fetch("visitor_alarm_api.php", {
-                method: "POST",
-                body: fd,
-                credentials: "same-origin"
-            });
-            var data = await res.json();
-            if (data && data.success) {
-                ingestSnapshot(data);
-                showMilestoneToast(
-                    "REMINDER",
-                    "🔴 Marked Exited: " + plateNumber,
-                    "Visitor timer closed and overstay alarm cleared."
-                );
+    function markVisitorExited(visitorId, plateNumber) {
+        var existing = document.getElementById("vdaMarkOutDialog");
+        if (existing) { existing.focus(); return; }
+        injectStyles();
+        var previousFocus = document.activeElement;
+        var dialog = document.createElement("dialog");
+        dialog.id = "vdaMarkOutDialog";
+        dialog.className = "vda-markout-dialog";
+        dialog.setAttribute("aria-labelledby", "vdaMarkOutTitle");
+        dialog.setAttribute("aria-describedby", "vdaMarkOutDescription");
+        dialog.innerHTML =
+            '<div class="vda-markout-icon" aria-hidden="true">&#8599;</div>' +
+            '<h2 id="vdaMarkOutTitle">Mark vehicle OUT?</h2>' +
+            '<div class="vda-markout-plate"></div>' +
+            '<p id="vdaMarkOutDescription">Confirm that this vehicle has left. This will record its exit, close the visitor timer, and clear its overstay alarm.</p>' +
+            '<p class="vda-markout-error" role="alert" hidden></p>' +
+            '<div class="vda-markout-actions">' +
+                '<button type="button" class="vda-markout-cancel">Cancel</button>' +
+                '<button type="button" class="vda-markout-confirm">Mark OUT</button>' +
+            '</div>';
+        dialog.querySelector(".vda-markout-plate").textContent = plateNumber || "Unknown plate";
+        var cancel = dialog.querySelector(".vda-markout-cancel");
+        var confirm = dialog.querySelector(".vda-markout-confirm");
+        var error = dialog.querySelector(".vda-markout-error");
+        var saving = false;
+        function close() { if (!saving) dialog.close(); }
+        cancel.addEventListener("click", close);
+        dialog.addEventListener("cancel", function (event) {
+            if (saving) event.preventDefault();
+        });
+        dialog.addEventListener("click", function (event) {
+            if (event.target === dialog) {
+                var bounds = dialog.getBoundingClientRect();
+                if (event.clientX < bounds.left || event.clientX > bounds.right ||
+                    event.clientY < bounds.top || event.clientY > bounds.bottom) close();
             }
-        } catch (e) {}
+        });
+        dialog.addEventListener("close", function () {
+            dialog.remove();
+            if (previousFocus && previousFocus.isConnected) previousFocus.focus();
+        });
+        confirm.addEventListener("click", async function () {
+            if (saving) return;
+            saving = true;
+            cancel.disabled = confirm.disabled = true;
+            confirm.textContent = "Marking OUT...";
+            dialog.setAttribute("aria-busy", "true");
+            error.hidden = true;
+            try {
+                var fd = new FormData();
+                fd.append("action", "mark_exited");
+                fd.append("role", detectPageRole());
+                fd.append("visitor_id", String(visitorId || 0));
+                fd.append("plate_number", String(plateNumber || ""));
+                var res = await fetch("visitor_alarm_api.php", {
+                    method: "POST", body: fd, credentials: "same-origin"
+                });
+                var data = await res.json();
+                if (!res.ok || !data || !data.success) {
+                    throw new Error((data && data.message) || "Unable to mark this vehicle OUT. Please try again.");
+                }
+                ingestSnapshot(data);
+                saving = false;
+                dialog.close();
+                showMilestoneToast("REMINDER", "Marked OUT: " + plateNumber,
+                    "Visitor timer closed and overstay alarm cleared.");
+            } catch (e) {
+                error.textContent = e.message || "Connection failed. Please try again.";
+                error.hidden = false;
+                saving = false;
+                cancel.disabled = confirm.disabled = false;
+                confirm.textContent = "Mark OUT";
+                dialog.removeAttribute("aria-busy");
+                confirm.focus();
+            }
+        });
+        document.body.appendChild(dialog);
+        dialog.showModal();
+        cancel.focus();
     }
 
     /* ---------------------------------------------------------------------

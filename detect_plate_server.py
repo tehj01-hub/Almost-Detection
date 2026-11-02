@@ -26,6 +26,7 @@ import cv2
 cv2.setNumThreads(2)
 from app.vehicle_visit_logger import record_vehicle_visit
 from lpr_engine.plate_tracker import PlateTracker
+from lpr_engine.capture_store import save_plate_capture
 import time
 import threading
 import os
@@ -116,7 +117,8 @@ DEFAULT_EXIT_RTSP_URL = "rtsp://Jhetlogs:123456789ten@192.168.1.23:554/stream1"
 DEFAULT_RTSP_URL = DEFAULT_ENTRANCE_RTSP_URL
 
 # Detection settings (Dynamically tuned for GPU / Intel UHD with CPU fallback)
-CONFIDENCE_THRESHOLD = 0.22                  # Catches distant/angled CCTV plates cleanly
+DETECTION_CANDIDATE_THRESHOLD = 0.22        # Let distant plate boxes reach OCR
+CONFIDENCE_THRESHOLD = 0.60                  # Require at least 60% final reading confidence
 IMAGE_SIZE = 640 if ANY_GPU_ACTIVE else 480  # 640px on GPU for max plate accuracy; 480px on CPU for low latency
 JPEG_QUALITY = 75 if ANY_GPU_ACTIVE else 65  # Higher visual MJPEG streaming quality on GPU
 OVERLAY_TTL_SECONDS = 1.6                    # Keep bounding box overlay visible smoothly between AI passes
@@ -477,6 +479,7 @@ PATTERNS = [
     ('motorcycle_7', 7, [0, 1], [2, 3, 4, 5, 6], lambda s: f"{s[0:2]} {s[2:7]}"),
     ('motorcycle_6', 6, [0, 1], [2, 3, 4, 5], lambda s: f"{s[0:2]} {s[2:6]}"),
     ('motorcycle_alt', 6, [3, 4, 5], [0, 1, 2], lambda s: f"{s[0:3]} {s[3:6]}"),
+    ('numeric_suffix_6', 6, [5], [0, 1, 2, 3, 4], lambda s: s),
 ]
 
 _REG_CACHE = {'timestamp': 0.0, 'data': {}}
@@ -598,7 +601,7 @@ def extract_exact_ph_plate_details(raw_string, registered_plates=None):
                 res, cost = score_and_fix(sub, pat)
                 if res:
                     is_reg = res in registered_plates
-                    priority = cost - (100 if is_reg else 0)
+                    priority = cost  # Registration classifies a plate; it must not choose its OCR text.
                     formatter = pat[4]
                     disp = formatter(res)
                     candidates.append((priority, cost, -len(sub), res, disp, pat[0], is_reg))
@@ -900,6 +903,16 @@ class CameraChannel:
 
         return None
 
+    @staticmethod
+    def fit_processing_frame(frame):
+        """Limit working frames to 1080p without stretching or upscaling."""
+        height, width = frame.shape[:2]
+        scale = min(1.0, 1920 / width, 1080 / height)
+        if scale >= 1.0:
+            return frame
+        return cv2.resize(frame, (max(1, round(width * scale)), max(1, round(height * scale))),
+                          interpolation=cv2.INTER_AREA)
+
     def capture_loop(self):
         """Continuously drain frames to eliminate network buffer delay and detect motion."""
         failures = 0
@@ -964,6 +977,9 @@ class CameraChannel:
                         frame = frame[cy1:cy1 + ch, cx1:cx1 + cw]
                     except Exception:
                         pass
+
+                # Keep detection, OCR crops, and saved captures within a 1080p frame.
+                frame = self.fit_processing_frame(frame)
 
                 # Quick motion detection on downscaled 160x90 grayscale (< 1ms)
                 try:
@@ -1206,7 +1222,7 @@ class PlateDetector:
 
         return (disp, norm, conf, decision, method, reason)
 
-    def detect_plates_on_frame(self, frame, channel_direction="IN"):
+    def detect_plates_on_frame(self, frame, channel_direction="IN", on_boxes=None):
         """Run YOLOv10 detection + Triple-Reader OCR Ensemble on a frame with directional tags."""
         plates_found = []
         overlays = []
@@ -1217,7 +1233,7 @@ class PlateDetector:
         results = self.model.predict(
             source=frame,
             imgsz=IMAGE_SIZE,
-            conf=CONFIDENCE_THRESHOLD,
+            conf=DETECTION_CANDIDATE_THRESHOLD,
             device=pred_device,
             verbose=False
         )
@@ -1235,7 +1251,7 @@ class PlateDetector:
             rot_results = self.model.predict(
                 source=rot_frame,
                 imgsz=IMAGE_SIZE,
-                conf=CONFIDENCE_THRESHOLD,
+                conf=DETECTION_CANDIDATE_THRESHOLD,
                 device=pred_device,
                 verbose=False
             )
@@ -1245,6 +1261,12 @@ class PlateDetector:
                         rx1, ry1, rx2, ry2 = map(int, box.xyxy[0].tolist())
                         conf = float(box.conf[0])
                         detected_boxes.append((w - rx2, h - ry2, w - rx1, h - ry1, conf, True))
+
+        # Publish localization immediately; OCR must not delay the visible box.
+        if on_boxes and detected_boxes:
+            on_boxes([{'bbox': tuple(box[:4]),
+                       'label': f"[{channel_direction}] Reading plate ({box[4]:.0%})"}
+                      for box in detected_boxes])
 
         # Prioritize highest confidence detections first and limit OCR to top 2 candidates
         detected_boxes.sort(key=lambda b: b[4], reverse=True)
@@ -1267,6 +1289,8 @@ class PlateDetector:
             display_text, normalized, ocr_conf, decision, method, review_reason = self._extract_ocr_from_crop(plate_crop)
 
             combined_conf = (confidence * 0.4) + (ocr_conf * 0.6) if ocr_conf > 0 else confidence
+            if combined_conf < CONFIDENCE_THRESHOLD:
+                continue
 
             if decision == "NEEDS_REVIEW":
                 label = f"[{channel_direction}] REVIEW: {display_text or 'Plate'}"
@@ -1289,7 +1313,8 @@ class PlateDetector:
                     'decision': decision,
                     'method': method,
                     'review_reason': review_reason,
-                    'bbox': [x1, y1, x2, y2]
+                    'bbox': [x1, y1, x2, y2],
+                    '_plate_crop': plate_crop.copy()
                 })
                 # If primary candidate is a valid high-confidence plate, avoid redundant OCR on secondary boxes
                 if ocr_conf >= 0.70:
@@ -1302,7 +1327,10 @@ class PlateDetector:
         overlays, plates_found = self.detect_plates_on_frame(frame, channel_direction=self.channels['entrance'].direction)
         channel = self.channels.get("entrance")
         annotated_frame = channel.draw_overlays(frame, overlays) if channel else frame
-        return annotated_frame, plates_found
+        # Internal capture pixels stay out of the public JSON response.
+        public_plates = [{key: value for key, value in plate.items() if not key.startswith('_')}
+                         for plate in plates_found]
+        return annotated_frame, public_plates
 
     def handle_detection(self, plate_info, channel):
         """Handle a detected plate on a specific camera channel."""
@@ -1366,6 +1394,18 @@ class PlateDetector:
             'timestamp': now.strftime('%Y-%m-%d %H:%M:%S')
         }
 
+        crop = plate_info.get('_plate_crop')
+        if crop is not None:
+            try:
+                capture = save_plate_capture(
+                    os.path.join(BASE_DIR, 'uploads', 'plate_captures'), crop, detection)
+                detection['image_path'] = 'uploads/plate_captures/' + capture['image']
+                detection['metadata_path'] = 'uploads/plate_captures/' + capture['metadata']
+            except Exception as exc:
+                # The visit is committed. A failed photo must not trigger a duplicate entry.
+                detection['capture_error'] = str(exc)
+                print(f"[WARNING] Plate photo save failed: {exc}")
+
         self.recent_detections.insert(0, detection)
         self.recent_detections = self.recent_detections[:50]
 
@@ -1419,7 +1459,13 @@ class PlateDetector:
                         with self.inference_lock:
                             if self.channels.get(ch_id) is not ch or not ch.running:
                                 continue
-                            overlays, plates = self.detect_plates_on_frame(frame_to_proc, channel_direction=ch.direction)
+                            def publish_boxes(boxes):
+                                with ch.overlay_lock:
+                                    ch.active_overlays = boxes
+                                    ch.last_overlay_time = time.time()
+
+                            overlays, plates = self.detect_plates_on_frame(
+                                frame_to_proc, channel_direction=ch.direction, on_boxes=publish_boxes)
 
                             with ch.overlay_lock:
                                 if overlays:

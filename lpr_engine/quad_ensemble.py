@@ -68,6 +68,7 @@ PH_TEMPLATES = [
     ('motorcycle_7', 7, [0, 1], [2, 3, 4, 5, 6], lambda s: f"{s[0:2]} {s[2:7]}"),
     ('motorcycle_6', 6, [0, 1], [2, 3, 4, 5], lambda s: f"{s[0:2]} {s[2:6]}"),
     ('motorcycle_alt', 6, [3, 4, 5], [0, 1, 2], lambda s: f"{s[0:3]} {s[3:6]}"),
+    ('numeric_suffix_6', 6, [5], [0, 1, 2, 3, 4], lambda s: s),
 ]
 
 
@@ -409,11 +410,18 @@ class QuadReaderEnsemble:
             resized, sharpened_bgr = self.preprocess_crop(self.number_region(bgr_crop))
             sharpened_gray = cv2.cvtColor(sharpened_bgr, cv2.COLOR_BGR2GRAY)
 
-            # Pass 1: Enhanced sharpened crop
-            res = self.easyocr.readtext(sharpened_gray, allowlist="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ", paragraph=False)
-            if not res:
-                # Pass 2: Resized raw crop
-                res = self.easyocr.readtext(resized, allowlist="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ", paragraph=False)
+            # YOLO already found the plate: recognize the main number line directly.
+            def recognize(image):
+                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+                height, width = gray.shape[:2]
+                return self.easyocr.recognize(
+                    gray, horizontal_list=[[0, width, 0, height]], free_list=[],
+                    allowlist="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ", paragraph=False,
+                    decoder="greedy", detail=1)
+
+            res = recognize(sharpened_gray)
+            if not res or not any(str(item[1]).strip() for item in res):
+                res = recognize(resized)
 
             if not res:
                 return "", 0.0

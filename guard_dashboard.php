@@ -5902,11 +5902,44 @@ function markNotificationSingleRead(id) {
 }
 
 function clearAllNotifications() {
-    if (confirm("Are you sure you want to clear all notification history?")) {
+    const existing = document.getElementById("clearNotificationsDialog");
+    if (existing) { existing.focus(); return; }
+    const previousFocus = document.activeElement;
+    const dialog = document.createElement("dialog");
+    dialog.id = "clearNotificationsDialog";
+    dialog.className = "vda-markout-dialog";
+    dialog.setAttribute("aria-labelledby", "clearNotificationsTitle");
+    dialog.setAttribute("aria-describedby", "clearNotificationsDescription");
+    dialog.innerHTML =
+        '<div class="vda-markout-icon" aria-hidden="true">&#128465;</div>' +
+        '<h2 id="clearNotificationsTitle">Clear all notifications?</h2>' +
+        '<p id="clearNotificationsDescription">This will clear all notification history, including entries, exits, and due alerts. Vehicle logs and active visitor timers will remain unchanged.</p>' +
+        '<div class="vda-markout-actions">' +
+            '<button type="button" class="vda-markout-cancel">Cancel</button>' +
+            '<button type="button" class="vda-markout-confirm">Clear All</button>' +
+        '</div>';
+    const cancel = dialog.querySelector(".vda-markout-cancel");
+    const confirm = dialog.querySelector(".vda-markout-confirm");
+    cancel.addEventListener("click", () => dialog.close());
+    confirm.addEventListener("click", () => {
         notificationsList = [];
         saveNotificationsToStorage();
         updateNotificationUI();
-    }
+        dialog.close();
+    });
+    dialog.addEventListener("click", event => {
+        if (event.target !== dialog) return;
+        const bounds = dialog.getBoundingClientRect();
+        if (event.clientX < bounds.left || event.clientX > bounds.right ||
+            event.clientY < bounds.top || event.clientY > bounds.bottom) dialog.close();
+    });
+    dialog.addEventListener("close", () => {
+        dialog.remove();
+        if (previousFocus && previousFocus.isConnected) previousFocus.focus();
+    });
+    document.body.appendChild(dialog);
+    dialog.showModal();
+    cancel.focus();
 }
 
 function toggleNotificationDrawer() {

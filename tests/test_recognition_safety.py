@@ -40,6 +40,38 @@ class RecognitionSafetyTests(unittest.TestCase):
   self.assertEqual((r.decision,r.final_plate),('ACCEPT','D566CP'))
  def test_registration_does_not_change_text_extraction(self):
   self.assertEqual(extract_best_template_match('D566CP R181RT',{})[0],extract_best_template_match('D566CP R181RT',{'R181RT':{}})[0])
+ def test_five_digits_and_suffix_preserve_leading_zero(self):
+  for raw in ('09420T', '09420t', '09420 T', '00001A'):
+   with self.subTest(raw=raw):
+    plate,display,_,_,changes,_=extract_best_template_match(raw,{})
+    self.assertEqual(plate,raw.replace(' ','').upper())
+    self.assertEqual(display,plate)
+    self.assertEqual(changes,0)
+ def test_five_digit_plate_agreement_is_not_rewritten_as_conduction(self):
+  e=self.ensemble(('09420T',.92),('09420T',.91));r=e.recognize_ensemble(self.crop,{})
+  self.assertEqual((r.decision,r.final_plate),('ACCEPT','09420T'))
+ def test_existing_conduction_plate_is_not_rewritten_as_digits(self):
+  self.assertEqual(extract_best_template_match('D942DT',{})[0],'D942DT')
+ def test_validator_accepts_five_digits_and_suffix(self):
+  from lpr_engine.ph_plate_validator import PhilippinePlateValidator
+  validator=PhilippinePlateValidator()
+  self.assertIsNotNone(validator.match_format('09420T'))
+  self.assertEqual(validator.format_for_display('09420T'),'09420T')
+ def test_server_fallback_preserves_five_digits_and_suffix(self):
+  import ast,re
+  from pathlib import Path
+  tree=ast.parse(Path('detect_plate_server.py').read_text(encoding='utf-8'))
+  assignments={'DIGIT_TO_LETTER','LETTER_TO_DIGIT','PATTERNS','NON_PLATE_WORDS'}
+  functions={'score_and_fix','extract_exact_ph_plate_details'}
+  nodes=[n for n in tree.body if
+         (isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id in assignments for t in n.targets))
+         or (isinstance(n,ast.FunctionDef) and n.name in functions)]
+  ns={'re':re}
+  exec(compile(ast.Module(body=nodes,type_ignores=[]),'<fallback>','exec'),ns)
+  for registered in ({},{'D942DT':{}}):
+   with self.subTest(registered=registered):
+    result=ns['extract_exact_ph_plate_details']('09420T',registered)
+    self.assertEqual((result[0],result[1],result[4]),('09420T','09420T',0))
  def test_untrained_lprnet_is_not_a_reader_vote(self):
   calls=[]
   class Untrained:
