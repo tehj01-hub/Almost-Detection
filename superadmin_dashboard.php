@@ -161,21 +161,6 @@ $extraCameras = secsysLoadExtraCameras($conn);
    FAST-PATH AJAX: LIVE DASHBOARD STATS
    Returns counts & hourly chart data for real-time auto-refresh
 ========================================================= */
-/* Current network address (the dashboard re-checks it so the chip follows
-   whatever Wi-Fi/network this PC is connected to) */
-if (isset($_GET['action']) && $_GET['action'] === 'network_address') {
-    header("Content-Type: application/json; charset=utf-8");
-    header("Cache-Control: no-store, no-cache, must-revalidate, max-age=0");
-    $net = secsysNetworkAccessInfo();
-    echo json_encode([
-        'success'   => true,
-        'connected' => $net !== null,
-        'ip'        => $net['ip'] ?? null,
-        'url'       => $net['url'] ?? null,
-    ]);
-    exit();
-}
-
 if (isset($_GET['action']) && $_GET['action'] === 'dashboard_stats') {
     header("Content-Type: application/json; charset=utf-8");
     header("Cache-Control: no-store, no-cache, must-revalidate, max-age=0");
@@ -2688,7 +2673,6 @@ body {
             <p>
                 <?php echo htmlspecialchars($displayDate); ?> &bull; <span style="font-size:12px; color:#64748b; font-weight:500;">(Resets daily at 12:00 AM)</span>
             </p>
-            <div style="margin-top:6px;"><?php echo secsysNetworkAccessHtml(true); ?></div>
         </div>
 
         <div class="header-right">
@@ -4118,59 +4102,6 @@ document.addEventListener("visibilitychange", function () {
         ev.preventDefault();
         openRow(row, ev);
     });
-})();
-</script>
-<style>
-.net-chip.net-chip-changed {
-    background: #fef9c3 !important;
-    border-color: #facc15 !important;
-}
-</style>
-<script>
-/* Network address chip: re-checks every 10 seconds and updates itself when
-   this PC joins another Wi-Fi/network (no page reload needed). */
-(function () {
-    const chip = document.querySelector("[data-network-chip]");
-    if (!chip) return;
-    const label = chip.querySelector(".net-chip-label");
-    const link = chip.querySelector(".net-chip-url");
-    const copy = chip.querySelector(".net-chip-copy");
-
-    function show(url) {
-        const previous = chip.getAttribute("data-url") || "";
-        if (url === previous) return;
-        chip.setAttribute("data-url", url);
-        if (url) {
-            label.textContent = "Network address:";
-            link.href = url;
-            link.textContent = url;
-            link.style.display = "";
-            copy.style.display = "";
-        } else {
-            label.textContent = "Not connected to a network";
-            link.style.display = "none";
-            copy.style.display = "none";
-        }
-        // Brief highlight so the change is noticed
-        chip.classList.add("net-chip-changed");
-        chip.title = url ? "Network changed - new address: " + url : "This PC is not connected to a network";
-        setTimeout(function () { chip.classList.remove("net-chip-changed"); }, 4000);
-    }
-
-    async function check() {
-        try {
-            const res = await fetch("superadmin_dashboard.php?action=network_address", { cache: "no-store", credentials: "same-origin" });
-            if (!res.ok) return;
-            const data = await res.json();
-            if (data && data.success) show(data.url || "");
-        } catch (e) {
-            // Server unreachable for a moment: keep the last known address
-        }
-    }
-
-    setInterval(check, 10000);
-    window.addEventListener("online", check);
-    window.addEventListener("offline", check);
 })();
 </script>
 </body>

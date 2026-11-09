@@ -1740,8 +1740,6 @@ button:hover {
             </a>
         </div>
 
-        <?php echo secsysNetworkAccessHtml(); ?>
-
 
 
     </div>
