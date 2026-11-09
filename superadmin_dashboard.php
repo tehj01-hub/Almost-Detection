@@ -256,10 +256,17 @@ if (isset($_GET['action']) && $_GET['action'] === 'dashboard_stats') {
         $stmtHourly->close();
     }
 
+    $exitAlerts = secsysOpenExitAlerts($conn, 10);
+    $typeCounts = secsysTodayVehicleTypeCounts($conn);
+    // Totals count every vehicle type that entered (not only cars and motorcycles)
+    $totRegToday = array_sum(array_column($typeCounts['Registered'], 'in'));
+    $totVisToday = array_sum(array_column($typeCounts['Visitor'], 'in'));
     $conn->close();
 
     echo json_encode([
         'success' => true,
+        'exit_alerts' => $exitAlerts,
+        'by_type' => $typeCounts,
         'stats' => [
             'reg_moto_in' => $regMotoIn,
             'reg_moto_out' => $regMotoOut,
@@ -417,18 +424,17 @@ $stmt->close();
    TOTAL REGISTERED VEHICLES ENTERED TODAY
 ========================================================= */
 
-$totalRegisteredToday =
-    $registeredMotorcycleIn +
-    $registeredCarIn;
+// Per-type IN / OUT counts (every vehicle type detected today)
+$todayTypeCounts = secsysTodayVehicleTypeCounts($conn);
+
+$totalRegisteredToday = array_sum(array_column($todayTypeCounts['Registered'], 'in'));
 
 
 /* =========================================================
    TOTAL VISITOR VEHICLES ENTERED TODAY
 ========================================================= */
 
-$totalVisitorsToday =
-    $visitorMotorcycleIn +
-    $visitorCarIn;
+$totalVisitorsToday = array_sum(array_column($todayTypeCounts['Visitor'], 'in'));
 
 
 /* =========================================================
@@ -944,22 +950,21 @@ body {
 }
 
 .vehicle-card,
-.activity-card {
-    background: #baf7b4;
-    border: 1px solid #dedede;
+.activity-card,
+.activity-cards {
+    background: #f0f6fc;
+    border: 1px solid #c8dcf0;
     border-radius: 21px;
     padding: 13px 15px 15px;
-    box-shadow: 0 2px 5px rgba(0, 0, 0, 0.13);
+    box-shadow: 0 2px 6px rgba(15, 23, 42, 0.05);
     min-width: 0;
     box-sizing: border-box;
 }
 
-.vehicle-card.panel-visitor {
-    background: #b3dcf4;
-}
-
+.vehicle-card.panel-visitor,
 .vehicle-card.panel-registered {
-    background: #baf7b4;
+    background: #f0f6fc;
+    border: 1px solid #c8dcf0;
 }
 
 .vehicle-card h2,
@@ -2190,17 +2195,14 @@ body {
     margin-bottom: 16px;
 }
 
-.admin-activity .activity-cards {
-    background: #b3dcf4;
-    border: 1px solid #dedede;
+.admin-activity .activity-cards,
+.admin-activity .activity-card {
+    background: #f0f6fc;
+    border: 1px solid #c8dcf0;
     border-radius: 21px;
     padding: 13px 15px 15px;
-    box-shadow: 0 2px 5px rgba(0, 0, 0, 0.13);
+    box-shadow: 0 2px 6px rgba(15, 23, 42, 0.05);
     min-width: 0;
-}
-
-.admin-activity .activity-card {
-    background: #baf7b4;
 }
 
 .admin-activity-link {
@@ -2417,16 +2419,16 @@ body {
 }
 
 .admin-activity .captured {
-    background: #c5d8ef;
+    background: #e2edf6;
     border-radius: 10px;
     padding: 3px 7px;
     font-size: 8px;
     font-weight: 600;
-    color: #374151;
+    color: #0369a1;
 }
 
 .admin-activity .activity-card .captured {
-    background: #bbf2b5;
+    background: #e2edf6;
 }
 
 .admin-activity .empty-activity {
@@ -2461,6 +2463,16 @@ body {
 
 .admin-counts .stat-value {
     font-size: 20px;
+}
+
+.admin-counts .stat-empty {
+    grid-column: 1 / -1;
+    text-align: center;
+    color: #64748b;
+    font-size: 12px;
+    padding: 12px 6px;
+    border: 1px dashed #cbd5e1;
+    border-radius: 8px;
 }
 
 .admin-counts .stat-label {
@@ -2677,17 +2689,28 @@ body {
 
         <div class="header-right">
             <div class="dual-clock">
-                <div class="clock-card" title="Time from internet time servers (NTP)">
-                    <div class="clock-label"><span>🌐 Internet Time</span><span class="clock-badge" id="internetClockStatus">Syncing…</span></div>
-                    <div class="clock" id="internetClock">--:--:--</div>
-                </div>
                 <div class="clock-card" title="This unit's own clock">
-                    <div class="clock-label"><span>🖥️ System Time</span><span class="clock-badge" id="systemClockDrift"></span></div>
+                    <div class="clock-label"><span></span></div>
                     <div class="clock" id="liveClock"><?php echo date('h:i:s A'); ?></div>
                 </div>
             </div>
         </div>
 
+    </div>
+
+    <!-- Exit without entry: vehicles the exit camera saw leaving that were never logged IN -->
+    <div id="adminExitAlertBanner" role="alert" style="display:none; background:#fef2f2; border:1px solid #fecaca; border-left:6px solid #dc2626; border-radius:12px; padding:12px 16px; margin-bottom:18px; color:#7f1d1d;">
+        <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:10px; flex-wrap:wrap;">
+            <div style="display:flex; gap:10px; align-items:flex-start;">
+                <span style="font-size:20px; line-height:1;">🚨</span>
+                <div>
+                    <strong>Exit Without Entry — <span id="adminExitAlertCount">0</span> not yet acknowledged</strong>
+                    <div style="font-size:12px; color:#991b1b; margin-top:2px;">The exit camera read these vehicles leaving without an entry record. Guards acknowledge them on their dashboard.</div>
+                </div>
+            </div>
+            <a href="report.php?audit_type=module%3ASecurity+Guard+Dashboard&amp;search=Exit+Without+Entry" style="font-size:12px; font-weight:700; color:#b91c1c; text-decoration:underline; white-space:nowrap;">View in Report</a>
+        </div>
+        <div id="adminExitAlertList" style="display:flex; flex-wrap:wrap; gap:6px; margin-top:10px;"></div>
     </div>
 
 
@@ -2844,47 +2867,14 @@ body {
         <!-- VISITOR VEHICLES (blue, left - same as guard dashboard) -->
         <section class="vehicle-card activity-card panel-visitor">
             <h2>Visitor Vehicles Today</h2>
-            <div class="stats">
-                <div class="stat row-in">
-                    <div class="stat-label">🏍 Motorcycle <span class="stat-dir">🟢 IN</span></div>
-                    <div class="stat-value" id="statVisMotoIn"><?php echo $visitorMotorcycleIn; ?></div>
-                </div>
-                <div class="stat row-out">
-                    <div class="stat-label">🏍 Motorcycle <span class="stat-dir">🔴 OUT</span></div>
-                    <div class="stat-value" id="statVisMotoOut"><?php echo $visitorMotorcycleOut; ?></div>
-                </div>
-                <div class="stat row-in">
-                    <div class="stat-label">🚗 Car <span class="stat-dir">🟢 IN</span></div>
-                    <div class="stat-value" id="statVisCarIn"><?php echo $visitorCarIn; ?></div>
-                </div>
-                <div class="stat row-out">
-                    <div class="stat-label">🚗 Car <span class="stat-dir">🔴 OUT</span></div>
-                    <div class="stat-value" id="statVisCarOut"><?php echo $visitorCarOut; ?></div>
-                </div>
-            </div>
+            <!-- One IN / OUT pair per vehicle type detected today (empty after 12:00 AM) -->
+            <div class="stats" id="statsVisitorByType"><?php echo secsysVehicleTypeStatsHtml($todayTypeCounts['Visitor']); ?></div>
         </section>
 
         <!-- REGISTERED VEHICLES (green, right - same as guard dashboard) -->
         <section class="vehicle-card activity-card panel-registered">
             <h2>Registered Vehicles Today</h2>
-            <div class="stats">
-                <div class="stat row-in">
-                    <div class="stat-label">🏍 Motorcycle <span class="stat-dir">🟢 IN</span></div>
-                    <div class="stat-value" id="statRegMotoIn"><?php echo $registeredMotorcycleIn; ?></div>
-                </div>
-                <div class="stat row-out">
-                    <div class="stat-label">🏍 Motorcycle <span class="stat-dir">🔴 OUT</span></div>
-                    <div class="stat-value" id="statRegMotoOut"><?php echo $registeredMotorcycleOut; ?></div>
-                </div>
-                <div class="stat row-in">
-                    <div class="stat-label">🚗 Car <span class="stat-dir">🟢 IN</span></div>
-                    <div class="stat-value" id="statRegCarIn"><?php echo $registeredCarIn; ?></div>
-                </div>
-                <div class="stat row-out">
-                    <div class="stat-label">🚗 Car <span class="stat-dir">🔴 OUT</span></div>
-                    <div class="stat-value" id="statRegCarOut"><?php echo $registeredCarOut; ?></div>
-                </div>
-            </div>
+            <div class="stats" id="statsRegisteredByType"><?php echo secsysVehicleTypeStatsHtml($todayTypeCounts['Registered']); ?></div>
         </section>
 
     </div>
@@ -3238,6 +3228,7 @@ const vehicleChart =
 
                 {
                     label: "Motor",
+                    hidden: true, // Car/Motor not shown on this chart
 
                     data:
                         <?php
@@ -3263,6 +3254,7 @@ const vehicleChart =
 
                 {
                     label: "Car",
+                    hidden: true, // Car/Motor not shown on this chart
 
                     data:
                         <?php
@@ -3309,6 +3301,7 @@ const vehicleChart =
                     position: "bottom",
 
                     labels: {
+                        filter: function (item) { return item.text !== "Car" && item.text !== "Motor"; },
 
                         boxWidth: 20,
 
@@ -3441,12 +3434,12 @@ function printDashboard() {
     const c = function (text) { return { text: text, cls: "center" }; };
 
     // Summary (live tiles)
-    const summary = [
-        ["Registered", "Motorcycle", reportNum("statRegMotoIn"), reportNum("statRegMotoOut")],
-        ["Registered", "Car", reportNum("statRegCarIn"), reportNum("statRegCarOut")],
-        ["Visitor", "Motorcycle", reportNum("statVisMotoIn"), reportNum("statVisMotoOut")],
-        ["Visitor", "Car", reportNum("statVisCarIn"), reportNum("statVisCarOut")]
-    ];
+    const summary = [];
+    ["Registered", "Visitor"].forEach(function (cat) {
+        (adminTypeCounts[cat] || []).forEach(function (r) {
+            summary.push([cat, r.type, Number(r.in || 0), Number(r.out || 0)]);
+        });
+    });
     const sumIn = summary.reduce(function (t, r) { return t + r[2]; }, 0);
     const sumOut = summary.reduce(function (t, r) { return t + r[3]; }, 0);
     const summaryRows = summary.map(function (r, i) { return [c(i + 1), r[0], r[1], c(r[2]), c(r[3])]; });
@@ -3505,7 +3498,7 @@ function printDashboard() {
    LIVE CLOCK
 ========================================================= */
 
-/* Live clocks (Internet + System) are driven by assets/js/dual_clock.js */
+/* The live System Time clock is driven by assets/js/dual_clock.js */
 
 
 /* =========================================================
@@ -3992,6 +3985,58 @@ function updateStatElement(id, value) {
     }
 }
 
+// Latest per-type counts, also used by Print Dashboard
+let adminTypeCounts = <?php echo json_encode($todayTypeCounts, JSON_UNESCAPED_UNICODE); ?>;
+
+function renderVehicleTypeStats(containerId, rows) {
+    const box = document.getElementById(containerId);
+    if (!box) return;
+    if (containerId === "statsVisitorByType") adminTypeCounts.Visitor = rows;
+    if (containerId === "statsRegisteredByType") adminTypeCounts.Registered = rows;
+    const esc = function (s) {
+        const d = document.createElement("div");
+        d.textContent = s == null ? "" : String(s);
+        return d.innerHTML;
+    };
+    const html = rows.length
+        ? rows.map(function (r) {
+            const label = esc(r.icon + " " + r.type);
+            return '<div class="stat row-in"><div class="stat-label">' + label + ' <span class="stat-dir">🟢 IN</span></div>' +
+                       '<div class="stat-value">' + Number(r.in || 0) + '</div></div>' +
+                   '<div class="stat row-out"><div class="stat-label">' + label + ' <span class="stat-dir">🔴 OUT</span></div>' +
+                       '<div class="stat-value">' + Number(r.out || 0) + '</div></div>';
+        }).join("")
+        : '<div class="stat-empty">No vehicles detected yet today.</div>';
+    if (box.innerHTML !== html) box.innerHTML = html;
+}
+
+function renderAdminExitAlerts(alerts) {
+    const banner = document.getElementById("adminExitAlertBanner");
+    const list = document.getElementById("adminExitAlertList");
+    const count = document.getElementById("adminExitAlertCount");
+    if (!banner || !list) return;
+    if (!alerts.length) {
+        banner.style.display = "none";
+        list.innerHTML = "";
+        return;
+    }
+    const esc = function (s) {
+        const d = document.createElement("div");
+        d.textContent = s == null ? "" : String(s);
+        return d.innerHTML;
+    };
+    if (count) count.textContent = String(alerts.length);
+    list.innerHTML = alerts.map(function (a) {
+        const kind = String(a.vehicle_category || "Unknown") === "Unknown" ? "Unregistered" : a.vehicle_category;
+        const alertId = Number(a.id);
+        const modalUrl = 'vehicle_photo.php?alert_id=' + alertId + '&plate=' + encodeURIComponent(a.plate_number || '');
+        return '<span style="background:#fff; border:1px solid #fecaca; border-radius:8px; padding:4px 10px; font-size:12px; display:inline-flex; align-items:center; gap:6px;">' +
+            '<a href="' + esc(modalUrl) + '" class="secsys-plate-link" data-plate="' + esc(a.plate_number || '') + '" data-alert-id="' + alertId + '" onclick="return window.secsysOpenPlateCaptureModal ? window.secsysOpenPlateCaptureModal(event, this) : true;" style="color:#b91c1c; font-weight:700; text-decoration:none;" title="Click to view captured license plate &amp; vehicle image"><strong style="letter-spacing:.5px;">' + esc(a.plate_number) + '</strong></a> · ' + esc(kind) + ' · ' + esc(a.time_label || "") +
+            '</span>';
+    }).join("");
+    banner.style.display = "block";
+}
+
 async function pollAdminDashboardStats() {
     if (isPollingAdminStats) return;
     isPollingAdminStats = true;
@@ -4006,17 +4051,13 @@ async function pollAdminDashboardStats() {
         const data = await res.json();
         if (!data || !data.success || !data.stats) return;
 
-        // 1. Registered vehicle statistics
-        updateStatElement("statRegMotoIn", data.stats.reg_moto_in);
-        updateStatElement("statRegMotoOut", data.stats.reg_moto_out);
-        updateStatElement("statRegCarIn", data.stats.reg_car_in);
-        updateStatElement("statRegCarOut", data.stats.reg_car_out);
+        renderAdminExitAlerts(Array.isArray(data.exit_alerts) ? data.exit_alerts : []);
 
-        // 2. Visitor vehicle statistics
-        updateStatElement("statVisMotoIn", data.stats.vis_moto_in);
-        updateStatElement("statVisMotoOut", data.stats.vis_moto_out);
-        updateStatElement("statVisCarIn", data.stats.vis_car_in);
-        updateStatElement("statVisCarOut", data.stats.vis_car_out);
+        // 1-2. Per-type IN / OUT tiles (a new type appears when first detected; empty after 12:00 AM)
+        if (data.by_type) {
+            renderVehicleTypeStats("statsVisitorByType", data.by_type.Visitor || []);
+            renderVehicleTypeStats("statsRegisteredByType", data.by_type.Registered || []);
+        }
 
         // 3. Totals
         updateStatElement("statTotalRegToday", data.stats.total_reg_today);
@@ -4104,6 +4145,7 @@ document.addEventListener("visibilitychange", function () {
     });
 })();
 </script>
+<script src="assets/js/logout_confirm.js?v=<?php echo (int)@filemtime(__DIR__ . '/assets/js/logout_confirm.js'); ?>"></script>
 </body>
 
 </html>

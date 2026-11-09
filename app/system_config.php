@@ -517,6 +517,52 @@ function secsysEnsureSchema(mysqli $conn)
             KEY idx_reset_ip_time (ip_address, attempted_at)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
     ");
+    // Extra owner information the Administrator added fields for (see app/owner_fields.php)
+    foreach (['registered_vehicles', 'registered_vehicles_archive'] as $ownerTable) {
+        $extraCol = $conn->query("SHOW COLUMNS FROM `$ownerTable` LIKE 'extra_info'");
+        if ($extraCol && $extraCol->num_rows === 0) {
+            $conn->query("ALTER TABLE `$ownerTable` ADD COLUMN extra_info TEXT DEFAULT NULL");
+        }
+    }
+
+    // Exit camera read a plate that was never logged IN (written by detect_plate_server.py)
+    $conn->query("
+        CREATE TABLE IF NOT EXISTS exit_without_entry_alerts (
+            id INT NOT NULL AUTO_INCREMENT,
+            plate_number VARCHAR(50) NOT NULL,
+            normalized_plate VARCHAR(50) NOT NULL,
+            vehicle_category VARCHAR(30) NOT NULL DEFAULT 'Unknown',
+            vehicle_type VARCHAR(50) DEFAULT NULL,
+            camera_name VARCHAR(100) DEFAULT NULL,
+            confidence DECIMAL(5,2) DEFAULT NULL,
+            plate_image VARCHAR(255) DEFAULT NULL,
+            vehicle_image VARCHAR(255) DEFAULT NULL,
+            detected_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            status ENUM('New','Acknowledged') NOT NULL DEFAULT 'New',
+            acknowledged_by VARCHAR(50) DEFAULT NULL,
+            acknowledged_at DATETIME DEFAULT NULL,
+            PRIMARY KEY (id),
+            KEY idx_ewe_plate_time (normalized_plate, detected_at),
+            KEY idx_ewe_status (status)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
+    ");
+    // What the guard wrote when acknowledging the warning (shown in the Report's log)
+    $ackNoteCol = $conn->query("SHOW COLUMNS FROM exit_without_entry_alerts LIKE 'ack_note'");
+    if ($ackNoteCol && $ackNoteCol->num_rows === 0) {
+        $conn->query("ALTER TABLE exit_without_entry_alerts ADD COLUMN ack_note VARCHAR(255) DEFAULT NULL AFTER acknowledged_at");
+    }
+
+    // vehicle_type used to be a fixed ENUM, which silently saved any other type
+    // (e.g. a Tricycle visit, or a new type such as Bus) as an empty string.
+    // A text column keeps every type, so new types show up in the counts and report.
+    foreach (['vehicle_logs', 'vehicle_logs_archive', 'vehicle_log_dates', 'visitor_vehicles',
+              'visitor_vehicles_archive', 'registered_vehicles', 'registered_vehicles_archive'] as $vtTable) {
+        $vtCol = $conn->query("SHOW COLUMNS FROM `$vtTable` LIKE 'vehicle_type'");
+        $vtRow = $vtCol ? $vtCol->fetch_assoc() : null;
+        if ($vtRow && stripos((string)$vtRow['Type'], 'enum(') === 0) {
+            $conn->query("ALTER TABLE `$vtTable` MODIFY COLUMN vehicle_type VARCHAR(50) NOT NULL DEFAULT 'Car'");
+        }
+    }
 
     /* -------------------------------------------------------------
        6. Daily 12:00 AM Midnight Log Reset (auto-archive past logs).
@@ -703,9 +749,15 @@ function secsysClickablePlateHtml($plateOrRow, array $extraRow = [], string $cla
     $ids = array_values(array_filter(array_map('intval', $rawIds)));
     $idsStr = implode(',', $ids);
 
+    // An exit-without-entry warning has its own photos (uploads/exit_alerts)
+    $alertId = (int)($row['alert_id'] ?? 0);
+
     $href = 'vehicle_photo.php?plate=' . rawurlencode($plate);
     if ($idsStr !== '') {
         $href .= '&ids=' . rawurlencode($idsStr);
+    }
+    if ($alertId > 0) {
+        $href .= '&alert_id=' . $alertId;
     }
 
     $classes = trim('secsys-plate-link ' . $className);
@@ -719,6 +771,7 @@ function secsysClickablePlateHtml($plateOrRow, array $extraRow = [], string $cla
         . ' class="' . htmlspecialchars($classes, ENT_QUOTES, 'UTF-8') . '"'
         . ' data-plate="' . $escPlate . '"'
         . ' data-ids="' . $escIds . '"'
+        . ($alertId > 0 ? ' data-alert-id="' . $alertId . '"' : '')
         . $styleAttr
         . ' onclick="return window.secsysOpenPlateCaptureModal ? window.secsysOpenPlateCaptureModal(event, this) : true;"'
         . ' title="Click to view YOLOv10 captured license plate &amp; vehicle image">'
@@ -878,6 +931,308 @@ function secsysGetSetting(mysqli $conn, string $key, string $default = ''): stri
         }
     }
     return array_key_exists($key, $settingsCache) ? (string)$settingsCache[$key] : $default;
+}
+
+/**
+ * Open visit (entered, not yet exited) for a normalized plate, or null.
+ * Same rules as find_open_vehicle_visit() in app/vehicle_visit_logger.py.
+ * Returns ['id' => vehicle_log_dates id or null, 'vehicle_log_id' => id or null].
+ */
+/** Icon for each vehicle type; types without one get a generic vehicle icon. */
+const SECSYS_VEHICLE_TYPE_ICONS = [
+    'Car' => '🚗', 'Motorcycle' => '🏍️', 'Truck' => '🚚', 'Tricycle' => '🛺',
+    'E-Bike' => '🛵', 'Bike' => '🚲', 'Bus' => '🚌', 'Van' => '🚐', 'Jeep' => '🚙',
+];
+
+function secsysVehicleTypeIcon(string $type): string
+{
+    return SECSYS_VEHICLE_TYPE_ICONS[$type] ?? '🚙';
+}
+
+/**
+ * Display name of a vehicle type for counts and summaries. Known types are
+ * normalized (e.g. "motor" -> Motorcycle); any other new type (e.g. "Bus")
+ * keeps its own name so it shows up as its own row instead of being counted as a Car.
+ */
+function secsysVehicleTypeLabel($value): string
+{
+    $raw = trim((string)$value);
+    $normalized = secsysNormalizeVehicleType($raw);
+    $lower = strtolower($raw);
+    if ($normalized === 'Car' && $raw !== '' && !in_array($lower, ['car', 'unknown', 'none', 'n/a', '-'], true)
+        && strpos($lower, 'car') === false) {
+        return ucwords($lower);
+    }
+    return $normalized;
+}
+
+/** Sort vehicle types: the standard ones in their usual order, then any new ones alphabetically. */
+function secsysSortVehicleTypes(array $types): array
+{
+    $order = array_flip(SECSYS_VEHICLE_TYPES);
+    usort($types, function ($a, $b) use ($order) {
+        $ra = $order[$a] ?? 1000;
+        $rb = $order[$b] ?? 1000;
+        return $ra === $rb ? strcasecmp($a, $b) : $ra <=> $rb;
+    });
+    return $types;
+}
+
+/**
+ * Today's IN / OUT counts per vehicle type, for Visitor and Registered vehicles.
+ * Only types that actually moved today are listed, so right after 12:00 AM both
+ * lists are empty and each type appears the first time it is detected.
+ *
+ * @return array{Visitor: list<array{type:string,icon:string,in:int,out:int}>, Registered: list<array{type:string,icon:string,in:int,out:int}>}
+ */
+function secsysTodayVehicleTypeCounts(mysqli $conn): array
+{
+    $counts = ['Visitor' => [], 'Registered' => []];
+    $res = $conn->query("
+        SELECT vehicle_category, vehicle_type, direction, COUNT(*) AS total
+        FROM vehicle_logs
+        WHERE date_created >= CURDATE() AND date_created < CURDATE() + INTERVAL 1 DAY
+        GROUP BY vehicle_category, vehicle_type, direction
+    ");
+    while ($res && ($row = $res->fetch_assoc())) {
+        $cat = strcasecmp((string)$row['vehicle_category'], 'Registered') === 0 ? 'Registered' : 'Visitor';
+        $type = secsysVehicleTypeLabel($row['vehicle_type'] ?? '');
+        $dir = strtoupper((string)$row['direction']) === 'OUT' ? 'out' : 'in';
+        if (!isset($counts[$cat][$type])) {
+            $counts[$cat][$type] = ['type' => $type, 'icon' => secsysVehicleTypeIcon($type), 'in' => 0, 'out' => 0];
+        }
+        $counts[$cat][$type][$dir] += (int)$row['total'];
+    }
+    foreach ($counts as $cat => $byType) {
+        $sorted = [];
+        foreach (secsysSortVehicleTypes(array_keys($byType)) as $type) {
+            $sorted[] = $byType[$type];
+        }
+        $counts[$cat] = $sorted;
+    }
+    return $counts;
+}
+
+/** IN / OUT tiles for one category of today's counts (admin dashboard vehicle cards). */
+function secsysVehicleTypeStatsHtml(array $rows): string
+{
+    if (!$rows) {
+        return '<div class="stat-empty">No vehicles detected yet today.</div>';
+    }
+    $html = '';
+    foreach ($rows as $r) {
+        $label = htmlspecialchars($r['icon'] . ' ' . $r['type'], ENT_QUOTES, 'UTF-8');
+        $html .= '<div class="stat row-in"><div class="stat-label">' . $label . ' <span class="stat-dir">🟢 IN</span></div>'
+               . '<div class="stat-value">' . (int)$r['in'] . '</div></div>'
+               . '<div class="stat row-out"><div class="stat-label">' . $label . ' <span class="stat-dir">🔴 OUT</span></div>'
+               . '<div class="stat-value">' . (int)$r['out'] . '</div></div>';
+    }
+    return $html;
+}
+
+/**
+ * Exit-without-entry warnings the guards have not acknowledged yet
+ * (today and yesterday, newest first). Empty when the table is missing.
+ */
+function secsysOpenExitAlerts(mysqli $conn, int $limit = 20): array
+{
+    $alerts = [];
+    try {
+        $res = $conn->query("
+            SELECT id, plate_number, vehicle_category, vehicle_type, camera_name, confidence,
+                   plate_image, vehicle_image, detected_at,
+                   DATE_FORMAT(detected_at, '%h:%i %p') AS time_label
+            FROM exit_without_entry_alerts
+            WHERE status = 'New' AND detected_at >= CURDATE() - INTERVAL 1 DAY
+            ORDER BY id DESC
+            LIMIT " . max(1, min(100, $limit))
+        );
+    } catch (Throwable $e) {
+        return [];
+    }
+    while ($res && ($row = $res->fetch_assoc())) {
+        $row['id'] = (int)$row['id'];
+        $vFile = basename((string)($row['vehicle_image'] ?? ''));
+        $pFile = basename((string)($row['plate_image'] ?? ''));
+        $row['vehicle_image_url'] = $vFile !== '' ? ('vehicle_photo.php?raw=vehicle&file=' . rawurlencode($vFile)) : null;
+        $row['plate_image_url'] = $pFile !== '' ? ('vehicle_photo.php?raw=plate&file=' . rawurlencode($pFile)) : null;
+        $row['photo_url'] = $row['vehicle_image_url'] ?: $row['plate_image_url'];
+        $row['modal_url'] = 'vehicle_photo.php?alert_id=' . (int)$row['id'] . '&plate=' . rawurlencode((string)$row['plate_number']);
+        $alerts[] = $row;
+    }
+    return $alerts;
+}
+
+function secsysFindOpenVisit(mysqli $conn, string $normalized, bool $forUpdate = false): ?array
+{
+    if ($normalized === '') {
+        return null;
+    }
+    $lock = $forUpdate ? ' FOR UPDATE' : '';
+    $stmt = $conn->prepare("
+        SELECT vld.id AS id, vl.id AS vehicle_log_id
+        FROM vehicle_logs vl
+        LEFT JOIN vehicle_log_dates vld ON vld.vehicle_log_id = vl.id
+        WHERE UPPER(REGEXP_REPLACE(vl.plate_number, '[^a-zA-Z0-9]', '')) = ?
+          AND vl.direction = 'IN'
+          AND vl.date_out IS NULL
+          AND (vld.id IS NULL OR (vld.status = 'IN' AND vld.time_in IS NOT NULL AND vld.time_out IS NULL))
+          AND NOT EXISTS (
+              SELECT 1 FROM vehicle_logs vl_out
+              WHERE UPPER(REGEXP_REPLACE(vl_out.plate_number, '[^a-zA-Z0-9]', '')) = ?
+                AND vl_out.direction = 'OUT' AND vl_out.id > vl.id
+          )
+        ORDER BY vl.id DESC, vld.id DESC
+        LIMIT 1{$lock}
+    ");
+    $stmt->bind_param('ss', $normalized, $normalized);
+    $stmt->execute();
+    $row = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+    if ($row) {
+        return ['id' => $row['id'] !== null ? (int)$row['id'] : null, 'vehicle_log_id' => (int)$row['vehicle_log_id']];
+    }
+
+    $stmt = $conn->prepare("
+        SELECT vld.id AS id, vld.vehicle_log_id AS vehicle_log_id
+        FROM vehicle_log_dates vld
+        WHERE UPPER(REGEXP_REPLACE(vld.plate_number, '[^a-zA-Z0-9]', '')) = ?
+          AND vld.vehicle_log_id IS NULL
+          AND vld.status = 'IN' AND vld.time_in IS NOT NULL AND vld.time_out IS NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM vehicle_log_dates vld_out
+              WHERE UPPER(REGEXP_REPLACE(vld_out.plate_number, '[^a-zA-Z0-9]', '')) = ?
+                AND vld_out.status = 'OUT' AND vld_out.id > vld.id
+          )
+        ORDER BY vld.id DESC
+        LIMIT 1{$lock}
+    ");
+    $stmt->bind_param('ss', $normalized, $normalized);
+    $stmt->execute();
+    $row = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+    return $row ? ['id' => (int)$row['id'], 'vehicle_log_id' => null] : null;
+}
+
+/**
+ * Manually log a registered vehicle's entry or exit (guard dashboard "Add
+ * Registered"), exactly like a camera read in app/vehicle_visit_logger.py:
+ * same per-plate lock, IN refused while the vehicle is already inside, OUT
+ * refused when it is not inside, AUTO picks IN or OUT.
+ * Returns ['ok' => bool, 'message' => string, 'direction' => ?, 'log_id' => ?, 'plate' => ?].
+ */
+function secsysRecordManualRegisteredVisit(mysqli $conn, int $registeredId, string $direction): array
+{
+    $direction = strtoupper(trim($direction));
+    if (!in_array($direction, ['AUTO', 'IN', 'OUT'], true)) {
+        return ['ok' => false, 'message' => 'Choose Auto, IN or OUT.'];
+    }
+
+    $stmt = $conn->prepare("SELECT id, plate_number, vehicle_type FROM registered_vehicles WHERE id = ? AND status = 'Active' LIMIT 1");
+    $stmt->bind_param('i', $registeredId);
+    $stmt->execute();
+    $vehicle = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+    if (!$vehicle) {
+        return ['ok' => false, 'message' => 'That vehicle is not in the active registered list.'];
+    }
+
+    $plate = trim((string)$vehicle['plate_number']);
+    $normalized = preg_replace('/[^A-Z0-9]/', '', strtoupper($plate));
+    $vehicleType = secsysNormalizeVehicleType($vehicle['vehicle_type'] ?? 'Car');
+    $purpose = 'Registered Vehicle';
+    $category = 'Registered';
+
+    // Same lock name as the camera logger, so a camera read and a manual log cannot collide
+    $dbName = (string)($conn->query("SELECT DATABASE() AS d")->fetch_assoc()['d'] ?? 'security_system');
+    $lockName = 'secsys:visit:' . substr(hash('sha256', $dbName . ':' . $normalized), 0, 45);
+    $stmt = $conn->prepare("SELECT GET_LOCK(?, 5) AS acquired");
+    $stmt->bind_param('s', $lockName);
+    $stmt->execute();
+    $locked = (int)($stmt->get_result()->fetch_assoc()['acquired'] ?? 0) === 1;
+    $stmt->close();
+    if (!$locked) {
+        return ['ok' => false, 'message' => 'This vehicle is being updated right now. Please try again.'];
+    }
+
+    try {
+        $conn->begin_transaction();
+        $visit = secsysFindOpenVisit($conn, $normalized, true);
+
+        if ($direction === 'IN' && $visit !== null) {
+            $conn->rollback();
+            return ['ok' => false, 'message' => "$plate is already inside. Log it OUT instead (or use Auto)."];
+        }
+        if ($direction === 'OUT' && $visit === null) {
+            $conn->rollback();
+            return ['ok' => false, 'message' => "$plate is not inside right now, so it cannot be logged OUT."];
+        }
+        $resolved = $direction === 'AUTO' ? ($visit ? 'OUT' : 'IN') : $direction;
+        $dateColumn = $resolved === 'IN' ? 'date_in' : 'date_out';
+
+        $stmt = $conn->prepare("
+            INSERT INTO vehicle_logs
+                (plate_number, vehicle_category, vehicle_type, registered_vehicle_id,
+                 visitor_vehicle_id, visitor_name, purpose, direction,
+                 recognition_method, {$dateColumn}, date_created)
+            VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, 'Manual', CURDATE(), NOW())
+        ");
+        $regId = (int)$vehicle['id'];
+        $stmt->bind_param('sssiss', $plate, $category, $vehicleType, $regId, $purpose, $resolved);
+        $stmt->execute();
+        $logId = (int)$conn->insert_id;
+        $stmt->close();
+
+        if ($resolved === 'OUT' && $visit) {
+            if ($visit['id'] !== null) {
+                $stmt = $conn->prepare("
+                    UPDATE vehicle_log_dates SET date_out = CURDATE(), time_out = NOW(), status = 'OUT'
+                    WHERE id = ?
+                       OR (UPPER(REGEXP_REPLACE(plate_number, '[^a-zA-Z0-9]', '')) = ? AND status = 'IN' AND time_out IS NULL)
+                ");
+                $stmt->bind_param('is', $visit['id'], $normalized);
+            } else {
+                $stmt = $conn->prepare("
+                    INSERT INTO vehicle_log_dates
+                        (vehicle_log_id, plate_number, vehicle_category, vehicle_type, purpose, date_out, time_out, status)
+                    VALUES (?, ?, ?, ?, ?, CURDATE(), NOW(), 'OUT')
+                ");
+                $stmt->bind_param('issss', $logId, $plate, $category, $vehicleType, $purpose);
+            }
+            $stmt->execute();
+            $stmt->close();
+            $entryLogId = (int)($visit['vehicle_log_id'] ?? 0);
+            $stmt = $conn->prepare("
+                UPDATE vehicle_logs SET date_out = CURDATE()
+                WHERE id = ?
+                   OR (UPPER(REGEXP_REPLACE(plate_number, '[^a-zA-Z0-9]', '')) = ? AND direction = 'IN' AND date_out IS NULL)
+            ");
+            $stmt->bind_param('is', $entryLogId, $normalized);
+            $stmt->execute();
+            $stmt->close();
+        } else {
+            $stmt = $conn->prepare("
+                INSERT INTO vehicle_log_dates
+                    (vehicle_log_id, plate_number, vehicle_category, vehicle_type, purpose, date_in, time_in, status)
+                VALUES (?, ?, ?, ?, ?, CURDATE(), NOW(), 'IN')
+            ");
+            $stmt->bind_param('issss', $logId, $plate, $category, $vehicleType, $purpose);
+            $stmt->execute();
+            $stmt->close();
+        }
+
+        $conn->commit();
+        return ['ok' => true, 'message' => "$plate logged $resolved.", 'direction' => $resolved, 'log_id' => $logId, 'plate' => $plate];
+    } catch (Throwable $e) {
+        $conn->rollback();
+        return ['ok' => false, 'message' => 'Could not save the manual log. Please try again.'];
+    } finally {
+        $stmt = $conn->prepare("SELECT RELEASE_LOCK(?)");
+        $stmt->bind_param('s', $lockName);
+        $stmt->execute();
+        $stmt->get_result();
+        $stmt->close();
+    }
 }
 
 /**
@@ -2238,11 +2593,8 @@ function secsysBuildVehicleSummary(array $sessions): array
     $visBucket = $emptyBucket();
     $allPlates = [];
 
-    $typeBuckets = [
-        'Car'        => array_merge($emptyBucket(), ['label' => 'Car', 'icon' => '🚗', 'registered' => 0, 'visitor' => 0]),
-        'Motorcycle' => array_merge($emptyBucket(), ['label' => 'Motorcycle', 'icon' => '🏍️', 'registered' => 0, 'visitor' => 0]),
-        'Truck'      => array_merge($emptyBucket(), ['label' => 'Truck', 'icon' => '🚚', 'registered' => 0, 'visitor' => 0]),
-    ];
+    // Only vehicle types that actually appear in the period get a row (a new type is added when first seen)
+    $typeBuckets = [];
 
     $perPlate = [];
     $totalIn  = 0;
@@ -2257,7 +2609,7 @@ function secsysBuildVehicleSummary(array $sessions): array
         $catRaw   = strtolower(trim((string)($s['category'] ?? 'registered')));
         $isReg    = ($catRaw === 'registered');
         $catLabel = $isReg ? 'Registered' : 'Visitor';
-        $typeKey  = secsysNormalizeVehicleType($s['vehicle_type'] ?? 'Car');
+        $typeKey  = secsysVehicleTypeLabel($s['vehicle_type'] ?? 'Car');
 
         $hasIn    = !empty($s['time_in']);
         $hasOut   = !empty($s['time_out']);
@@ -2300,7 +2652,7 @@ function secsysBuildVehicleSummary(array $sessions): array
         if (!isset($typeBuckets[$typeKey])) {
             $typeBuckets[$typeKey] = array_merge($emptyBucket(), [
                 'label'      => $typeKey,
-                'icon'       => '🚙',
+                'icon'       => secsysVehicleTypeIcon($typeKey),
                 'registered' => 0,
                 'visitor'    => 0,
             ]);
@@ -2409,6 +2761,11 @@ function secsysBuildVehicleSummary(array $sessions): array
         unset($tb['_plates']);
     }
     unset($tb);
+    $sortedTypeBuckets = [];
+    foreach (secsysSortVehicleTypes(array_keys($typeBuckets)) as $typeName) {
+        $sortedTypeBuckets[$typeName] = $typeBuckets[$typeName];
+    }
+    $typeBuckets = $sortedTypeBuckets;
 
     // Sort perPlate by most active / latest activity
     uasort($perPlate, function ($a, $b) {

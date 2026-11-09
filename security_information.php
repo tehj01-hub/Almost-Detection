@@ -346,22 +346,9 @@ $totalGuards = count($guards);
 
 $totalMorning = 0;
 $totalNight = 0;
-$totalAssigned = 0;
-$totalUnassigned = 0;
 
 
 foreach ($guards as $guard) {
-
-    if (!empty($guard['assignment'])) {
-
-        $totalAssigned++;
-
-    } else {
-
-        $totalUnassigned++;
-
-    }
-
 
     if (
         strtolower(
@@ -848,15 +835,15 @@ body {
 
 .shift-banner {
 
-    background: #ffffff;
+    background: #f0f6fc;
 
     border-radius: 14px;
 
     padding: 22px 25px;
 
-    border: 1px solid #e8edf5;
+    border: 1px solid #c8dcf0;
 
-    box-shadow: 0 3px 12px rgba(0,0,0,0.03);
+    box-shadow: 0 2px 6px rgba(15, 23, 42, 0.05);
 
     margin-bottom: 22px;
 
@@ -875,6 +862,8 @@ body {
 
     font-weight: 600;
 
+    color: #0c4a6e;
+
     margin-bottom: 5px;
 
 }
@@ -884,7 +873,7 @@ body {
 
     font-size: 12px;
 
-    color: #777;
+    color: #475569;
 
 }
 
@@ -904,7 +893,7 @@ body {
 
     font-weight: 600;
 
-    color: #2f80ed;
+    color: #0284c7;
 
 }
 
@@ -913,7 +902,7 @@ body {
 
     font-size: 11px;
 
-    color: #777;
+    color: #64748b;
 
 }
 
@@ -924,13 +913,13 @@ body {
 
 .card {
 
-    background: #ffffff;
+    background: #f0f6fc;
 
     border-radius: 14px;
 
-    border: 1px solid #e8edf5;
+    border: 1px solid #c8dcf0;
 
-    box-shadow: 0 3px 12px rgba(0,0,0,0.03);
+    box-shadow: 0 2px 6px rgba(15, 23, 42, 0.05);
 
     overflow: hidden;
 
@@ -938,12 +927,24 @@ body {
 
 }
 
+#liveSecurityContacts,
+#liveGuardInfo {
+    background: #f0f6fc;
+    border: 1px solid #c8dcf0;
+    box-shadow: 0 2px 6px rgba(15, 23, 42, 0.05);
+}
+
+#liveSecurityContacts .card-header,
+#liveGuardInfo .card-header {
+    border-bottom: 1px solid #c8dcf0;
+}
+
 
 .card-header {
 
     padding: 19px 22px;
 
-    border-bottom: 1px solid #edf0f5;
+    border-bottom: 1px solid #c8dcf0;
 
     display: flex;
 
@@ -960,12 +961,14 @@ body {
 
     font-weight: 600;
 
+    color: #0369a1;
+
 }
 
 
 .card-header p {
 
-    color: #888;
+    color: #64748b;
 
     font-size: 11px;
 
@@ -980,7 +983,7 @@ body {
 
     display: grid;
 
-    grid-template-columns: repeat(4, 1fr);
+    grid-template-columns: repeat(3, 1fr);
 
     gap: 16px;
 
@@ -991,22 +994,22 @@ body {
 
 .stat {
 
-    background: #ffffff;
+    background: #f0f6fc;
 
-    border: 1px solid #e8edf5;
+    border: 1px solid #c8dcf0;
 
     border-radius: 13px;
 
     padding: 19px 20px;
 
-    box-shadow: 0 3px 12px rgba(0,0,0,0.03);
+    box-shadow: 0 2px 6px rgba(15, 23, 42, 0.05);
 
 }
 
 
 .stat-label {
 
-    color: #777;
+    color: #0369a1;
 
     font-size: 12px;
 
@@ -1021,7 +1024,7 @@ body {
 
     font-weight: 600;
 
-    color: #2f80ed;
+    color: #0c4a6e;
 
 }
 
@@ -1048,9 +1051,9 @@ table {
 
 thead th {
 
-    background: #f8faff;
+    background: #f8fafc;
 
-    color: #555;
+    color: #0369a1;
 
     font-size: 11px;
 
@@ -1060,31 +1063,40 @@ thead th {
 
     padding: 14px 18px;
 
-    border-bottom: 1px solid #e9edf3;
+    border-bottom: 2px solid #c8dcf0;
 
     white-space: nowrap;
 
 }
 
 
+tbody tr {
+
+    background: #ffffff;
+
+}
+
+
 tbody td {
+
+    background: #ffffff;
 
     padding: 15px 18px;
 
     font-size: 12px;
 
-    color: #444;
+    color: #1e293b;
 
-    border-bottom: 1px solid #f0f2f6;
+    border-bottom: 1px solid #e2edf6;
 
     vertical-align: middle;
 
 }
 
 
-tbody tr:hover {
+tbody tr:hover td {
 
-    background: #fbfcff;
+    background: #f8fafc;
 
 }
 
@@ -1093,7 +1105,7 @@ tbody tr:hover {
 
     font-weight: 600;
 
-    color: #222;
+    color: #1e293b;
 
 }
 
@@ -1102,7 +1114,7 @@ tbody tr:hover {
 
     font-size: 10px;
 
-    color: #999;
+    color: #64748b;
 
     margin-top: 2px;
 
@@ -1138,36 +1150,44 @@ tbody tr:hover {
 
 .badge-blue {
 
-    background: #eaf3ff;
+    background: #eff6ff;
 
-    color: #2f80ed;
+    color: #0284c7;
+
+    border: 1px solid #bae6fd;
 
 }
 
 
 .badge-green {
 
-    background: #eaf8f0;
+    background: #ecfdf5;
 
-    color: #20a35a;
+    color: #059669;
+
+    border: 1px solid #a7f3d0;
 
 }
 
 
 .badge-gray {
 
-    background: #f0f1f3;
+    background: #f1f5f9;
 
-    color: #777;
+    color: #475569;
+
+    border: 1px solid #cbd5e1;
 
 }
 
 
 .badge-orange {
 
-    background: #fff4e5;
+    background: #fffbeb;
 
-    color: #d98600;
+    color: #b45309;
+
+    border: 1px solid #fde68a;
 
 }
 
@@ -1191,13 +1211,15 @@ tbody tr:hover {
 
 .contact {
 
-    border: 1px solid #edf0f5;
+    border: 1px solid #c8dcf0;
 
     border-radius: 11px;
 
     padding: 17px;
 
     background: #ffffff;
+
+    box-shadow: 0 1px 3px rgba(15, 23, 42, 0.04);
 
 }
 
@@ -1208,6 +1230,8 @@ tbody tr:hover {
 
     font-size: 13px;
 
+    color: #1e293b;
+
     margin-bottom: 3px;
 
 }
@@ -1215,7 +1239,7 @@ tbody tr:hover {
 
 .contact-position {
 
-    color: #2f80ed;
+    color: #0284c7;
 
     font-size: 10px;
 
@@ -1228,7 +1252,7 @@ tbody tr:hover {
 
     font-size: 11px;
 
-    color: #666;
+    color: #334155;
 
     line-height: 1.8;
 
@@ -1254,11 +1278,15 @@ tbody tr:hover {
 
 .shift-card {
 
-    border: 1px solid #edf0f5;
+    border: 1px solid #c8dcf0;
 
     border-radius: 11px;
 
     padding: 18px;
+
+    background: #ffffff;
+
+    box-shadow: 0 1px 3px rgba(15, 23, 42, 0.04);
 
 }
 
@@ -1266,6 +1294,10 @@ tbody tr:hover {
 .shift-card h3 {
 
     font-size: 13px;
+
+    font-weight: 600;
+
+    color: #0369a1;
 
     margin-bottom: 8px;
 
@@ -1276,7 +1308,7 @@ tbody tr:hover {
 
     font-size: 11px;
 
-    color: #777;
+    color: #334155;
 
     line-height: 1.8;
 
@@ -1385,6 +1417,8 @@ tbody tr:hover {
 
         align-items: flex-start;
 
+        gap: 15px;
+
     }
 
 }
@@ -1422,12 +1456,6 @@ tbody tr:hover {
         width: 100% !important;
 
         padding: 20px !important;
-
-    }
-
-}
-
-        gap: 15px;
 
     }
 
@@ -1551,8 +1579,8 @@ tbody tr:hover {
         </h1>
 
         <p>
-            Security personnel overview, current shifts,
-            assignments and security contacts.
+            Security personnel overview, current shifts
+            and security contacts.
         </p>
 
     </div>
@@ -1641,7 +1669,7 @@ tbody tr:hover {
          STATISTICS
     ====================================================== -->
 
-    <div class="stats">
+    <div class="stats" id="liveStats" data-live>
 
 
         <div class="stat">
@@ -1682,18 +1710,6 @@ tbody tr:hover {
 
         </div>
 
-
-        <div class="stat">
-
-            <div class="stat-label">
-                Assigned Guards
-            </div>
-
-            <div class="stat-value">
-                <?php echo $totalAssigned; ?>
-            </div>
-
-        </div>
 
     </div>
 
@@ -1747,10 +1763,6 @@ tbody tr:hover {
                         </th>
 
                         <th>
-                            Assignment
-                        </th>
-
-                        <th>
                             Status
                         </th>
 
@@ -1766,8 +1778,8 @@ tbody tr:hover {
 
                     <tr>
 
-                        <td colspan="6"
-                            style="text-align:center; padding:30px; color:#888;">
+                        <td colspan="5"
+                            style="text-align:center; padding:30px; color:#64748b; background:#ffffff;">
 
                             No active security guards found.
 
@@ -1880,35 +1892,8 @@ tbody tr:hover {
 
                                 <?php else: ?>
 
-                                    <span style="color:#999;">
+                                    <span style="color:#64748b;">
                                         No Schedule
-                                    </span>
-
-                                <?php endif; ?>
-
-                            </td>
-
-
-                            <!-- ASSIGNMENT -->
-
-                            <td>
-
-                                <?php if (!empty($guard['assignment'])): ?>
-
-                                    <?php
-
-                                    echo e(
-                                        $guard['assignment']
-                                    );
-
-                                    ?>
-
-                                <?php else: ?>
-
-                                    <span class="badge badge-gray">
-
-                                        Not Assigned
-
                                     </span>
 
                                 <?php endif; ?>
@@ -2217,6 +2202,7 @@ setInterval(updateGuardStatus, 5000);
 <script>window.AUTO_REFRESH_SECONDS = 5;</script>
 <script src="assets/js/auto_refresh.js?v=<?php echo (int)@filemtime(__DIR__ . '/assets/js/auto_refresh.js'); ?>"></script>
 
+<script src="assets/js/logout_confirm.js?v=<?php echo (int)@filemtime(__DIR__ . '/assets/js/logout_confirm.js'); ?>"></script>
 </body>
 
 </html>

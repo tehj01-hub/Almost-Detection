@@ -2381,27 +2381,27 @@ body{
 }
 
 .stat-card{
-    background:white;
+    background:#f0f6fc;
 
-    border:1px solid #dedede;
+    border:1px solid #c8dcf0;
 
     border-radius:17px;
 
     padding:18px;
 
     box-shadow:
-        0 1px 4px rgba(0,0,0,.08);
+        0 2px 6px rgba(15,23,42,.05);
 }
 
 .stat-card-label{
-    color:#666;
+    color:#0369a1;
     font-size:12px;
 }
 
 .stat-card-number{
     font-size:29px;
 
-    color:#333;
+    color:#0c4a6e;
 
     margin-top:5px;
 }
@@ -2412,9 +2412,9 @@ body{
 ========================================================= */
 
 .table-card{
-    background:white;
+    background:#f0f6fc;
 
-    border:1px solid #dedede;
+    border:1px solid #c8dcf0;
 
     border-radius:20px;
 
@@ -2423,7 +2423,7 @@ body{
     max-width:1350px;
 
     box-shadow:
-        0 1px 4px rgba(0,0,0,.08);
+        0 2px 6px rgba(15,23,42,.05);
 }
 
 .table-header{
@@ -2454,9 +2454,9 @@ table{
 }
 
 th{
-    background:#f5f7fa;
+    background:#f8fafc;
 
-    color:#555;
+    color:#0369a1;
 
     font-size:12px;
 
@@ -2464,17 +2464,25 @@ th{
 
     padding:13px 11px;
 
-    border-bottom:1px solid #ddd;
+    border-bottom:2px solid #c8dcf0;
 
     vertical-align:middle;
 }
 
+tbody tr{
+    background:#ffffff;
+}
+
 td{
+    background:#ffffff;
+
+    color:#1e293b;
+
     padding:13px 11px;
 
     font-size:13px;
 
-    border-bottom:1px solid #eee;
+    border-bottom:1px solid #e2edf6;
 
     vertical-align:middle;
 
@@ -2482,7 +2490,7 @@ td{
 }
 
 tr:hover td{
-    background:#fafcff;
+    background:#f8fafc;
 }
 
 
@@ -3172,7 +3180,8 @@ tr:hover td{
 
     <form
         method="GET"
-        class="search-form">
+        class="search-form"
+        id="guardSearchForm">
 
         <input
             type="text"
@@ -4770,8 +4779,10 @@ setInterval(
 
 </script>
 
+<script src="assets/js/keep_scroll.js?v=<?php echo (int)@filemtime(__DIR__ . '/assets/js/keep_scroll.js'); ?>"></script>
 <script>window.AUTO_REFRESH_SECONDS = 5;</script>
 <script src="assets/js/auto_refresh.js?v=<?php echo (int)@filemtime(__DIR__ . '/assets/js/auto_refresh.js'); ?>"></script>
 
+<script src="assets/js/logout_confirm.js?v=<?php echo (int)@filemtime(__DIR__ . '/assets/js/logout_confirm.js'); ?>"></script>
 </body>
 </html>

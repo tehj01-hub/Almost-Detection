@@ -57,15 +57,21 @@ class FastCaptureTests(unittest.TestCase):
         self.assertGreaterEqual(distant[0]['confidence'], .60)
         detector._extract_ocr_from_crop = lambda c:('ABC1234','ABC1234',.1,'NEEDS_REVIEW','test',None)
         self.assertEqual(detector.detect_plates_on_frame(frame), ([], []))
-        # Inside vehicles must not be scanned on Entrance (IN) and Outside vehicles must not be scanned on Exit (OUT)
+        # Inside vehicles are not scanned on Entrance (IN). On Exit (OUT) a vehicle that was never
+        # logged IN is still read and flagged, so the exit-without-entry warning can fire.
         box.conf = [.9]
         detector._extract_ocr_from_crop = lambda c:('ABC1234','ABC1234',.95,'ACCEPT','test',None)
         detector.can_scan_plate = lambda plate, direction, use_cache=True: False
         self.assertEqual(detector.detect_plates_on_frame(frame, channel_direction='IN'), ([], []))
-        self.assertEqual(detector.detect_plates_on_frame(frame, channel_direction='OUT'), ([], []))
+        out_boxes, out_reads = detector.detect_plates_on_frame(frame, channel_direction='OUT')
+        self.assertEqual(len(out_reads), 1)
+        self.assertTrue(out_reads[0]['no_entry'])
+        self.assertIn('NO ENTRY', out_boxes[0]['label'])
         detector.can_scan_plate = lambda plate, direction, use_cache=True: True
         self.assertEqual(len(detector.detect_plates_on_frame(frame, channel_direction='IN')[1]), 1)
-        self.assertEqual(len(detector.detect_plates_on_frame(frame, channel_direction='OUT')[1]), 1)
+        normal_out = detector.detect_plates_on_frame(frame, channel_direction='OUT')[1]
+        self.assertEqual(len(normal_out), 1)
+        self.assertFalse(normal_out[0]['no_entry'])
 
     def test_photo_save_failure_does_not_retry_committed_vehicle_visit(self):
         import test_camera_modes as modes

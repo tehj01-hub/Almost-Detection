@@ -36,8 +36,45 @@ unset($_SESSION['flash_success'], $_SESSION['flash_error']);
 /* =========================================================
    HANDLE POST ACTIONS
 ========================================================= */
+/** True when $password is the logged-in administrator's own password. */
+function profileVerifyOwnPassword(mysqli $conn, string $username, string $password): bool
+{
+    if ($password === '') {
+        return false;
+    }
+    $stmt = $conn->prepare("SELECT password FROM users WHERE username = ? LIMIT 1");
+    $stmt->bind_param("s", $username);
+    $stmt->execute();
+    $row = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+    if (!$row) {
+        return false;
+    }
+    $stored = (string)$row['password'];
+    // Older accounts may still have a plain-text password
+    return password_verify($password, $stored) || hash_equals($stored, $password);
+}
+
 if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
     $action = $_POST['action'] ?? '';
+
+    // Every Profile change must be confirmed with the administrator's own password
+    if (in_array($action, ['update_system_variables', 'update_admin_profile', 'update_security_contacts'], true)) {
+        $verifyPassword = (string)($_POST['verify_password'] ?? '');
+        if (!profileVerifyOwnPassword($conn, $currentUsername, $verifyPassword)) {
+            secsysLogActivity(
+                $conn,
+                $currentUsername,
+                'Profile Update',
+                'A Profile change was refused: the password entered to confirm it was incorrect.'
+            );
+            $_SESSION['flash_error'] = $verifyPassword === ''
+                ? 'Please enter your password to confirm the change. Nothing was saved.'
+                : 'Incorrect password. Nothing was saved.';
+            header("Location: profile.php");
+            exit();
+        }
+    }
 
     // ACTION 1: UPDATE SYSTEM VARIABLES (BRANDING, ICON, BACKGROUND)
     if ($action === 'update_system_variables') {
@@ -112,7 +149,8 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
     // ACTION 2: UPDATE ADMINISTRATOR PROFILE & PASSWORD
     if ($action === 'update_admin_profile') {
         $fullName = trim($_POST['full_name'] ?? '');
-        $currentPass = $_POST['current_password'] ?? '';
+        // The password confirmed in the verification window is the current password
+        $currentPass = (string)($_POST['verify_password'] ?? '');
         $newPass = $_POST['new_password'] ?? '';
         $confirmPass = $_POST['confirm_password'] ?? '';
 
@@ -623,6 +661,16 @@ body {
     background: #0369a1;
 }
 
+.btn-secondary {
+    background: #f1f5f9;
+    color: #0f172a;
+    border: 1px solid #cbd5e1;
+}
+
+.btn-secondary:hover {
+    background: #e2e8f0;
+}
+
 .btn-outline-danger {
     background: #fff;
     color: #dc2626;
@@ -927,11 +975,6 @@ body {
                     </div>
 
                     <div class="form-group">
-                        <label class="form-label" for="current_password">Current Password:</label>
-                        <input type="password" class="form-input" id="current_password" name="current_password" autocomplete="current-password" placeholder="Enter current password to verify">
-                    </div>
-
-                    <div class="form-group">
                         <label class="form-label" for="new_password">New Password:</label>
                         <input type="password" class="form-input" id="new_password" name="new_password" autocomplete="new-password" placeholder="At least 4 characters">
                     </div>
@@ -1003,6 +1046,128 @@ body {
 
 </main>
 
+<!-- =========================================================
+     PASSWORD CONFIRMATION before any Profile change is saved
+========================================================= -->
+<div class="pv-backdrop" id="profileVerifyModal" role="dialog" aria-modal="true" aria-labelledby="pvTitle">
+    <form class="pv-box" id="profileVerifyForm" autocomplete="off">
+        <div class="pv-head">
+            <div class="pv-title" id="pvTitle">🔒 Confirm It's You</div>
+            <button type="button" class="pv-close" onclick="closeProfileVerify()" aria-label="Close">&times;</button>
+        </div>
+        <p class="pv-hint">
+            Enter your password to save the changes to <strong id="pvWhat">your profile</strong>.
+        </p>
+        <label class="pv-label" for="pvPassword">Password for <?php echo e($currentUsername); ?></label>
+        <div class="pv-input-wrap">
+            <input type="password" id="pvPassword" class="pv-input" autocomplete="current-password" required>
+            <button type="button" class="pv-eye" onclick="var p=document.getElementById('pvPassword'); p.type = p.type === 'password' ? 'text' : 'password';" title="Show / hide password">👁</button>
+        </div>
+        <div class="pv-error" id="pvError" hidden></div>
+        <div class="pv-actions">
+            <button type="button" class="btn btn-secondary" onclick="closeProfileVerify()">Cancel</button>
+            <button type="submit" class="btn btn-primary">Confirm &amp; Save</button>
+        </div>
+    </form>
+</div>
+
+<style>
+.pv-backdrop {
+    display: none; position: fixed; inset: 0; z-index: 10050; background: rgba(15, 23, 42, 0.55);
+    align-items: center; justify-content: center; padding: 16px;
+}
+.pv-backdrop.open { display: flex; }
+.pv-box {
+    background: #fff; border-radius: 16px; width: 100%; max-width: 400px; padding: 18px 20px 16px;
+    box-shadow: 0 20px 40px rgba(0, 0, 0, 0.25); box-sizing: border-box;
+}
+.pv-box * { box-sizing: border-box; }
+.pv-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+.pv-title { font-size: 17px; font-weight: 700; color: #0f172a; }
+.pv-close { background: none; border: none; font-size: 24px; line-height: 1; color: #64748b; cursor: pointer; }
+.pv-hint { font-size: 13px; color: #475569; margin: 0 0 12px; line-height: 1.45; }
+.pv-label { display: block; font-size: 12.5px; font-weight: 700; color: #1e293b; margin-bottom: 6px; }
+.pv-input-wrap { position: relative; }
+.pv-input {
+    width: 100%; height: 40px; border: 1px solid #cbd5e1; border-radius: 8px; padding: 0 40px 0 12px; font-size: 14px;
+}
+.pv-input:focus { outline: none; border-color: #0284c7; box-shadow: 0 0 0 3px rgba(2, 132, 199, 0.15); }
+.pv-eye { position: absolute; right: 8px; top: 50%; transform: translateY(-50%); background: none; border: none; cursor: pointer; font-size: 16px; color: #64748b; }
+.pv-error { margin-top: 10px; background: #fef2f2; color: #991b1b; border: 1px solid #fecaca; border-radius: 8px; padding: 8px 10px; font-size: 12.5px; }
+.pv-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+</style>
+
+<script>
+(function () {
+    // Profile forms that change something; each needs the password first
+    const LABELS = {
+        update_system_variables: "the system variables",
+        update_admin_profile: "your administrator profile",
+        update_security_contacts: "the security contacts"
+    };
+    let pendingForm = null;
+
+    function actionOf(form) {
+        const field = form.querySelector('input[name="action"]');
+        return field ? field.value : "";
+    }
+
+    document.querySelectorAll('form[action="profile.php"]').forEach(function (form) {
+        if (!LABELS[actionOf(form)]) return;
+        form.addEventListener("submit", function (event) {
+            if (form.dataset.verified === "1") return; // already confirmed: let it go through
+            event.preventDefault();
+            if (!form.reportValidity()) return;
+            pendingForm = form;
+            document.getElementById("pvWhat").textContent = LABELS[actionOf(form)];
+            document.getElementById("pvError").hidden = true;
+            const input = document.getElementById("pvPassword");
+            input.value = "";
+            input.type = "password";
+            document.getElementById("profileVerifyModal").classList.add("open");
+            setTimeout(function () { input.focus(); }, 60);
+        });
+    });
+
+    document.getElementById("profileVerifyForm").addEventListener("submit", function (event) {
+        event.preventDefault();
+        const password = document.getElementById("pvPassword").value;
+        if (!password) {
+            const err = document.getElementById("pvError");
+            err.textContent = "Please enter your password.";
+            err.hidden = false;
+            return;
+        }
+        if (!pendingForm) return;
+        let hidden = pendingForm.querySelector('input[name="verify_password"]');
+        if (!hidden) {
+            hidden = document.createElement("input");
+            hidden.type = "hidden";
+            hidden.name = "verify_password";
+            pendingForm.appendChild(hidden);
+        }
+        hidden.value = password;
+        pendingForm.dataset.verified = "1";
+        closeProfileVerify(true);
+        pendingForm.submit();
+    });
+
+    window.closeProfileVerify = function (keepForm) {
+        document.getElementById("profileVerifyModal").classList.remove("open");
+        document.getElementById("pvPassword").value = "";
+        if (!keepForm) pendingForm = null;
+    };
+
+    document.addEventListener("keydown", function (event) {
+        if (event.key === "Escape") closeProfileVerify();
+    });
+    document.getElementById("profileVerifyModal").addEventListener("click", function (event) {
+        if (event.target === this) closeProfileVerify();
+    });
+})();
+</script>
+
+<script src="assets/js/logout_confirm.js?v=<?php echo (int)@filemtime(__DIR__ . '/assets/js/logout_confirm.js'); ?>"></script>
 </body>
 </html>
 <?php $conn->close(); ?>

@@ -28,7 +28,7 @@ $systemIcon = secsysGetSystemIcon($conn);
    SETTINGS
 ========================================================= */
 
-$rowsPerPage = 6;
+$rowsPerPage = 7;  // rows per page in every log table (the rest go to the next page)
 
 $today = date("Y-m-d");
 
@@ -140,6 +140,11 @@ function logsQuery($changes = [], $dropPages = true)
 
     if ($_GET['dir'] ?? '') {
         $params['dir'] = $_GET['dir'];
+    }
+
+    // Day shown in the Exit Without Entry Log
+    if ($_GET['exit_date'] ?? '') {
+        $params['exit_date'] = $_GET['exit_date'];
     }
 
     if (
@@ -958,6 +963,71 @@ $visitorPagination =
 
 
 /* =========================================================
+   EXIT WITHOUT ENTRY LOG
+   Vehicles the Exit Cam read leaving that were never logged IN.
+   One day at a time (today by default); the search box applies.
+========================================================= */
+
+$exitLogDate = (isset($_GET['exit_date']) && preg_match('/^\d{4}-\d{2}-\d{2}$/', (string)$_GET['exit_date']))
+    ? (string)$_GET['exit_date']
+    : $today;
+if ($exitLogDate > $today) {
+    $exitLogDate = $today;
+}
+
+$exitAlertRows = [];
+try {
+    $stmtExit = $conn->prepare("
+        SELECT id, plate_number, vehicle_category, vehicle_type, camera_name, confidence,
+               plate_image, vehicle_image, detected_at, status, acknowledged_by, acknowledged_at, ack_note
+        FROM exit_without_entry_alerts
+        WHERE detected_at >= ? AND detected_at < ? + INTERVAL 1 DAY
+        ORDER BY detected_at DESC
+    ");
+    if ($stmtExit) {
+        $stmtExit->bind_param("ss", $exitLogDate, $exitLogDate);
+        $stmtExit->execute();
+        $resExit = $stmtExit->get_result();
+        while ($ea = $resExit->fetch_assoc()) {
+            $exitAlertRows[] = $ea;
+        }
+        $stmtExit->close();
+    }
+} catch (Throwable $e) {
+    $exitAlertRows = [];
+}
+
+// Guard names for "Acknowledged By"
+$exitGuardNames = [];
+$resGuardNames = $conn->query("SELECT guard_id, full_name FROM security_guard");
+while ($resGuardNames && ($g = $resGuardNames->fetch_assoc())) {
+    $exitGuardNames[(string)$g['guard_id']] = (string)$g['full_name'];
+}
+
+if ($searchQuery !== '') {
+    $exitNeedle = strtolower($searchQuery);
+    $exitPlain = preg_replace('/[^a-z0-9]/', '', $exitNeedle);
+    $exitAlertRows = array_values(array_filter($exitAlertRows, function ($ea) use ($exitNeedle, $exitPlain, $exitGuardNames) {
+        $hay = strtolower(implode(' ', [
+            $ea['plate_number'], $ea['vehicle_category'], $ea['vehicle_type'], $ea['camera_name'], $ea['status'],
+            $ea['ack_note'], $ea['acknowledged_by'], $exitGuardNames[$ea['acknowledged_by'] ?? ''] ?? '',
+        ]));
+        return strpos($hay, $exitNeedle) !== false
+            || ($exitPlain !== '' && strpos(preg_replace('/[^a-z0-9]/', '', $hay), $exitPlain) !== false);
+    }));
+}
+
+$exitAlertPagination = paginate(
+    $exitAlertRows,
+    isset($_GET['exit_page']) ? (int)$_GET['exit_page'] : 1,
+    $rowsPerPage
+);
+$exitAlertOpenCount = count(array_filter($exitAlertRows, function ($ea) {
+    return ($ea['status'] ?? 'New') !== 'Acknowledged';
+}));
+
+
+/* =========================================================
    ARCHIVE DATA
 ========================================================= */
 
@@ -1769,6 +1839,68 @@ body {
 
     box-shadow:
         0 2px 4px rgba(0,0,0,.15);
+}
+
+/* Eye-comfort light blue/slate tint for vehicle log cards */
+#liveRegisteredLogs .table-card,
+.registered-log-card,
+.archive-registered-card,
+#liveVisitorLogs .table-card,
+.visitor-log-card,
+.archive-visitor-card {
+    background: #f0f6fc !important;
+    border: 1px solid #c8dcf0 !important;
+    box-shadow: 0 2px 6px rgba(15, 23, 42, 0.05) !important;
+}
+
+#liveRegisteredLogs .table-toolbar,
+.registered-log-card .table-toolbar,
+.archive-registered-card .archive-toolbar-card,
+#liveVisitorLogs .table-toolbar,
+.visitor-log-card .table-toolbar,
+.archive-visitor-card .archive-toolbar-card {
+    background: #ffffff !important;
+    border-bottom: 1px solid #c8dcf0 !important;
+}
+
+#liveRegisteredLogs .log-table th,
+.registered-log-card .log-table th,
+.archive-registered-card .log-table th,
+#liveVisitorLogs .log-table th,
+.visitor-log-card .log-table th,
+.archive-visitor-card .log-table th {
+    background: #f8fafc !important;
+    border-bottom: 2px solid #c8dcf0 !important;
+    color: #0369a1 !important;
+}
+
+#liveRegisteredLogs .log-table tbody tr,
+.registered-log-card .log-table tbody tr,
+.archive-registered-card .log-table tbody tr,
+#liveVisitorLogs .log-table tbody tr,
+.visitor-log-card .log-table tbody tr,
+.archive-visitor-card .log-table tbody tr {
+    background: #ffffff !important;
+}
+
+#liveRegisteredLogs .log-table td,
+.registered-log-card .log-table td,
+.archive-registered-card .log-table td,
+#liveVisitorLogs .log-table td,
+.visitor-log-card .log-table td,
+.archive-visitor-card .log-table td {
+    background: #ffffff !important;
+    color: #1e293b !important;
+    border-bottom: 1px solid #e2edf6 !important;
+}
+
+#liveRegisteredLogs .log-table tbody tr:hover td,
+.registered-log-card .log-table tbody tr:hover td,
+.archive-registered-card .log-table tbody tr:hover td,
+#liveVisitorLogs .log-table tbody tr:hover td,
+.visitor-log-card .log-table tbody tr:hover td,
+.archive-visitor-card .log-table tbody tr:hover td {
+    background: #f8fafc !important;
 }
 
 
@@ -3437,7 +3569,7 @@ body {
             </div>
 
 
-            <div class="table-card">
+            <div class="table-card registered-log-card">
 
 
                 <!-- TOOLBAR -->
@@ -3477,11 +3609,11 @@ body {
                         <tr>
 
                             <th class="col-check">
-                                <input
+                                <!-- <input
                                     type="checkbox"
                                     class="select-all"
                                     data-target="registered"
-                                >
+                                > -->
                             </th>
 
                             <th class="col-number">
@@ -3806,7 +3938,7 @@ body {
             </div>
 
 
-            <div class="table-card">
+            <div class="table-card visitor-log-card">
 
 
                 <!-- TOOLBAR -->
@@ -3847,11 +3979,11 @@ body {
 
                             <th class="col-check">
 
-                                <input
+                                <!-- <input
                                     type="checkbox"
                                     class="select-all"
                                     data-target="visitor"
-                                >
+                                > -->
 
                             </th>
 
@@ -4139,6 +4271,119 @@ body {
     </form>
 
 
+    <!-- =================================================
+         EXIT WITHOUT ENTRY LOG
+         Vehicles the Exit Cam read leaving that were never
+         logged IN. Click a plate to see its captured photos.
+    ================================================== -->
+
+    <section class="log-section" id="liveExitAlertLogs" data-live>
+
+        <div class="section-header">
+            <div class="section-title">
+                🚨 Exit Without Entry Log
+            </div>
+            <div class="section-count">
+                <?php echo (int)$exitAlertPagination['total']; ?> alert(s)
+                <?php if ($exitAlertOpenCount > 0): ?>
+                    · <span style="color:#b91c1c; font-weight:700;"><?php echo (int)$exitAlertOpenCount; ?> not acknowledged</span>
+                <?php endif; ?>
+            </div>
+        </div>
+
+        <div class="table-card exit-alert-log-card">
+
+            <div class="table-toolbar">
+                <form method="GET" action="logs.php" class="exit-log-date-form" id="exitLogDateForm">
+                    <?php foreach (['q', 'status', 'time_from', 'time_to', 'sort', 'dir', 'period', 'period_date', 'period_month'] as $keepKey): ?>
+                        <?php if (($_GET[$keepKey] ?? '') !== ''): ?>
+                            <input type="hidden" name="<?php echo $keepKey; ?>" value="<?php echo htmlspecialchars((string)$_GET[$keepKey], ENT_QUOTES); ?>">
+                        <?php endif; ?>
+                    <?php endforeach; ?>
+                    <label for="exitLogDate" style="font-weight:600; font-size:13px; color:#334155;">Day:</label>
+                    <input type="date" id="exitLogDate" name="exit_date" max="<?php echo $today; ?>"
+                           value="<?php echo htmlspecialchars($exitLogDate, ENT_QUOTES); ?>" onchange="this.form.submit()">
+                    <?php if ($exitLogDate !== $today): ?>
+                        <a href="?<?php echo logsQuery(['exit_date' => '']); ?>" style="font-size:12.5px; font-weight:600; color:#0369a1;">Back to today</a>
+                    <?php endif; ?>
+                </form>
+            </div>
+
+            <div class="exit-log-scroll">
+            <table class="log-table exit-log-table">
+                <thead>
+                    <tr>
+                        <th class="col-number">No.</th>
+                        <th class="col-plate">Plate Number</th>
+                        <th>Vehicle</th>
+                        <th>Camera</th>
+                        <th>Time Detected</th>
+                        <th>Status</th>
+                        <th>Acknowledged By</th>
+                        <th>Guard's Note</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php if (empty($exitAlertPagination['items'])): ?>
+                        <tr>
+                            <td colspan="8" class="empty-row">
+                                No vehicle exited without an entry record on <?php echo htmlspecialchars(date('M d, Y', strtotime($exitLogDate))); ?>.
+                            </td>
+                        </tr>
+                    <?php else: ?>
+                        <?php foreach ($exitAlertPagination['items'] as $n => $ea): ?>
+                            <?php
+                            $eaAcked = ($ea['status'] ?? 'New') === 'Acknowledged';
+                            $eaKind = ($ea['vehicle_category'] ?? '') === 'Unknown' ? 'Unregistered' : (string)$ea['vehicle_category'];
+                            $eaBy = (string)($ea['acknowledged_by'] ?? '');
+                            $eaByName = $exitGuardNames[$eaBy] ?? '';
+                            ?>
+                            <tr>
+                                <td class="col-number"><?php echo ($exitAlertPagination['page'] - 1) * $rowsPerPage + $n + 1; ?></td>
+                                <td class="col-plate">
+                                    <?php echo secsysClickablePlateHtml((string)$ea['plate_number'], ['alert_id' => (int)$ea['id']]); ?>
+                                </td>
+                                <td><?php echo htmlspecialchars($eaKind . (!empty($ea['vehicle_type']) ? ' · ' . $ea['vehicle_type'] : '')); ?></td>
+                                <td><?php echo htmlspecialchars($ea['camera_name'] ?: 'Exit Cam'); ?></td>
+                                <td style="white-space:nowrap;"><?php echo htmlspecialchars(date('h:i A', strtotime((string)$ea['detected_at']))); ?></td>
+                                <td>
+                                    <?php if ($eaAcked): ?>
+                                        <span class="exit-log-badge exit-log-badge-ok">Acknowledged</span>
+                                    <?php else: ?>
+                                        <span class="exit-log-badge exit-log-badge-new">Not Acknowledged</span>
+                                    <?php endif; ?>
+                                </td>
+                                <td>
+                                    <?php if ($eaAcked): ?>
+                                        <div style="font-weight:600;"><?php echo htmlspecialchars($eaByName !== '' ? $eaByName . ' (' . $eaBy . ')' : $eaBy); ?></div>
+                                        <div style="font-size:11.5px; color:#64748b;"><?php echo htmlspecialchars(date('h:i A', strtotime((string)$ea['acknowledged_at']))); ?></div>
+                                    <?php else: ?>
+                                        <span style="color:#94a3b8;">—</span>
+                                    <?php endif; ?>
+                                </td>
+                                <td style="white-space:normal; max-width:260px;">
+                                    <?php echo (string)($ea['ack_note'] ?? '') !== '' ? htmlspecialchars($ea['ack_note']) : '<span style="color:#94a3b8;">—</span>'; ?>
+                                </td>
+                            </tr>
+                        <?php endforeach; ?>
+                    <?php endif; ?>
+                </tbody>
+            </table>
+            </div>
+
+            <?php if ($exitAlertPagination['totalPages'] > 1): ?>
+                <div class="pagination">
+                    <?php for ($i = 1; $i <= $exitAlertPagination['totalPages']; $i++): ?>
+                        <a href="?<?php echo logsQuery(['exit_page' => $i]); ?>" class="<?php echo $i === $exitAlertPagination['page'] ? 'active' : ''; ?>"><?php echo $i; ?></a>
+                    <?php endfor; ?>
+                </div>
+            <?php endif; ?>
+
+        </div>
+
+    </section>
+
+
 
     <!-- =================================================
          ARCHIVE WINDOW
@@ -4163,7 +4408,7 @@ body {
                 <div class="archive-log-count"><?php echo (int)$pagination['total']; ?> record(s)</div>
             </div>
 
-            <div class="table-card archive-table-card">
+            <div class="table-card archive-table-card <?php echo $isVisitor ? 'archive-visitor-card' : 'archive-registered-card'; ?>">
                 <div class="archive-table-wrapper">
                     <table class="log-table archive-log-table">
                         <thead>
@@ -5016,12 +5261,24 @@ document.querySelectorAll(
 </script>
 
 <!-- Live auto-refresh (no full page reload) -->
+<style>
+.exit-log-date-form { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.exit-log-date-form input[type="date"] { padding: 6px 9px; border: 1px solid #cbd5e1; border-radius: 7px; font-size: 13px; background: #fff; }
+.exit-log-scroll { overflow-x: auto; }
+.exit-log-table { min-width: 880px; table-layout: auto; }
+.exit-log-table th, .exit-log-table td { white-space: nowrap; }
+.exit-log-badge { display: inline-block; font-size: 11px; font-weight: 700; padding: 3px 9px; border-radius: 999px; border: 1px solid; white-space: nowrap; }
+.exit-log-badge-ok { background: #dcfce7; color: #166534; border-color: #86efac; }
+.exit-log-badge-new { background: #fee2e2; color: #991b1b; border-color: #fca5a5; }
+</style>
+<script src="assets/js/keep_scroll.js?v=<?php echo (int)@filemtime(__DIR__ . '/assets/js/keep_scroll.js'); ?>"></script>
 <script>window.AUTO_REFRESH_SECONDS = 5;</script>
 <script src="assets/js/download_format.js?v=<?php echo (int)@filemtime(__DIR__ . '/assets/js/download_format.js'); ?>"></script>
 <script src="assets/js/auto_refresh.js?v=<?php echo (int)@filemtime(__DIR__ . '/assets/js/auto_refresh.js'); ?>"></script>
 <?php echo secsysYoloCaptureModalAssetsHtml(); ?>
 
 
+<script src="assets/js/logout_confirm.js?v=<?php echo (int)@filemtime(__DIR__ . '/assets/js/logout_confirm.js'); ?>"></script>
 </body>
 
 </html>

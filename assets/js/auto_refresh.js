@@ -30,6 +30,7 @@
         ".modal.active",
         ".modal-overlay.open",
         ".audit-modal-backdrop.open",
+        ".plate-report-backdrop.open",
         ".tapo-modal-overlay.active",
         ".notif-drawer.open",
         ".visitor-modal-overlay.active",
@@ -40,6 +41,77 @@
     ].join(",");
 
     var isFetching = false;
+
+    /* Server HTML of each live region from the previous refresh (by id). */
+    var lastServerHtml = {};
+
+
+    /* ---------------------------------------------------------
+       SCROLL POSITIONS INSIDE A REGION
+       Tables that scroll sideways (or lists that scroll up/down)
+       keep their position when the region is updated.
+    --------------------------------------------------------- */
+
+    function scrollableChildren(region) {
+
+        var list = [];
+
+        region.querySelectorAll("*").forEach(function (el) {
+            if (el.scrollLeft > 0 || el.scrollTop > 0) {
+                list.push(el);
+            }
+        });
+
+        return list;
+    }
+
+    /* Path of child indexes from region to el, so the same element can be
+       found again in the new HTML. */
+    function pathFrom(region, el) {
+
+        var path = [];
+
+        while (el && el !== region) {
+            path.unshift(Array.prototype.indexOf.call(el.parentNode.children, el));
+            el = el.parentNode;
+        }
+
+        return path;
+    }
+
+    function byPath(region, path) {
+
+        var el = region;
+
+        for (var i = 0; i < path.length && el; i++) {
+            el = el.children[path[i]];
+        }
+
+        return el || null;
+    }
+
+    function saveScrollPositions(region) {
+
+        return scrollableChildren(region).map(function (el) {
+            return {
+                path: pathFrom(region, el),
+                cls: el.className,
+                left: el.scrollLeft,
+                top: el.scrollTop
+            };
+        });
+    }
+
+    function restoreScrollPositions(region, saved) {
+
+        saved.forEach(function (s) {
+            var el = byPath(region, s.path);
+            if (el && el.className === s.cls) {
+                el.scrollLeft = s.left;
+                el.scrollTop = s.top;
+            }
+        });
+    }
 
     /* (The bottom-left "Live · time" indicator was removed on request;
        the background refresh below keeps running silently.) */
@@ -186,10 +258,32 @@
 
                 var fresh = doc.getElementById(region.id);
 
-                if (fresh && fresh.innerHTML !== region.innerHTML) {
-                    region.innerHTML = fresh.innerHTML;
-                    changed = true;
+                if (!fresh) {
+                    return;
                 }
+
+                var freshHtml = fresh.innerHTML;
+
+                /* Compare with what the server sent last time, not with the live
+                   DOM: page scripts tweak the live DOM, so it never matches the
+                   server HTML and the region would be swapped on every tick
+                   (throwing scrolled tables back to the start). */
+                var lastHtml = lastServerHtml[region.id];
+
+                if (lastHtml === undefined) {
+                    lastHtml = region.innerHTML;
+                }
+
+                lastServerHtml[region.id] = freshHtml;
+
+                if (freshHtml === lastHtml) {
+                    return;
+                }
+
+                var scroll = saveScrollPositions(region);
+                region.innerHTML = freshHtml;
+                restoreScrollPositions(region, scroll);
+                changed = true;
             });
 
             if (changed) {

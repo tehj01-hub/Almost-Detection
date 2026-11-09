@@ -86,19 +86,44 @@ function secsysStreamJpegFile(string $baseDirPath, string $fileName): void
 // 1. Handle direct raw image streaming requests
 $rawMode = strtolower(trim((string)($_GET['raw'] ?? '')));
 $rawFile = trim((string)($_GET['file'] ?? ''));
-if ($rawMode === 'vehicle' && $rawFile !== '') {
-    secsysStreamJpegFile(__DIR__ . '/uploads/vehicle_captures', basename($rawFile));
-}
-if ($rawMode === 'plate' && $rawFile !== '') {
-    secsysStreamJpegFile(__DIR__ . '/uploads/plate_captures', basename($rawFile));
+if ($rawFile !== '') {
+    $baseName = basename($rawFile);
+    if ($rawMode === 'vehicle') {
+        if (is_file(__DIR__ . '/uploads/vehicle_captures/' . $baseName)) {
+            secsysStreamJpegFile(__DIR__ . '/uploads/vehicle_captures', $baseName);
+        } elseif (is_file(__DIR__ . '/uploads/exit_alerts/' . $baseName)) {
+            secsysStreamJpegFile(__DIR__ . '/uploads/exit_alerts', $baseName);
+        } else {
+            secsysStreamJpegFile(__DIR__ . '/uploads/vehicle_captures', $baseName);
+        }
+    }
+    if ($rawMode === 'plate') {
+        if (is_file(__DIR__ . '/uploads/plate_captures/' . $baseName)) {
+            secsysStreamJpegFile(__DIR__ . '/uploads/plate_captures', $baseName);
+        } elseif (is_file(__DIR__ . '/uploads/exit_alerts/' . $baseName)) {
+            secsysStreamJpegFile(__DIR__ . '/uploads/exit_alerts', $baseName);
+        } else {
+            secsysStreamJpegFile(__DIR__ . '/uploads/plate_captures', $baseName);
+        }
+    }
+    if ($rawMode === 'exit_alert' || $rawMode === 'alert') {
+        if (is_file(__DIR__ . '/uploads/exit_alerts/' . $baseName)) {
+            secsysStreamJpegFile(__DIR__ . '/uploads/exit_alerts', $baseName);
+        } elseif (is_file(__DIR__ . '/uploads/vehicle_captures/' . $baseName)) {
+            secsysStreamJpegFile(__DIR__ . '/uploads/vehicle_captures', $baseName);
+        } else {
+            secsysStreamJpegFile(__DIR__ . '/uploads/exit_alerts', $baseName);
+        }
+    }
 }
 
-// 2. Parse query parameters (ids and/or plate)
+// 2. Parse query parameters (ids, alert_id, and/or plate)
 $ids = array_values(array_filter(array_map('intval', explode(',', (string)($_GET['ids'] ?? '')))));
 $ids = array_slice($ids, 0, 15);
+$alertId = isset($_GET['alert_id']) ? (int)$_GET['alert_id'] : 0;
 $plateParam = trim((string)($_GET['plate'] ?? ''));
 
-if (!$ids && $plateParam === '') {
+if (!$ids && !$alertId && $plateParam === '') {
     if (($_GET['format'] ?? '') === 'json') {
         header('Content-Type: application/json; charset=utf-8');
         http_response_code(400);
@@ -115,6 +140,30 @@ if (($_GET['format'] ?? '') === 'json') {
 
 $conn = secsysConnectDb(true);
 
+$alertRow = null;
+if ($alertId > 0 && $conn instanceof mysqli) {
+    try {
+        $stmtAlert = $conn->prepare("
+            SELECT id, plate_number, vehicle_category, vehicle_type, camera_name, confidence,
+                   plate_image, vehicle_image, detected_at, status, acknowledged_by, acknowledged_at
+            FROM exit_without_entry_alerts
+            WHERE id = ?
+            LIMIT 1
+        ");
+        if ($stmtAlert) {
+            $stmtAlert->bind_param('i', $alertId);
+            $stmtAlert->execute();
+            $resAlert = $stmtAlert->get_result();
+            if ($resAlert && ($aRow = $resAlert->fetch_assoc())) {
+                $alertRow = $aRow;
+            }
+            $stmtAlert->close();
+        }
+    } catch (\Throwable $e) {
+        // Ignore table/column differences
+    }
+}
+
 $matchedLogs = [];
 $exactIdsMap = [];
 
@@ -129,7 +178,7 @@ if ($ids && $conn instanceof mysqli) {
         try {
             $stmt = $conn->prepare("
                 SELECT id, plate_number, vehicle_type, vehicle_category, direction,
-                       date_in, date_out, date_created, vehicle_image, visitor_name, purpose
+                       date_in, date_out, date_created, vehicle_image, visitor_name, purpose, id_type, id_number
                 FROM `$table`
                 WHERE id IN ($placeholders)
                 ORDER BY id DESC
@@ -153,6 +202,9 @@ $plateDisplay = $plateParam;
 if ($plateDisplay === '' && !empty($matchedLogs)) {
     $plateDisplay = (string)($matchedLogs[0]['plate_number'] ?? '');
 }
+if ($plateDisplay === '' && $alertRow && !empty($alertRow['plate_number'])) {
+    $plateDisplay = (string)$alertRow['plate_number'];
+}
 $normPlate = secsysNormPlateKey($plateDisplay);
 
 // 4. Also look up recent logs for this normalized plate so clicks by plate number
@@ -162,7 +214,7 @@ if ($normPlate !== '' && $conn instanceof mysqli) {
         try {
             $stmt = $conn->prepare("
                 SELECT id, plate_number, vehicle_type, vehicle_category, direction,
-                       date_in, date_out, date_created, vehicle_image, visitor_name, purpose
+                       date_in, date_out, date_created, vehicle_image, visitor_name, purpose, id_type, id_number
                 FROM `$table`
                 WHERE REPLACE(REPLACE(UPPER(plate_number), ' ', ''), '-', '') = ?
                 ORDER BY id DESC
@@ -192,6 +244,32 @@ if ($normPlate !== '' && $conn instanceof mysqli) {
     }
 }
 
+// 4B. If no vehicle log matched and no alert_id was explicitly provided,
+// check if this plate belongs to an exit-without-entry alert.
+if ($alertRow === null && empty($matchedLogs) && $normPlate !== '' && $conn instanceof mysqli) {
+    try {
+        $stmtAlertNorm = $conn->prepare("
+            SELECT id, plate_number, vehicle_category, vehicle_type, camera_name, confidence,
+                   plate_image, vehicle_image, detected_at, status, acknowledged_by, acknowledged_at
+            FROM exit_without_entry_alerts
+            WHERE normalized_plate = ? OR REPLACE(REPLACE(UPPER(plate_number), ' ', ''), '-', '') = ?
+            ORDER BY id DESC
+            LIMIT 1
+        ");
+        if ($stmtAlertNorm) {
+            $stmtAlertNorm->bind_param('ss', $normPlate, $normPlate);
+            $stmtAlertNorm->execute();
+            $resAlertNorm = $stmtAlertNorm->get_result();
+            if ($resAlertNorm && ($aNorm = $resAlertNorm->fetch_assoc())) {
+                $alertRow = $aNorm;
+            }
+            $stmtAlertNorm->close();
+        }
+    } catch (\Throwable $e) {
+        // Ignore table/column differences
+    }
+}
+
 // 5. Gather vehicle metadata from matched logs, registered_vehicles, or visitor_vehicles
 $vehicleType = '';
 $vehicleCategory = '';
@@ -199,6 +277,15 @@ $direction = '';
 $timestamp = '';
 $ownerOrVisitor = '';
 $vehicleModelInfo = '';
+$visitorIdType = '';
+$visitorIdNumber = '';
+
+/* "Visitor" is only a placeholder (used when no ID was presented), not a real name */
+function secsysRealVisitorName($name): string
+{
+    $name = trim((string)$name);
+    return ($name === '' || strcasecmp($name, 'Visitor') === 0) ? '' : $name;
+}
 
 foreach ($matchedLogs as $logRow) {
     if ($plateDisplay === '' && !empty($logRow['plate_number'])) {
@@ -214,10 +301,35 @@ foreach ($matchedLogs as $logRow) {
         $direction = strtoupper((string)$logRow['direction']);
     }
     if ($timestamp === '') {
-        $timestamp = (string)($logRow['date_out'] ?: ($logRow['date_in'] ?: ($logRow['date_created'] ?? '')));
+        // date_created has the real time; date_in / date_out are dates only (would show 12:00 AM)
+        $timestamp = (string)(($logRow['date_created'] ?? '') ?: ($logRow['date_out'] ?: ($logRow['date_in'] ?? '')));
     }
-    if ($ownerOrVisitor === '' && !empty($logRow['visitor_name'])) {
-        $ownerOrVisitor = (string)$logRow['visitor_name'];
+    if ($ownerOrVisitor === '' && secsysRealVisitorName($logRow['visitor_name'] ?? '') !== '') {
+        $ownerOrVisitor = secsysRealVisitorName($logRow['visitor_name']);
+    }
+    // ID presented by the visitor (only when they gave one)
+    if ($visitorIdType === '' && trim((string)($logRow['id_type'] ?? '')) !== '' && trim((string)($logRow['id_number'] ?? '')) !== '') {
+        $visitorIdType = trim((string)$logRow['id_type']);
+        $visitorIdNumber = trim((string)$logRow['id_number']);
+    }
+}
+
+if ($alertRow) {
+    if ($plateDisplay === '' && !empty($alertRow['plate_number'])) {
+        $plateDisplay = (string)$alertRow['plate_number'];
+    }
+    if ($vehicleType === '' && !empty($alertRow['vehicle_type'])) {
+        $vehicleType = (string)$alertRow['vehicle_type'];
+    }
+    if ($vehicleCategory === '' && !empty($alertRow['vehicle_category'])) {
+        $cat = (string)$alertRow['vehicle_category'];
+        $vehicleCategory = ($cat === 'Unknown') ? 'Unregistered' : $cat;
+    }
+    if ($direction === '') {
+        $direction = 'OUT (Exit Without Entry)';
+    }
+    if ($timestamp === '' && !empty($alertRow['detected_at'])) {
+        $timestamp = (string)$alertRow['detected_at'];
     }
 }
 
@@ -260,10 +372,10 @@ if ($normPlate !== '' && $conn instanceof mysqli) {
         // Ignore schema differences
     }
 
-    if ($ownerOrVisitor === '' || $vehicleType === '') {
+    if ($ownerOrVisitor === '' || $vehicleType === '' || $visitorIdType === '') {
         try {
             $visStmt = $conn->prepare("
-                SELECT visitor_name, vehicle_type, plate_number
+                SELECT visitor_name, vehicle_type, plate_number, id_type, id_number
                 FROM visitor_vehicles
                 WHERE REPLACE(REPLACE(UPPER(plate_number), ' ', ''), '-', '') = ?
                 ORDER BY id DESC
@@ -281,8 +393,12 @@ if ($normPlate !== '' && $conn instanceof mysqli) {
                     if ($vehicleCategory === '') {
                         $vehicleCategory = 'Visitor';
                     }
-                    if ($ownerOrVisitor === '' && !empty($visRow['visitor_name'])) {
-                        $ownerOrVisitor = (string)$visRow['visitor_name'];
+                    if ($ownerOrVisitor === '' && secsysRealVisitorName($visRow['visitor_name'] ?? '') !== '') {
+                        $ownerOrVisitor = secsysRealVisitorName($visRow['visitor_name']);
+                    }
+                    if ($visitorIdType === '' && trim((string)($visRow['id_type'] ?? '')) !== '' && trim((string)($visRow['id_number'] ?? '')) !== '') {
+                        $visitorIdType = trim((string)$visRow['id_type']);
+                        $visitorIdNumber = trim((string)$visRow['id_number']);
                     }
                 }
             }
@@ -295,6 +411,7 @@ if ($normPlate !== '' && $conn instanceof mysqli) {
 // 6. Find YOLOv10 Vehicle Capture files and Plate Capture files
 $vehCaptureDir = __DIR__ . '/uploads/vehicle_captures';
 $plateCaptureDir = __DIR__ . '/uploads/plate_captures';
+$exitAlertDir = __DIR__ . '/uploads/exit_alerts';
 
 $exactVehicleFiles = [];
 $fallbackVehicleFiles = [];
@@ -310,13 +427,33 @@ foreach ($matchedLogs as $logRow) {
         $candidates[] = 'log_' . $rowId . '.jpg';
     }
     foreach ($candidates as $cand) {
-        if (preg_match('/^[A-Za-z0-9_.-]+\.jpg$/i', $cand) && is_file($vehCaptureDir . '/' . $cand)) {
+        if (preg_match('/^[A-Za-z0-9_.-]+\.jpg$/i', $cand) && (is_file($vehCaptureDir . '/' . $cand) || is_file($exitAlertDir . '/' . $cand))) {
             if ($isExactId) {
                 $exactVehicleFiles[$cand] = $logRow;
             } else {
                 $fallbackVehicleFiles[$cand] = $logRow;
             }
         }
+    }
+}
+
+if ($alertRow) {
+    $aRowId = (int)($alertRow['id'] ?? 0);
+    $aVehFile = !empty($alertRow['vehicle_image']) ? basename((string)$alertRow['vehicle_image']) : ('exit_alert_' . $aRowId . '.jpg');
+    if ($aVehFile !== '' && (is_file($vehCaptureDir . '/' . $aVehFile) || is_file($exitAlertDir . '/' . $aVehFile))) {
+        $exactVehicleFiles[$aVehFile] = $alertRow;
+    }
+    $aPlateFile = !empty($alertRow['plate_image']) ? basename((string)$alertRow['plate_image']) : '';
+    if ($aPlateFile !== '' && (is_file($plateCaptureDir . '/' . $aPlateFile) || is_file($exitAlertDir . '/' . $aPlateFile))) {
+        $exactPlateCaptures[] = [
+            'plate_file'   => $aPlateFile,
+            'vehicle_file' => $aVehFile,
+            'display_text' => $alertRow['plate_number'] ?? '',
+            'camera'       => $alertRow['camera_name'] ?: 'Exit Cam',
+            'direction'    => 'OUT (Exit Without Entry)',
+            'timestamp'    => $alertRow['detected_at'] ?? '',
+            'confidence'   => $alertRow['confidence'] ?? null,
+        ];
     }
 }
 
@@ -367,10 +504,55 @@ if (is_dir($plateCaptureDir)) {
         $metaPlateNorm = secsysNormPlateKey((string)($meta['plate'] ?? $meta['display_text'] ?? ''));
 
         $meta['plate_file'] = $imgFile;
-        $meta['vehicle_file'] = ($metaVehFile !== '' && is_file($vehCaptureDir . '/' . $metaVehFile)) ? $metaVehFile : '';
+        $meta['vehicle_file'] = ($metaVehFile !== '' && (is_file($vehCaptureDir . '/' . $metaVehFile) || is_file($exitAlertDir . '/' . $metaVehFile))) ? $metaVehFile : '';
 
         if ($metaVehFile !== '' && isset($exactVehicleFiles[$metaVehFile])) {
             $exactPlateCaptures[] = $meta;
+        } elseif ($normPlate !== '' && $metaPlateNorm === $normPlate) {
+            $plateMatchedCaptures[] = $meta;
+            if ($meta['vehicle_file'] !== '' && !isset($exactVehicleFiles[$meta['vehicle_file']]) && !isset($fallbackVehicleFiles[$meta['vehicle_file']])) {
+                $fallbackVehicleFiles[$meta['vehicle_file']] = $meta;
+            }
+        }
+    }
+}
+
+// Also scan uploads/exit_alerts/*.json for matching exit alerts
+if (is_dir($exitAlertDir)) {
+    $alertJsonFiles = glob($exitAlertDir . '/*.json') ?: [];
+    rsort($alertJsonFiles);
+    $alertJsonFiles = array_slice($alertJsonFiles, 0, 100);
+
+    foreach ($alertJsonFiles as $jFile) {
+        $rawJson = @file_get_contents($jFile);
+        if (!is_string($rawJson) || $rawJson === '') {
+            continue;
+        }
+        $meta = json_decode($rawJson, true);
+        if (!is_array($meta)) {
+            continue;
+        }
+        $imgFile = !empty($meta['image'])
+            ? basename((string)$meta['image'])
+            : (basename($jFile, '.json') . '.jpg');
+        if (!is_file($exitAlertDir . '/' . $imgFile)) {
+            continue;
+        }
+
+        $metaPlateNorm = secsysNormPlateKey((string)($meta['plate'] ?? $meta['display_text'] ?? ''));
+        $metaAlertId = (int)($meta['alert_id'] ?? 0);
+        $metaVehFile = !empty($meta['vehicle_image']) ? basename((string)$meta['vehicle_image']) : ('exit_alert_' . $metaAlertId . '.jpg');
+
+        $meta['plate_file'] = $imgFile;
+        $meta['vehicle_file'] = is_file($vehCaptureDir . '/' . $metaVehFile) ? $metaVehFile : (is_file($exitAlertDir . '/' . $metaVehFile) ? $metaVehFile : '');
+        $meta['direction'] = 'OUT (Exit Without Entry)';
+        $meta['camera'] = (string)($meta['camera'] ?? ($alertRow['camera_name'] ?? 'Exit Cam'));
+
+        if (($alertId > 0 && $metaAlertId === $alertId) || ($alertRow && (int)$alertRow['id'] === $metaAlertId)) {
+            $exactPlateCaptures[] = $meta;
+            if ($meta['vehicle_file'] !== '' && !isset($exactVehicleFiles[$meta['vehicle_file']])) {
+                $exactVehicleFiles[$meta['vehicle_file']] = $meta;
+            }
         } elseif ($normPlate !== '' && $metaPlateNorm === $normPlate) {
             $plateMatchedCaptures[] = $meta;
             if ($meta['vehicle_file'] !== '' && !isset($exactVehicleFiles[$meta['vehicle_file']]) && !isset($fallbackVehicleFiles[$meta['vehicle_file']])) {
@@ -401,6 +583,19 @@ if (!empty($selectedPlateMeta['vehicle_file']) && isset($exactVehicleFiles[$sele
     $selectedVehicleFile = (string)array_key_first($fallbackVehicleFiles);
 }
 
+if ($selectedPlateFile === '' && $alertRow && !empty($alertRow['plate_image'])) {
+    $aP = basename((string)$alertRow['plate_image']);
+    if (is_file($plateCaptureDir . '/' . $aP) || is_file($exitAlertDir . '/' . $aP)) {
+        $selectedPlateFile = $aP;
+    }
+}
+if ($selectedVehicleFile === '' && $alertRow && !empty($alertRow['vehicle_image'])) {
+    $aV = basename((string)$alertRow['vehicle_image']);
+    if (is_file($vehCaptureDir . '/' . $aV) || is_file($exitAlertDir . '/' . $aV)) {
+        $selectedVehicleFile = $aV;
+    }
+}
+
 // Backfill metadata from the YOLOv10 capture JSON if DB rows did not have them
 if ($selectedPlateMeta) {
     if ($plateDisplay === '' && !empty($selectedPlateMeta['display_text'])) {
@@ -420,8 +615,13 @@ if ($selectedPlateMeta) {
     }
 }
 
-$cameraName = (string)($selectedPlateMeta['camera'] ?? '');
-$confidence = isset($selectedPlateMeta['confidence']) ? round(((float)$selectedPlateMeta['confidence']) * 100, 1) : null;
+$cameraName = (string)($selectedPlateMeta['camera'] ?? ($alertRow['camera_name'] ?? ''));
+$confRaw = isset($selectedPlateMeta['confidence']) ? $selectedPlateMeta['confidence'] : ($alertRow['confidence'] ?? null);
+$confidence = null;
+if ($confRaw !== null) {
+    $confFloat = (float)$confRaw;
+    $confidence = ($confFloat <= 1.0) ? round($confFloat * 100, 1) : round($confFloat, 1);
+}
 
 // Legacy raw=1 support
 if ($rawMode === '1' || $rawMode === 'true') {
@@ -463,6 +663,18 @@ foreach (array_merge($exactPlateCaptures, $plateMatchedCaptures) as $cap) {
     }
 }
 
+if (empty($allCaptures) && ($selectedPlateFile !== '' || $selectedVehicleFile !== '')) {
+    $tsRaw = $timestamp !== '' ? $timestamp : '';
+    $allCaptures[] = [
+        'plate_image_url'   => $selectedPlateFile !== '' ? ('vehicle_photo.php?raw=plate&file=' . rawurlencode($selectedPlateFile)) : null,
+        'vehicle_image_url' => $selectedVehicleFile !== '' ? ('vehicle_photo.php?raw=vehicle&file=' . rawurlencode($selectedVehicleFile)) : null,
+        'direction'         => $direction !== '' ? $direction : 'OUT (Exit Without Entry)',
+        'camera'            => $cameraName !== '' ? $cameraName : 'Exit Cam',
+        'timestamp'         => $tsRaw !== '' ? (strtotime($tsRaw) ? date('M d, Y h:i:s A', strtotime($tsRaw)) : $tsRaw) : '',
+        'confidence'        => $confidence,
+    ];
+}
+
 $plateImageUrl = $selectedPlateFile !== ''
     ? ('vehicle_photo.php?raw=plate&file=' . rawurlencode($selectedPlateFile))
     : null;
@@ -486,6 +698,8 @@ $payload = [
     'confidence'         => $confidence,
     'timestamp'          => $formattedTime,
     'owner_or_visitor'   => $ownerOrVisitor,
+    'id_type'            => $visitorIdType,      // empty when the visitor gave no ID
+    'id_number'          => $visitorIdNumber,
     'vehicle_model_info' => $vehicleModelInfo,
     'plate_image_url'    => $plateImageUrl,
     'vehicle_image_url'  => $vehicleImageUrl,
@@ -699,7 +913,7 @@ function ePhoto(string $v): string
             <div class="meta-pills">
                 <span class="meta-pill yolo">YOLOv10 Detection</span>
                 <?php if ($payload['direction'] !== ''): ?>
-                    <span class="meta-pill <?php echo $payload['direction'] === 'OUT' ? 'dir-out' : 'dir-in'; ?>">
+                    <span class="meta-pill <?php echo strpos($payload['direction'], 'OUT') === 0 ? 'dir-out' : 'dir-in'; ?>">
                         <?php echo ePhoto($payload['direction']); ?>
                     </span>
                 <?php endif; ?>

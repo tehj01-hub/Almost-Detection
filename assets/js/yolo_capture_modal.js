@@ -251,8 +251,11 @@
                     '<div class="secsys-plate-hero">' +
                         '<div class="secsys-plate-badge-lg" id="secsysModalPlateBadge">---</div>' +
                         '<div>' +
+                            '<div id="secsysModalPersonName" style="display:none;font-size:18px;font-weight:800;color:#ffffff;line-height:1.2;margin-bottom:2px;"></div>' +
                             '<div id="secsysModalVehicleTitle" style="font-size:15px;font-weight:700;color:#f8fafc;">Vehicle</div>' +
                             '<div id="secsysModalOwnerSub" style="font-size:12.5px;color:#94a3b8;margin-top:2px;"></div>' +
+                            '<div id="secsysModalIdLine" style="display:none;margin-top:6px;font-size:12.5px;font-weight:600;color:#fde68a;' +
+                                'background:rgba(250,204,21,.12);border:1px solid rgba(250,204,21,.35);border-radius:999px;padding:3px 10px;width:max-content;max-width:100%;"></div>' +
                         '</div>' +
                     '</div>' +
                     '<div class="secsys-plate-pills">' +
@@ -276,6 +279,8 @@
                                 '<div class="secsys-readout-item"><span>Vehicle Type</span><strong id="secsysReadoutType">-</strong></div>' +
                                 '<div class="secsys-readout-item"><span>Category</span><strong id="secsysReadoutCategory">-</strong></div>' +
                                 '<div class="secsys-readout-item"><span>Camera / Gate</span><strong id="secsysReadoutCamera">-</strong></div>' +
+                                '<div class="secsys-readout-item" id="secsysReadoutIdTypeItem" style="display:none;"><span>ID Type</span><strong id="secsysReadoutIdType">-</strong></div>' +
+                                '<div class="secsys-readout-item" id="secsysReadoutIdNumberItem" style="display:none;"><span>ID Number</span><strong id="secsysReadoutIdNumber">-</strong></div>' +
                             '</div>' +
                         '</div>' +
                     '</div>' +
@@ -330,8 +335,11 @@
         if (dirPill) {
             if (dir) {
                 dirPill.style.display = "inline-block";
-                dirPill.className = "secsys-plate-pill " + (dir === "OUT" ? "out" : "in");
-                dirPill.textContent = dir === "OUT" ? "OUT (Exit)" : "IN (Entrance)";
+                var isOut = dir.indexOf("OUT") === 0;
+                dirPill.className = "secsys-plate-pill " + (isOut ? "out" : "in");
+                dirPill.textContent = dir.indexOf("WITHOUT ENTRY") !== -1
+                    ? "OUT (Exit Without Entry)"
+                    : (isOut ? "OUT (Exit)" : "IN (Entrance)");
             } else {
                 dirPill.style.display = "none";
             }
@@ -382,14 +390,19 @@
         }
     }
 
-    function openByPlateAndIds(plate, ids) {
+    function openByPlateAndIds(plate, ids, alertId) {
         var overlay = ensureModalElement();
         var cleanPlate = String(plate || "").trim();
         var cleanIds = String(ids || "").trim();
+        var cleanAlertId = String(alertId || "").trim();
 
         document.getElementById("secsysModalPlateBadge").textContent = cleanPlate || "LOADING...";
         document.getElementById("secsysModalVehicleTitle").textContent = "Loading YOLOv10 capture...";
         document.getElementById("secsysModalOwnerSub").textContent = "";
+        document.getElementById("secsysModalPersonName").style.display = "none";
+        document.getElementById("secsysModalIdLine").style.display = "none";
+        document.getElementById("secsysReadoutIdTypeItem").style.display = "none";
+        document.getElementById("secsysReadoutIdNumberItem").style.display = "none";
         document.getElementById("secsysReadoutPlate").textContent = cleanPlate || "-";
         document.getElementById("secsysReadoutType").textContent = "-";
         document.getElementById("secsysReadoutCategory").textContent = "-";
@@ -409,6 +422,9 @@
         var url = "vehicle_photo.php?format=json";
         if (cleanIds) {
             url += "&ids=" + encodeURIComponent(cleanIds);
+        }
+        if (cleanAlertId) {
+            url += "&alert_id=" + encodeURIComponent(cleanAlertId);
         }
         if (cleanPlate) {
             url += "&plate=" + encodeURIComponent(cleanPlate);
@@ -431,11 +447,24 @@
 
                 document.getElementById("secsysModalPlateBadge").textContent = pNum;
                 document.getElementById("secsysModalVehicleTitle").textContent = vType + " \u2022 " + vCat;
-                var ownerSub = data.owner_or_visitor || "";
-                if (data.vehicle_model_info) {
-                    ownerSub = ownerSub ? (ownerSub + " (" + data.vehicle_model_info + ")") : data.vehicle_model_info;
-                }
-                document.getElementById("secsysModalOwnerSub").textContent = ownerSub;
+                // Visitor / owner name at the top of the header
+                var personName = String(data.owner_or_visitor || "").trim();
+                var nameEl = document.getElementById("secsysModalPersonName");
+                nameEl.textContent = personName ? "👤 " + personName : "";
+                nameEl.style.display = personName ? "block" : "none";
+                document.getElementById("secsysModalOwnerSub").textContent = data.vehicle_model_info || "";
+
+                // ID presented by the visitor (only when they gave one)
+                var idType = String(data.id_type || "").trim();
+                var idNumber = String(data.id_number || "").trim();
+                var hasId = idType !== "" && idNumber !== "";
+                var idLine = document.getElementById("secsysModalIdLine");
+                idLine.textContent = hasId ? "🪪 " + idType + " • " + idNumber : "";
+                idLine.style.display = hasId ? "block" : "none";
+                document.getElementById("secsysReadoutIdType").textContent = hasId ? idType : "-";
+                document.getElementById("secsysReadoutIdNumber").textContent = hasId ? idNumber : "-";
+                document.getElementById("secsysReadoutIdTypeItem").style.display = hasId ? "" : "none";
+                document.getElementById("secsysReadoutIdNumberItem").style.display = hasId ? "" : "none";
 
                 document.getElementById("secsysReadoutPlate").textContent = pNum;
                 document.getElementById("secsysReadoutType").textContent = vType;
@@ -485,8 +514,9 @@
         }
         var plate = el.getAttribute("data-plate") || el.textContent || "";
         var ids = el.getAttribute("data-ids") || "";
+        var alertId = el.getAttribute("data-alert-id") || "";
         if (reduceMotion) {
-            openByPlateAndIds(plate, ids);
+            openByPlateAndIds(plate, ids, alertId);
             return;
         }
         // Ripple starts where the plate was clicked (keyboard: from the centre)
@@ -507,7 +537,7 @@
         el.setAttribute("data-opening", "1");
         setTimeout(function () {
             el.removeAttribute("data-opening");
-            openByPlateAndIds(plate, ids);
+            openByPlateAndIds(plate, ids, alertId);
         }, 220);
         setTimeout(function () {
             el.classList.remove("is-pressed");
@@ -523,6 +553,15 @@
             return false;
         }
         pressAndOpen(el, event);
+        return false;
+    };
+
+    window.secsysOpenExitAlertModal = function (event, alertId, plate) {
+        if (event) {
+            event.preventDefault();
+            event.stopPropagation();
+        }
+        openByPlateAndIds(plate || "", "", alertId);
         return false;
     };
 

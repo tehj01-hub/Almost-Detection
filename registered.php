@@ -27,6 +27,33 @@ secsysEnsureSchema($conn);
 $systemName = secsysGetSystemName($conn);
 $systemIcon = secsysGetSystemIcon($conn);
 
+/* Extra owner fields the Administrator added (Add Field in the owner form) */
+require_once __DIR__ . '/app/owner_fields.php';
+$ownerFields = secsysOwnerFields($conn);
+
+if (
+    $_SERVER["REQUEST_METHOD"] === "POST"
+    && in_array(($_POST["action"] ?? ""), ["owner_field_add", "owner_field_rename", "owner_field_remove"], true)
+) {
+    header("Content-Type: application/json; charset=utf-8");
+    $fieldAction = $_POST["action"];
+    if ($fieldAction === "owner_field_add") {
+        $res = secsysOwnerFieldAdd($conn, (string)($_POST["label"] ?? ""));
+        $logText = 'Added the owner field "' . ($res['field']['label'] ?? '') . '" on the Registered page.';
+    } elseif ($fieldAction === "owner_field_rename") {
+        $res = secsysOwnerFieldRename($conn, (string)($_POST["key"] ?? ""), (string)($_POST["label"] ?? ""));
+        $logText = 'Renamed the owner field "' . ($res['old'] ?? '') . '" on the Registered page.';
+    } else {
+        $res = secsysOwnerFieldRemove($conn, (string)($_POST["key"] ?? ""));
+        $logText = 'Removed the owner field "' . ($res['label'] ?? '') . '" from the Registered page (saved values are kept).';
+    }
+    if ($res['ok']) {
+        secsysLogActivity($conn, (string)$_SESSION['username'], 'Registered Fields Update', $logText);
+    }
+    echo json_encode(['success' => $res['ok'], 'message' => $res['message'], 'field' => $res['field'] ?? null]);
+    exit();
+}
+
 /* =========================================================
    HELPER
 ========================================================= */
@@ -71,6 +98,7 @@ if (
 ) {
 
     $owner_name   = ""; // owner name field removed from the UI (column kept NOT NULL)
+    $extra_info   = secsysOwnerExtraEncode(secsysOwnerExtraFromPost($ownerFields, $_POST["extra"] ?? []));
     $brand        = trim($_POST["brand"] ?? "");
     $plate_number = normalizePlate($_POST["plate_number"] ?? "");
     $model        = trim($_POST["model"] ?? "");
@@ -128,6 +156,7 @@ if (
                     model,
                     address,
                     plate_number,
+                    extra_info,
                     status,
                     date_created
                 )
@@ -140,18 +169,20 @@ if (
                     ?,
                     ?,
                     ?,
+                    ?,
                     NOW()
                 )
             ");
 
             $stmt->bind_param(
-                "sssssss",
+                "ssssssss",
                 $owner_name,
                 $brand,
                 $vehicle_type,
                 $model,
                 $address,
                 $plate_number,
+                $extra_info,
                 $status
             );
 
@@ -300,6 +331,17 @@ if (
 
         } else {
 
+            // Keep values of fields that were removed; update the active ones from the form
+            $existingExtra = [];
+            $exStmt = $conn->prepare("SELECT extra_info FROM registered_vehicles WHERE id = ?");
+            if ($exStmt) {
+                $exStmt->bind_param("i", $id);
+                $exStmt->execute();
+                $existingExtra = secsysOwnerExtraDecode($exStmt->get_result()->fetch_assoc()['extra_info'] ?? null);
+                $exStmt->close();
+            }
+            $extra_info = secsysOwnerExtraEncode(secsysOwnerExtraFromPost($ownerFields, $_POST["extra"] ?? [], $existingExtra));
+
             $stmt = $conn->prepare("
                 UPDATE registered_vehicles
                 SET
@@ -307,17 +349,19 @@ if (
                     plate_number = ?,
                     model = ?,
                     address = ?,
-                    vehicle_type = ?
+                    vehicle_type = ?,
+                    extra_info = ?
                 WHERE id = ?
             ");
 
             $stmt->bind_param(
-                "sssssi",
+                "ssssssi",
                 $brand,
                 $plate_number,
                 $model,
                 $address,
                 $vehicle_type,
+                $extra_info,
                 $id
             );
 
@@ -422,6 +466,7 @@ if (
                 model,
                 address,
                 vehicle_type,
+                extra_info,
                 status,
                 original_date_created,
                 archive_date,
@@ -436,6 +481,7 @@ if (
                 model,
                 address,
                 vehicle_type,
+                extra_info,
                 'Inactive',
                 date_created,
                 CURDATE(),
@@ -553,6 +599,7 @@ if (
                         model,
                         address,
                         vehicle_type,
+                        extra_info,
                         status,
                         original_date_created,
                         archive_date,
@@ -567,6 +614,7 @@ if (
                         model,
                         address,
                         vehicle_type,
+                        extra_info,
                         'Inactive',
                         date_created,
                         CURDATE(),
@@ -714,12 +762,14 @@ if ($search !== "") {
             address,
             vehicle_type,
             status,
-            date_created
+            date_created,
+            extra_info
         FROM registered_vehicles
         WHERE plate_number LIKE ?
            OR brand LIKE ?
            OR model LIKE ?
            OR address LIKE ?
+           OR extra_info LIKE ?
         ORDER BY address ASC, id DESC
     ");
 
@@ -727,7 +777,8 @@ if ($search !== "") {
         "%" . $search . "%";
 
     $stmt->bind_param(
-        "ssss",
+        "sssss",
+        $search_param,
         $search_param,
         $search_param,
         $search_param,
@@ -746,7 +797,8 @@ if ($search !== "") {
             address,
             vehicle_type,
             status,
-            date_created
+            date_created,
+            extra_info
         FROM registered_vehicles
         ORDER BY address ASC, id DESC
     ");
@@ -758,6 +810,10 @@ $result =
     $stmt->get_result();
 
 while ($row = $result->fetch_assoc()) {
+
+    // Extra owner fields as [field key => value] (only the active fields are shown)
+    $row["extra"] = secsysOwnerExtraDecode($row["extra_info"] ?? null);
+    unset($row["extra_info"]);
 
     $all_vehicles[] =
         $row;
@@ -1162,6 +1218,14 @@ if ($download_type === "registered") {
                     <th style="width:28%;">
                         Address
                     </th>
+    ';
+
+    // Extra owner fields added by the Administrator
+    foreach ($ownerFields as $ownerField) {
+        $pdf_html .= '<th>' . e($ownerField['label']) . '</th>';
+    }
+
+    $pdf_html .= '
 
                 </tr>
 
@@ -1273,6 +1337,14 @@ if ($download_type === "registered") {
                         ) .
                         '
                     </td>
+            ';
+
+            foreach ($ownerFields as $ownerField) {
+                $ownerValue = secsysOwnerGroupValue($group["vehicles"], $ownerField['key']);
+                $pdf_html .= '<td>' . ($ownerValue !== '' ? e($ownerValue) : '-') . '</td>';
+            }
+
+            $pdf_html .= '
 
                 </tr>
 
@@ -1288,7 +1360,7 @@ if ($download_type === "registered") {
             <tr>
 
                 <td
-                    colspan="5"
+                    colspan="' . (5 + count($ownerFields)) . '"
                     style="
                         text-align:center;
                         padding:20px;
@@ -2282,6 +2354,13 @@ body {
     width: 16%;
 }
 
+/* Extra owner fields added by the Administrator */
+.owner-extra-col {
+    width: 150px;
+    white-space: normal !important;
+    word-break: break-word;
+}
+
 /* =========================================================
    MAIN VEHICLE DISPLAY
 ========================================================= */
@@ -3088,7 +3167,7 @@ body {
             class="btn btn-primary add-btn"
             onclick="openAddModal()"
         >
-            ➕ Add Vehicle
+            ➕ Add New Owner
         </button>
 
         <button
@@ -3191,7 +3270,7 @@ body {
 
         <div class="table-wrapper">
 
-            <table class="vehicle-table">
+            <table class="vehicle-table"<?php if ($ownerFields): ?> style="min-width: <?php echo 760 + 150 * count($ownerFields); ?>px;"<?php endif; ?>>
 
                 <thead>
 
@@ -3199,11 +3278,11 @@ body {
 
                         <th class="checkbox-col">
 
-                            <input
+                            <!-- <input
                                 type="checkbox"
                                 id="selectAll"
                                 title="Select all"
-                            >
+                            > -->
 
                         </th>
 
@@ -3218,6 +3297,12 @@ body {
                         <th class="address-col">
                             Address
                         </th>
+
+                        <?php foreach ($ownerFields as $ownerField): ?>
+                            <th class="owner-extra-col">
+                                <?php echo e($ownerField['label']); ?>
+                            </th>
+                        <?php endforeach; ?>
 
                         <th class="action-col">
                             Action
@@ -3456,6 +3541,11 @@ body {
 
                             </td>
 
+                            <?php foreach ($ownerFields as $ownerField): ?>
+                                <?php $ownerValue = secsysOwnerGroupValue($group_vehicles, $ownerField['key']); ?>
+                                <td class="owner-extra-col"><?php echo $ownerValue !== '' ? e($ownerValue) : '<span style="color:#94a3b8;">—</span>'; ?></td>
+                            <?php endforeach; ?>
+
                             <td>
 
                                 <?php if ($vehicle_count >= 2): ?>
@@ -3510,7 +3600,7 @@ body {
 
                     <tr class="empty-row">
 
-                        <td colspan="6">
+                        <td colspan="<?php echo 5 + count($ownerFields); ?>">
 
                             <?php if ($search !== ""): ?>
 
@@ -4098,6 +4188,92 @@ body {
 </div>
 
 <!-- =====================================================
+     ADD / RENAME OWNER FIELD MODAL (opens on top of the owner form)
+===================================================== -->
+
+<div
+    class="modal"
+    id="ownerFieldModal"
+    style="z-index: 10050;"
+>
+
+    <div class="modal-content owner-field-modal-content">
+
+        <div class="modal-header">
+
+            <div class="modal-title" id="ownerFieldModalTitle">
+                Add New Field
+            </div>
+
+            <button
+                type="button"
+                class="close-modal"
+                onclick="closeModal('ownerFieldModal')"
+                aria-label="Close"
+            >
+                ×
+            </button>
+
+        </div>
+
+        <form id="ownerFieldForm" onsubmit="return submitOwnerFieldModal(event)" autocomplete="off">
+
+            <div class="owner-field-hint" id="ownerFieldModalHint">
+                The new field is added to the owner form for every owner and shows as a column in the Registered list.
+            </div>
+
+            <div class="form-group">
+                <label class="form-label" for="ownerFieldLabelInput">
+                    Field Name
+                </label>
+                <input
+                    type="text"
+                    id="ownerFieldLabelInput"
+                    class="form-input"
+                    maxlength="40"
+                    placeholder="Example: Owner Name"
+                    required
+                >
+            </div>
+
+            <div class="owner-field-suggestions" id="ownerFieldSuggestions">
+                <span>Quick picks:</span>
+                <button type="button" onclick="pickOwnerFieldSuggestion(this)">Owner Name</button>
+                <button type="button" onclick="pickOwnerFieldSuggestion(this)">Contact Number</button>
+                <button type="button" onclick="pickOwnerFieldSuggestion(this)">Email</button>
+                <button type="button" onclick="pickOwnerFieldSuggestion(this)">Sticker / RFID No.</button>
+                <button type="button" onclick="pickOwnerFieldSuggestion(this)">Remarks</button>
+            </div>
+
+            <div class="owner-field-error" id="ownerFieldModalError" hidden></div>
+
+            <div class="modal-actions">
+
+                <button
+                    type="button"
+                    class="btn btn-secondary"
+                    onclick="closeModal('ownerFieldModal')"
+                >
+                    Cancel
+                </button>
+
+                <button
+                    type="submit"
+                    class="btn btn-primary"
+                    id="ownerFieldModalSave"
+                >
+                    Add Field
+                </button>
+
+            </div>
+
+        </form>
+
+    </div>
+
+</div>
+
+<!-- =====================================================
      ADD MODAL
 ===================================================== -->
 
@@ -4224,6 +4400,26 @@ body {
                 >
 
             </div>
+
+            <!-- Extra owner fields (added by the Administrator with "Add Field") -->
+            <div class="owner-extra-fields" data-owner-fields>
+                <?php foreach ($ownerFields as $ownerField): ?>
+                    <div class="form-group owner-extra-group" data-field-key="<?php echo e($ownerField['key']); ?>">
+                        <label class="form-label owner-extra-label">
+                            <span class="owner-extra-name"><?php echo e($ownerField['label']); ?></span>
+                            <span class="owner-extra-tools">
+                                <button type="button" title="Rename this field" onclick="renameOwnerField('<?php echo e($ownerField['key']); ?>')">✎</button>
+                                <button type="button" title="Remove this field" onclick="removeOwnerField('<?php echo e($ownerField['key']); ?>')">✕</button>
+                            </span>
+                        </label>
+                        <input type="text" name="extra[<?php echo e($ownerField['key']); ?>]" class="form-input" data-extra-key="<?php echo e($ownerField['key']); ?>" maxlength="255" placeholder="Optional">
+                    </div>
+                <?php endforeach; ?>
+            </div>
+
+            <button type="button" class="owner-add-field-btn" onclick="addOwnerField(this)">
+                ➕ Add Field
+            </button>
 
             <div class="modal-actions">
 
@@ -4380,6 +4576,26 @@ body {
                 >
 
             </div>
+
+            <!-- Extra owner fields (added by the Administrator with "Add Field") -->
+            <div class="owner-extra-fields" data-owner-fields>
+                <?php foreach ($ownerFields as $ownerField): ?>
+                    <div class="form-group owner-extra-group" data-field-key="<?php echo e($ownerField['key']); ?>">
+                        <label class="form-label owner-extra-label">
+                            <span class="owner-extra-name"><?php echo e($ownerField['label']); ?></span>
+                            <span class="owner-extra-tools">
+                                <button type="button" title="Rename this field" onclick="renameOwnerField('<?php echo e($ownerField['key']); ?>')">✎</button>
+                                <button type="button" title="Remove this field" onclick="removeOwnerField('<?php echo e($ownerField['key']); ?>')">✕</button>
+                            </span>
+                        </label>
+                        <input type="text" name="extra[<?php echo e($ownerField['key']); ?>]" class="form-input" data-extra-key="<?php echo e($ownerField['key']); ?>" maxlength="255" placeholder="Optional">
+                    </div>
+                <?php endforeach; ?>
+            </div>
+
+            <button type="button" class="owner-add-field-btn" onclick="addOwnerField(this)">
+                ➕ Add Field
+            </button>
 
             <div class="modal-actions">
 
@@ -4576,6 +4792,8 @@ function openVehicleManager(group)
 
                     </div>
 
+                    ${ownerExtraDetailsHtml(vehicle)}
+
                 </div>
 
                 <div class="management-actions">
@@ -4664,6 +4882,12 @@ function editVehicle(vehicle)
     ).value =
         vehicle.vehicle_type;
 
+    // Extra owner fields
+    document.querySelectorAll("#updateModal [data-extra-key]").forEach(function (input) {
+        const key = input.getAttribute("data-extra-key");
+        input.value = (vehicle.extra && vehicle.extra[key]) ? vehicle.extra[key] : "";
+    });
+
     document
         .getElementById(
             "updateModal"
@@ -4738,7 +4962,9 @@ const selectAll =
         "selectAll"
     );
 
-selectAll.addEventListener(
+// The "select all" box is hidden in the table header; without this check the
+// rest of the page script stopped here and nothing after it worked.
+if (selectAll) selectAll.addEventListener(
     "change",
     function()
     {
@@ -4813,6 +5039,10 @@ function updateSelectedCount()
 
 function updateSelectAll()
 {
+    if (!selectAll) {
+        return;
+    }
+
     const checkboxes =
         document.querySelectorAll(
             ".owner-checkbox"
@@ -5128,6 +5358,9 @@ function printCurrentVehicles()
         foreach ($owner_groups as $group) {
             $printGroups[] = [
                 'address'  => (string)$group['address'],
+                'extra'    => array_map(function ($f) use ($group) {
+                    return secsysOwnerGroupValue($group['vehicles'], $f['key']);
+                }, $ownerFields),
                 'vehicles' => array_map(function ($v) {
                     return [
                         'vehicle' => trim(($v['brand'] ?? '') . ' ' . ($v['model'] ?? '')),
@@ -5147,7 +5380,7 @@ function printCurrentVehicles()
     const rows = [];
     groups.forEach(function (group) {
         group.vehicles.forEach(function (v) {
-            rows.push([c(rows.length + 1), group.address, v.vehicle, c(v.plate), c(v.type), c(v.date)]);
+            rows.push([c(rows.length + 1), group.address].concat(group.extra.map(function (x) { return x || "-"; }), [v.vehicle, c(v.plate), c(v.type), c(v.date)]));
         });
     });
 
@@ -5161,7 +5394,7 @@ function printCurrentVehicles()
         title: "Registered Vehicle Report",
         meta: meta,
         body: SecsysPrint.table(
-            [["#", 5], ["Address", 25], ["Vehicle", 22], ["Plate Number", 16], ["Vehicle Type", 14], ["Date Registered", 18]],
+            [["#", 5], ["Address", 25]].concat(OWNER_FIELDS.map(function (f) { return [f.label, 14]; }), [["Vehicle", 22], ["Plate Number", 16], ["Vehicle Type", 14], ["Date Registered", 18]]),
             rows,
             "No registered vehicles found."
         ),
@@ -5504,6 +5737,182 @@ updateSelectAll();
    Ensures newly added plate numbers appear immediately without
    full page reloads or form resubmission prompts.
 ========================================================= */
+/* =========================================================
+   EXTRA OWNER FIELDS ("Add Field" in the owner forms)
+========================================================= */
+let OWNER_FIELDS = <?php echo json_encode($ownerFields, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_UNICODE); ?>;
+
+function ownerExtraDetailsHtml(vehicle)
+{
+    return OWNER_FIELDS.map(function (f) {
+        const value = (vehicle.extra && vehicle.extra[f.key]) ? vehicle.extra[f.key] : "—";
+        return '<div class="management-detail"><strong>' + escapeHTML(f.label) + ':</strong> ' + escapeHTML(value) + '</div>';
+    }).join("");
+}
+
+function ownerFieldGroupHtml(field)
+{
+    const k = escapeHTML(field.key);
+    return '<div class="form-group owner-extra-group" data-field-key="' + k + '">' +
+        '<label class="form-label owner-extra-label">' +
+            '<span class="owner-extra-name">' + escapeHTML(field.label) + '</span>' +
+            '<span class="owner-extra-tools">' +
+                '<button type="button" title="Rename this field" onclick="renameOwnerField(\'' + k + '\')">✎</button>' +
+                '<button type="button" title="Remove this field" onclick="removeOwnerField(\'' + k + '\')">✕</button>' +
+            '</span>' +
+        '</label>' +
+        '<input type="text" name="extra[' + k + ']" class="form-input" data-extra-key="' + k + '" maxlength="255" placeholder="Optional">' +
+    '</div>';
+}
+
+async function ownerFieldRequest(params)
+{
+    const body = new URLSearchParams(params);
+    const res = await fetch("registered.php", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/x-www-form-urlencoded", "X-Requested-With": "XMLHttpRequest" },
+        body: body.toString()
+    });
+    return res.json();
+}
+
+/* Add Field / Rename modal: { mode: "add" | "rename", key, form } */
+let ownerFieldModalState = { mode: "add", key: "", form: null };
+
+function openOwnerFieldModal(mode, key, form)
+{
+    ownerFieldModalState = { mode: mode, key: key || "", form: form || null };
+    const field = OWNER_FIELDS.find(function (f) { return f.key === key; });
+    const input = document.getElementById("ownerFieldLabelInput");
+    const isRename = mode === "rename";
+
+    document.getElementById("ownerFieldModalTitle").textContent = isRename ? "Rename Field" : "Add New Field";
+    document.getElementById("ownerFieldModalHint").textContent = isRename
+        ? 'Rename "' + (field ? field.label : "") + '". What was already entered for every owner stays the same.'
+        : "The new field is added to the owner form for every owner and shows as a column in the Registered list.";
+    document.getElementById("ownerFieldModalSave").textContent = isRename ? "Save Name" : "Add Field";
+    document.getElementById("ownerFieldSuggestions").hidden = isRename;
+    showOwnerFieldError("");
+    input.value = isRename && field ? field.label : "";
+
+    document.getElementById("ownerFieldModal").classList.add("show");
+    setTimeout(function () { input.focus(); input.select(); }, 60);
+}
+
+function showOwnerFieldError(message)
+{
+    const box = document.getElementById("ownerFieldModalError");
+    box.textContent = message || "";
+    box.hidden = !message;
+}
+
+function pickOwnerFieldSuggestion(btn)
+{
+    const input = document.getElementById("ownerFieldLabelInput");
+    input.value = btn.textContent.trim();
+    showOwnerFieldError("");
+    input.focus();
+}
+
+// Typing a new name clears the last error
+document.addEventListener("input", function (event) {
+    if (event.target && event.target.id === "ownerFieldLabelInput") {
+        showOwnerFieldError("");
+    }
+});
+
+async function submitOwnerFieldModal(event)
+{
+    event.preventDefault();
+    const label = document.getElementById("ownerFieldLabelInput").value.trim();
+    const saveBtn = document.getElementById("ownerFieldModalSave");
+    const state = ownerFieldModalState;
+
+    if (!label) {
+        showOwnerFieldError("Please enter a name for the field.");
+        return false;
+    }
+
+    saveBtn.disabled = true;
+    const original = saveBtn.textContent;
+    saveBtn.textContent = state.mode === "rename" ? "Saving..." : "Adding...";
+
+    try {
+        if (state.mode === "rename") {
+            const data = await ownerFieldRequest({ action: "owner_field_rename", key: state.key, label: label });
+            if (!data || !data.success) {
+                showOwnerFieldError((data && data.message) || "Could not rename the field.");
+                return false;
+            }
+            const field = OWNER_FIELDS.find(function (f) { return f.key === state.key; });
+            if (field) field.label = label;
+            document.querySelectorAll('[data-field-key="' + state.key + '"] .owner-extra-name').forEach(function (el) {
+                el.textContent = label;
+            });
+        } else {
+            const data = await ownerFieldRequest({ action: "owner_field_add", label: label });
+            if (!data || !data.success) {
+                showOwnerFieldError((data && data.message) || "Could not add the field.");
+                return false;
+            }
+            const field = data.field;
+            if (!OWNER_FIELDS.some(function (f) { return f.key === field.key; })) {
+                OWNER_FIELDS.push(field);
+            }
+            // Add the input to both owner forms (Add New Owner and Update)
+            document.querySelectorAll("[data-owner-fields]").forEach(function (box) {
+                if (!box.querySelector('[data-field-key="' + field.key + '"]')) {
+                    box.insertAdjacentHTML("beforeend", ownerFieldGroupHtml(field));
+                }
+            });
+            closeModal("ownerFieldModal");
+            const newInput = state.form ? state.form.querySelector('[data-extra-key="' + field.key + '"]') : null;
+            if (newInput) newInput.focus();
+            return false;
+        }
+        closeModal("ownerFieldModal");
+    } catch (e) {
+        showOwnerFieldError("Could not save. Please check the connection and try again.");
+    } finally {
+        saveBtn.disabled = false;
+        saveBtn.textContent = original;
+    }
+    return false;
+}
+
+function addOwnerField(btn)
+{
+    openOwnerFieldModal("add", "", btn ? btn.closest("form") : null);
+}
+
+// Esc closes the Add / Rename Field window first (the owner form underneath stays open)
+document.addEventListener("keydown", function (event) {
+    const modal = document.getElementById("ownerFieldModal");
+    if (event.key === "Escape" && modal && modal.classList.contains("show")) {
+        event.stopImmediatePropagation();
+        closeModal("ownerFieldModal");
+    }
+}, true);
+
+function renameOwnerField(key)
+{
+    openOwnerFieldModal("rename", key, null);
+}
+
+async function removeOwnerField(key)
+{
+    const field = OWNER_FIELDS.find(function (f) { return f.key === key; });
+    if (!confirm('Remove the field "' + (field ? field.label : "") + '" from the owner form and list?\n\nWhat was already entered is kept; adding a field with the same name brings it back.')) return;
+    const data = await ownerFieldRequest({ action: "owner_field_remove", key: key });
+    if (!data || !data.success) {
+        alert((data && data.message) || "Could not remove the field.");
+        return;
+    }
+    OWNER_FIELDS = OWNER_FIELDS.filter(function (f) { return f.key !== key; });
+    document.querySelectorAll('[data-field-key="' + key + '"]').forEach(function (el) { el.remove(); });
+}
+
 document.addEventListener("DOMContentLoaded", function() {
     const addForm = document.querySelector("#addModal form");
     if (addForm) {
@@ -5581,12 +5990,41 @@ document.addEventListener("DOMContentLoaded", function() {
 
 </script>
 
+<style>
+.owner-extra-label { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.owner-extra-tools { display: inline-flex; gap: 4px; }
+.owner-extra-tools button {
+    border: 1px solid #cbd5e1; background: #fff; color: #475569; border-radius: 6px;
+    width: 24px; height: 22px; font-size: 11px; line-height: 1; cursor: pointer; padding: 0;
+}
+.owner-extra-tools button:hover { background: #f1f5f9; color: #0f172a; }
+.owner-add-field-btn {
+    display: inline-flex; align-items: center; gap: 6px; margin: 2px 0 14px; padding: 7px 14px;
+    border: 1px dashed #60a5fa; background: #eff6ff; color: #1d4ed8; border-radius: 8px;
+    font-size: 12.5px; font-weight: 700; cursor: pointer;
+}
+.owner-add-field-btn:hover { background: #dbeafe; }
+.owner-field-modal-content { max-width: 440px; }
+.owner-field-hint { font-size: 12.5px; color: #475569; line-height: 1.45; margin-bottom: 12px; }
+.owner-field-suggestions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: -4px 0 12px; font-size: 12px; color: #64748b; }
+.owner-field-suggestions button {
+    border: 1px solid #cbd5e1; background: #f8fafc; color: #0f172a; border-radius: 999px;
+    padding: 3px 10px; font-size: 11.5px; cursor: pointer;
+}
+.owner-field-suggestions button:hover { background: #e0f2fe; border-color: #7dd3fc; }
+.owner-field-error {
+    background: #fef2f2; color: #991b1b; border: 1px solid #fecaca; border-radius: 8px;
+    padding: 8px 10px; font-size: 12.5px; margin-bottom: 10px;
+}
+</style>
+
 <!-- Live auto-refresh (no full page reload) -->
 <script>window.AUTO_REFRESH_SECONDS = 5;</script>
 <script src="assets/js/download_format.js?v=<?php echo (int)@filemtime(__DIR__ . '/assets/js/download_format.js'); ?>"></script>
 <script src="assets/js/auto_refresh.js?v=<?php echo (int)@filemtime(__DIR__ . '/assets/js/auto_refresh.js'); ?>"></script>
 
 <?php echo secsysYoloCaptureModalAssetsHtml(); /* clickable plate styles + viewer, also for plates added live */ ?>
+<script src="assets/js/logout_confirm.js?v=<?php echo (int)@filemtime(__DIR__ . '/assets/js/logout_confirm.js'); ?>"></script>
 </body>
 
 </html>

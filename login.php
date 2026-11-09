@@ -1726,7 +1726,7 @@ button:hover {
 
             <button type="submit">
 
-                Submit
+                Log In
 
             </button>
 

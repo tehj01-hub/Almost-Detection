@@ -2490,19 +2490,19 @@ body {
                 value="<?= e($search) ?>"
             >
 
-            <div style="display:inline-flex; align-items:center; gap:6px; background:#fff; border:1px solid #d4d4d4; border-radius:20px; padding:0 12px; height:38px;">
-                <span style="font-size:12px; color:#555; font-weight:600;">Hours:</span>
-                <input type="time" name="time_from" value="<?= e($time_from) ?>" style="border:none; background:transparent; font-size:12px; outline:none;" title="From Time">
-                <span style="font-size:12px; color:#888;">to</span>
-                <input type="time" name="time_to" value="<?= e($time_to) ?>" style="border:none; background:transparent; font-size:12px; outline:none;" title="To Time">
-            </div>
-
             <button
                 type="submit"
                 class="btn btn-primary"
             >
                 Search
             </button>
+
+            <div style="display:inline-flex; align-items:center; gap:6px; background:#fff; border:1px solid #d4d4d4; border-radius:20px; padding:0 12px; height:38px;">
+                <span style="font-size:12px; color:#555; font-weight:600;">Hours:</span>
+                <input type="time" name="time_from" value="<?= e($time_from) ?>" style="border:none; background:transparent; font-size:12px; outline:none;" title="From Time">
+                <span style="font-size:12px; color:#888;">to</span>
+                <input type="time" name="time_to" value="<?= e($time_to) ?>" style="border:none; background:transparent; font-size:12px; outline:none;" title="To Time">
+            </div>
 
         </form>
 
@@ -3627,6 +3627,7 @@ function printArchive()
 <script src="assets/js/download_format.js?v=<?php echo (int)@filemtime(__DIR__ . '/assets/js/download_format.js'); ?>"></script>
 <script src="assets/js/auto_refresh.js?v=<?php echo (int)@filemtime(__DIR__ . '/assets/js/auto_refresh.js'); ?>"></script>
 
+<script src="assets/js/logout_confirm.js?v=<?php echo (int)@filemtime(__DIR__ . '/assets/js/logout_confirm.js'); ?>"></script>
 </body>
 
 </html>

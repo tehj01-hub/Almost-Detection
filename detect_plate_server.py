@@ -30,6 +30,7 @@ os.environ.setdefault("OPENCV_LOG_LEVEL", "OFF")
 import cv2
 cv2.setNumThreads(2)
 from app.vehicle_visit_logger import record_vehicle_visit
+from app.exit_alerts import record_exit_without_entry, attach_alert_image
 from app.pending_visitor_queue import (
     enqueue_pending_visitor,
     has_open_visitor_visit,
@@ -196,6 +197,7 @@ JPEG_QUALITY = 75 if ANY_GPU_ACTIVE else 65  # Higher visual MJPEG streaming qua
 OVERLAY_TTL_SECONDS = 1.6                    # Keep bounding box overlay visible smoothly between AI passes
 INFERENCE_INTERVAL_SECONDS = 0.03 if ANY_GPU_ACTIVE else 0.05 # 30ms (~33 FPS AI pass) on GPU, 50ms on CPU
 PLATE_COOLDOWN_SECONDS = 30                  # 30-second cooldown prevents spam while car is at the barrier
+EXIT_ALERT_REPEAT_SECONDS = 600              # one exit-without-entry warning per plate per 10 minutes
 
 # Camera orientation settings
 FLIP_CAMERA_180 = False
@@ -986,6 +988,39 @@ def plates_are_similar(plate_a, plate_b):
     return ca == cb
 
 
+def similar_plate_inside(plate):
+    """True if any vehicle with an open visit (inside) has a plate similar to `plate`.
+
+    Returns True when the database cannot be checked, so we never raise an
+    exit-without-entry alarm on missing information.
+    """
+    conn = get_db_connection()
+    if not conn:
+        return True
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT plate_number FROM vehicle_log_dates
+            WHERE status = 'IN' AND time_out IS NULL
+            ORDER BY id DESC LIMIT 500
+            """
+        )
+        target = normalize_plate(plate)
+        for (open_plate,) in cursor.fetchall():
+            if plates_are_similar(target, normalize_plate(open_plate)):
+                return True
+        return False
+    except Exception as e:
+        print(f"[EXIT-ALERT] Inside check error: {e}")
+        return True
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def is_plate_recently_logged_in_db(plate, direction='IN', cooldown_seconds=30):
     """
     Query MySQL to see if this plate's most recent log within the cooldown period
@@ -1376,8 +1411,12 @@ class CameraChannel:
         for item in overlays:
             x1, y1, x2, y2 = item['bbox']
             label = item['label']
+            # Orange warning box: exit camera sees a vehicle that was never logged IN
+            warn = 'NO ENTRY' in label
+            box_color = (0, 140, 255) if warn else color
+            bg_color = (0, 120, 240) if warn else text_bg_color
 
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), box_color, 3 if warn else 2)
 
             (label_w, label_h), _ = cv2.getTextSize(
                 label,
@@ -1391,7 +1430,7 @@ class CameraChannel:
                 annotated,
                 (x1, top_y - label_h - 10),
                 (x1 + label_w, top_y),
-                text_bg_color,
+                bg_color,
                 -1
             )
 
@@ -1658,15 +1697,22 @@ class PlateDetector:
             if combined_conf < CONFIDENCE_THRESHOLD:
                 continue
 
+            no_entry = False
             if normalized and is_valid_plate(normalized):
                 if not self._can_scan_plate(normalized, channel_direction):
-                    continue
+                    if channel_direction != 'OUT':
+                        continue  # entrance: vehicle already inside, nothing to do
+                    # Exit camera: this vehicle was never logged IN. Keep it so the
+                    # guard is warned (exit-without-entry alert) instead of ignoring it.
+                    no_entry = True
             elif channel_direction in ('IN', 'OUT') and callable(
                 getattr(self, 'can_scan_plate', None) or globals().get('should_scan_plate_on_direction')
             ):
                 continue
 
-            if decision == "NEEDS_REVIEW":
+            if no_entry:
+                label = f"[OUT] NO ENTRY: {display_text or normalized}"
+            elif decision == "NEEDS_REVIEW":
                 label = f"[{channel_direction}] REVIEW: {display_text or 'Plate'}"
             elif display_text:
                 label = f"[{channel_direction}] {display_text} ({combined_conf:.0%})"
@@ -1688,6 +1734,7 @@ class PlateDetector:
                     'method': method,
                     'review_reason': review_reason,
                     'bbox': [x1, y1, x2, y2],
+                    'no_entry': no_entry,
                     '_plate_crop': plate_crop.copy()
                 })
                 # If primary candidate is a valid high-confidence plate, avoid redundant OCR on secondary boxes
@@ -1743,6 +1790,12 @@ class PlateDetector:
         #    - Entrance ('IN'): do NOT scan if already Inside
         #    - Exit ('OUT'): do NOT scan if already Outside
         if not self._can_scan_plate(plate, direction, use_cache=False):
+            if direction == 'OUT':
+                # The exit camera read a plate that never came in: warn the guard.
+                try:
+                    self._flag_exit_without_entry(plate_info, channel, now)
+                except Exception as exc:
+                    print(f"[EXIT-ALERT] Could not record exit-without-entry alert: {exc}")
             return False
 
         # 1. Check in-memory cooldown across recent detections on this channel/direction
@@ -1913,6 +1966,91 @@ class PlateDetector:
             f"{category} | {vehicle_type} | {plate_info.get('confidence', 0.0):.0%}"
         )
         return True
+
+    def _flag_exit_without_entry(self, plate_info, channel, now):
+        """Record a warning when a plate is read leaving but was never logged IN.
+
+        Guards against false alarms: only confident (auto-accepted) reads, not a
+        vehicle that was just logged OUT and is still in view, not a visitor
+        still waiting for the guard's form, and once per plate per 10 minutes.
+        """
+        if plate_info.get('decision', 'ACCEPT') != 'ACCEPT':
+            return None
+        plate = plate_info.get('normalized') or ''
+        if not plate:
+            return None
+        key = f"EWE:{plate}"
+        seen = getattr(self, '_exit_alert_seen', None)
+        if seen is None:
+            seen = self._exit_alert_seen = {}
+        last = seen.get(key)
+        if last and (now - last).total_seconds() < EXIT_ALERT_REPEAT_SECONDS:
+            return None
+        seen[key] = now
+        cutoff = now - timedelta(seconds=EXIT_ALERT_REPEAT_SECONDS)
+        for k in [k for k, v in seen.items() if v < cutoff]:
+            seen.pop(k, None)
+
+        if is_visitor_pending_or_suppressed(plate, cooldown_seconds=EXIT_ALERT_REPEAT_SECONDS):
+            return None
+        # Just left a moment ago (still in front of the exit camera)
+        if is_plate_recently_logged_in_db(plate, 'OUT', cooldown_seconds=EXIT_ALERT_REPEAT_SECONDS):
+            return None
+
+        # An OCR misread of a vehicle that is inside (e.g. 8 read as B) is not an exit without entry.
+        if similar_plate_inside(plate):
+            return None
+
+        db_info = check_plate_in_database(plate)
+        actual_plate = db_info.get('official_plate') or plate
+        if actual_plate != plate:
+            # A misread of a vehicle that is inside is not an exit without entry.
+            if is_plate_currently_inside(actual_plate, use_cache=False) is not False:
+                return None
+            if is_plate_recently_logged_in_db(actual_plate, 'OUT', cooldown_seconds=EXIT_ALERT_REPEAT_SECONDS):
+                return None
+
+        conn = get_db_connection()
+        if not conn:
+            return None
+        try:
+            alert = record_exit_without_entry(
+                conn, plate_info.get('text') or plate, db_info,
+                camera_name=getattr(channel, 'name', None),
+                confidence=plate_info.get('confidence'),
+            )
+            if not alert:
+                return None
+            alert_id = int(alert['id'])
+            crop = plate_info.get('_plate_crop')
+            if crop is not None:
+                try:
+                    capture = save_plate_capture(
+                        os.path.join(BASE_DIR, 'uploads', 'exit_alerts'), crop,
+                        {'alert': 'exit_without_entry', 'alert_id': alert_id, 'plate': alert['plate'],
+                         'camera': getattr(channel, 'name', None),
+                         'timestamp': now.strftime('%Y-%m-%d %H:%M:%S')})
+                    attach_alert_image(conn, alert_id, 'plate_image', 'uploads/exit_alerts/' + capture['image'])
+                except Exception as exc:
+                    print(f"[EXIT-ALERT] Plate photo save failed: {exc}")
+        finally:
+            conn.close()
+
+        def _link(path, info, alert_id=alert_id):
+            c = get_db_connection()
+            if not c:
+                return
+            try:
+                attach_alert_image(c, alert_id, 'vehicle_image', path)
+            except Exception as exc:
+                print(f"[EXIT-ALERT] Could not link vehicle photo: {exc}")
+            finally:
+                c.close()
+
+        self._capture_vehicle(plate_info, f"exit_alert_{alert_id}", on_saved=_link)
+        print(f"[EXIT-ALERT] [{getattr(channel, 'name', 'Exit Cam')}] {alert['plate']} exited without an entry record "
+              f"({alert['category']}, alert id={alert_id})")
+        return alert
 
     def _capture_vehicle(self, plate_info, name, on_saved=None):
         """Queue a YOLOv10 vehicle photo for a successfully read plate."""

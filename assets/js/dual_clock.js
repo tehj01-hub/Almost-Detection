@@ -172,6 +172,10 @@
         injectStyles();
         tick();
         setInterval(tick, 1000);
+        // Only contact the internet time servers when a page shows the Internet Time card
+        if (!document.getElementById("internetClock")) {
+            return;
+        }
         sync();
         document.addEventListener("visibilitychange", function () {
             if (!document.hidden) sync();

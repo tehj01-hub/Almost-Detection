@@ -165,6 +165,51 @@ if ($report_basis === "monthly") {
     $periodDisplayLabel = date("F d, Y", strtotime($report_date));
 }
 
+/* =========================================================
+   PLATE REPORT DOWNLOAD (one plate number, detailed)
+   report.php?download=plate&plate=ABC1234&range=period|all&format=pdf|csv
+========================================================= */
+if (($_GET['download'] ?? '') === 'plate') {
+    require_once __DIR__ . '/app/plate_report.php';
+    $plateParam = trim((string)($_GET['plate'] ?? ''));
+    $allDates = (($_GET['range'] ?? 'period') === 'all');
+
+    if (secsysPlateReportNorm($plateParam) === '') {
+        header('Content-Type: text/plain; charset=utf-8', true, 400);
+        echo 'Please enter a plate number.';
+        exit();
+    }
+
+    $plateData = secsysPlateReportData($conn, $plateParam, $allDates ? null : $periodStart, $allDates ? null : $periodEnd);
+    $rangeLabel = $allDates ? 'All dates' : $periodDisplayLabel;
+    $meta = [
+        'Plate Number: ' . $plateData['plate'],
+        'Period: ' . $rangeLabel,
+    ];
+    if (!secsysPlateReportHasData($plateData)) {
+        $meta[] = 'No record of this plate was found in the system.';
+    }
+    $bodyHtml = secsysPlateReportBodyHtml($conn, $plateData);
+    $fileBase = 'Plate_Report_' . preg_replace('/[^A-Za-z0-9]+/', '', $plateData['plate']) . '_' . ($allDates ? 'All_Dates' : $periodStart);
+
+    secsysLogActivity(
+        $conn,
+        (string)($_SESSION['username'] ?? 'Administrator'),
+        'Report Download',
+        'Downloaded the detailed plate report for ' . $plateData['plate'] . ' (' . $rangeLabel . ', ' . (secsysWantsCsvDownload() ? 'CSV' : 'PDF') . ').'
+    );
+
+    if (secsysWantsCsvDownload()) {
+        secsysStreamCsvFromHtml(
+            secsysBuildPrintDocumentHtml('Plate Detailed Report', $meta, $bodyHtml, 'Plate Detailed Report', false),
+            $fileBase
+        );
+        exit();
+    }
+    secsysStreamPdfReport('Plate Detailed Report', $meta, $bodyHtml, 'Plate Detailed Report', $fileBase . '.pdf');
+    exit();
+}
+
 $searchQuery  = isset($_GET['search']) ? trim($_GET['search']) : '';
 $statusFilter = isset($_GET['status']) ? trim($_GET['status']) : ''; // Inside / Outside / ''
 $categoryFilter = isset($_GET['category']) ? trim($_GET['category']) : ''; // Registered / Visitor / ''
@@ -259,54 +304,94 @@ if (!function_exists('resolveActorLabel')) {
     }
 }
 
+/*
+ * Module names used in the audit trail. Each one is a real page of the system,
+ * named as it appears in the sidebar / page title, so the reader knows exactly
+ * where the action was done. The two dashboards are named after their user.
+ */
+const REPORT_MODULES = [
+    'Administrator Dashboard',   // superadmin_dashboard.php
+    'Security Guard Dashboard',  // guard_dashboard.php
+    'Logs',                      // logs.php (Administrator)
+    'Registered',                // registered.php (Administrator)
+    'Visitor',                   // visitor.php (Administrator)
+    'Registered Logs',           // registered_logs.php (Security Guard)
+    'Visitor Logs',              // visitor_logs.php (Security Guard)
+    'Security Guard',            // security_guard.php
+    'Security Information',      // security_information.php
+    'Report',                    // report.php
+    'Backup & Retrieve',         // backup.php
+    'Profile',                   // profile.php
+    'Login',                     // login.php
+    'Logout',                    // the Logout button in the sidebar
+    'Forgot Password',           // forgot_password.php
+    'Select Duty Partner',       // guard_select_partner.php
+];
+
+if (!function_exists('reportIsGuardActor')) {
+    /** Security guards are logged by their guard ID (SG-0001); administrators by username. */
+    function reportIsGuardActor($actor)
+    {
+        return (bool)preg_match('/^SG-/i', trim((string)$actor));
+    }
+}
+
 if (!function_exists('reportAuditModule')) {
     /**
-     * Name of the module (sidebar page) an activity log entry comes from,
-     * using the same wording as the navigation menu.
+     * The page (module) where the logged action was done.
      */
-    function reportAuditModule($activityType, $description)
+    function reportAuditModule($activityType, $description, $actor = '')
     {
         $type = strtolower(trim((string)$activityType));
         $desc = strtolower((string)$description);
+        $dashboard = reportIsGuardActor($actor) ? 'Security Guard Dashboard' : 'Administrator Dashboard';
 
         switch ($type) {
             case 'login':
+                return 'Login';
             case 'logout':
-                return 'Login & Logout';                 // login.php / logout.php
+                return 'Logout';
             case 'co-duty login':
-                return 'Duty Roster';                    // guard_select_partner.php
+                return 'Select Duty Partner';
             case 'visitor duration extended':
             case 'visitor marked exited':
-                return 'Visitor Monitoring';             // visitor timers on the guard dashboard
+                return $dashboard;                       // visitor timer controls on the dashboard
+            case 'manual registered log':
+            case 'exit alert acknowledged':
+                return 'Security Guard Dashboard';       // "Add Registered" / exit-without-entry warning
+            case 'camera settings':
+                return 'Administrator Dashboard';        // camera setup on the admin dashboard
+            case 'registered fields update':
+                return 'Registered';
+            case 'report download':
+                return 'Report';                         // Plate Report download                     // Add Field / rename / remove on registered.php
             case 'daily reset':
-                return 'System (Auto-Archive)';          // automatic midnight archive
+                return 'Logs';                           // automatic 12:00 AM archive of the logs
             case 'profile update':
             case 'password change':
-                return 'Profile';                        // profile.php
-            case 'password reset':
-                return 'Forgot Password';                // forgot_password.php (login page)
             case 'system settings update':
-                return 'System Settings';                // profile.php
-            case 'camera settings':
-                return 'Dashboard Cameras';              // superadmin_dashboard.php
+            case 'security contacts update':
+                return 'Profile';
+            case 'password reset':
+                return 'Forgot Password';
             case 'archive':
             case 'unarchive':
                 if (strpos($desc, 'visitor vehicle log') !== false) {
-                    return 'Visitor Logs';               // visitor_logs.php
+                    return 'Visitor Logs';
                 }
                 if (strpos($desc, 'registered vehicle log') !== false) {
-                    return 'Registered Logs';            // registered_logs.php
+                    return 'Registered Logs';
                 }
-                return 'Logs';                           // logs.php
+                return 'Logs';
         }
 
         if (strpos($type, 'database') === 0) {
-            return 'Backup & Retrieve';                  // backup.php (backup, restore, delete, cleanup)
+            return 'Backup & Retrieve';                  // backup, restore, merge, upload, cleanup
         }
         if (strpos($type, 'guard') === 0) {
-            return 'Security Guard';                     // security_guard.php
+            return 'Security Guard';                     // guard added / updated / archived
         }
-        return 'General';
+        return $dashboard;
     }
 }
 
@@ -411,7 +496,7 @@ foreach ($guardActivityThisPeriod as $act) {
             'time'        => !empty($act['date_created']) ? date('M d, Y h:i A', strtotime($act['date_created'])) : '-',
             'sort'        => (string)($act['date_created'] ?? ''),
             'event'       => (string)($act['activity_type'] ?? 'Activity'),
-            'module'      => reportAuditModule($act['activity_type'] ?? '', $act['activity_description'] ?? ''),
+            'module'      => reportAuditModule($act['activity_type'] ?? '', $act['activity_description'] ?? '', $actorRaw),
             'description' => (string)($act['activity_description'] ?? ''),
         ];
         $periodGuards[$resolvedGid]['was_active'] = true;
@@ -627,7 +712,7 @@ $stmtCurrLogs = $conn->prepare("
     SELECT
         id, plate_number, vehicle_type, vehicle_category,
         purpose, direction, date_created,
-        NULL AS archived_at, 'Active Log (Not Yet Archived)' AS archived_by
+        NULL AS archived_at, 'Active Log' AS archived_by
     FROM vehicle_logs
     WHERE DATE(date_created) BETWEEN ? AND ?
     ORDER BY date_created ASC
@@ -739,6 +824,7 @@ $filterReportSessions = function ($sessions) use ($searchQuery, $statusFilter, $
 };
 
 $filteredArchivedSessions = $filterReportSessions($archivedSessions);
+$filteredActiveSessions   = $filterReportSessions($currentPeriodSessions);   // not yet archived
 $allCombinedSessions      = $filterReportSessions($periodVehicleSessionsRaw);
 
 $insideCount  = 0;
@@ -768,7 +854,7 @@ foreach ($guardActivityThisPeriod as $ga) {
         'timestamp'   => $ga['date_created'] ?? null,
         'actor'       => $actorLabel,
         'event_type'  => $ga['activity_type'] ?: 'Activity',
-        'module'      => reportAuditModule($ga['activity_type'] ?? '', $ga['activity_description'] ?? ''),
+        'module'      => reportAuditModule($ga['activity_type'] ?? '', $ga['activity_description'] ?? '', $ga['guard_id'] ?? ''),
         'description' => $ga['activity_description'],
     ];
 }
@@ -793,7 +879,7 @@ foreach ($dutyPairsThisPeriod as $dp) {
         'timestamp'   => $dp['started_at'],
         'actor'       => $primaryLabel,
         'event_type'  => 'Duty Shift',
-        'module'      => 'Duty Roster',
+        'module'      => 'Select Duty Partner',
         'description' => $desc,
     ];
 }
@@ -823,7 +909,8 @@ if ($stmtArchAudit) {
             'timestamp'   => $aa['archived_at'],
             'actor'       => $actorLabel,
             'event_type'  => 'Vehicle Log Archive',
-            'module'      => $aa['vehicle_category'] . ' Logs',
+            // Archived by a guard on their log page, otherwise on the Administrator's Logs page (or the 12:00 AM reset)
+            'module'      => reportIsGuardActor($aa['archived_by'] ?? '') ? $aa['vehicle_category'] . ' Logs' : 'Logs',
             'description' => "Archived " . (int)$aa['record_count'] . " " . strtolower($aa['vehicle_category']) . " vehicle movement log(s) [Plates: " . $platesPreview . "].",
         ];
     }
@@ -847,12 +934,58 @@ if ($stmtRegArchAudit) {
             'timestamp'   => $ra['archived_at'],
             'actor'       => $actorLabel,
             'event_type'  => 'Registered Archive',
-            'module'      => 'Registered Vehicles',
+            'module'      => 'Registered',
             'description' => "Archived registered " . ($ra['vehicle_type'] ?? 'Vehicle') . " (" . ($ra['plate_number'] ?? '') . ") at " . ($ra['address'] ?? 'N/A') . " — " . ($ra['archive_reason'] ?? 'Manual Archive') . ".",
         ];
     }
     $stmtRegArchAudit->close();
 }
+
+// Exit camera read a vehicle leaving that never came in (exit_without_entry_alerts)
+// The same rows also make up the "Exit Without Entry Log" section.
+$exitAlertLog = [];
+$stmtExitAlerts = $conn->prepare("
+    SELECT id, plate_number, vehicle_category, vehicle_type, camera_name, confidence, plate_image, vehicle_image,
+           detected_at, status, acknowledged_by, acknowledged_at, ack_note
+    FROM exit_without_entry_alerts
+    WHERE DATE(detected_at) BETWEEN ? AND ?
+    ORDER BY detected_at DESC
+");
+if ($stmtExitAlerts) {
+    $stmtExitAlerts->bind_param("ss", $periodStart, $periodEnd);
+    $stmtExitAlerts->execute();
+    $resExitAlerts = $stmtExitAlerts->get_result();
+    while ($ea = $resExitAlerts->fetch_assoc()) {
+        $ea['acknowledged_label'] = !empty($ea['acknowledged_by'])
+            ? resolveActorLabel((string)$ea['acknowledged_by'], $guardMap, $usernameToGuardId)
+            : '';
+        $exitAlertLog[] = $ea;
+        $eaKind = ($ea['vehicle_category'] ?? '') === 'Unknown' ? 'unregistered vehicle' : strtolower((string)$ea['vehicle_category']) . ' vehicle';
+        $eaStatus = ($ea['status'] ?? 'New') === 'Acknowledged'
+            ? ' Acknowledged by ' . resolveActorLabel((string)$ea['acknowledged_by'], $guardMap, $usernameToGuardId) . ' at ' . date('h:i A', strtotime((string)$ea['acknowledged_at'])) . '.'
+            : ' Not yet acknowledged.';
+        $auditTrail[] = [
+            'timestamp'   => $ea['detected_at'],
+            'actor'       => 'System (' . ($ea['camera_name'] ?: 'Exit Cam') . ')',
+            'event_type'  => 'Exit Without Entry',
+            'module'      => 'Security Guard Dashboard',
+            'description' => 'Exit camera read ' . $eaKind . ' ' . ($ea['plate_number'] ?? '') . ' leaving without an entry record.' . $eaStatus,
+        ];
+    }
+    $stmtExitAlerts->close();
+}
+
+// The search box also narrows the Exit Without Entry Log (plate, camera, guard, note)
+if ($searchQuery !== '') {
+    $exitAlertLog = array_values(array_filter($exitAlertLog, function ($ea) use ($searchQuery) {
+        $hay = implode(' ', [$ea['plate_number'], $ea['vehicle_category'], $ea['vehicle_type'], $ea['camera_name'],
+                             $ea['acknowledged_label'], $ea['ack_note'], $ea['status']]);
+        $plain = preg_replace('/[^A-Z0-9]/i', '', $searchQuery);
+        return stripos($hay, $searchQuery) !== false
+            || ($plain !== '' && stripos(preg_replace('/[^A-Z0-9]/i', '', $hay), $plain) !== false);
+    }));
+}
+$exitAlertNew = count(array_filter($exitAlertLog, function ($ea) { return ($ea['status'] ?? 'New') !== 'Acknowledged'; }));
 
 // Filter & sort audit trail newest first
 if ($auditType !== '' && strtolower($auditType) !== 'all') {
@@ -863,8 +996,7 @@ if ($auditType !== '' && strtolower($auditType) !== 'all') {
             return strcasecmp($item['module'], $wantModule) === 0;
         }));
     } else {
-        // Event options match the event type only, so "Login" does not also
-        // pick up logouts through the "Login & Logout" module name.
+        // Event options match the event type only (not the module name).
         $atLower = strtolower($auditType);
         $auditTrail = array_values(array_filter($auditTrail, function ($item) use ($atLower) {
             if (stripos($item['event_type'], $atLower) !== false) {
@@ -954,6 +1086,9 @@ if (isset($_GET['download']) && $_GET['download'] === 'pdf') {
             </thead>
             <tbody>';
 
+    if (empty($vehicleDaySummary['by_type'])) {
+        $pdfHtml .= '<tr><td colspan="6" style="text-align:center; color:#666;">No vehicles detected in this period.</td></tr>';
+    }
     foreach ($vehicleDaySummary['by_type'] as $vtRow) {
         $pdfHtml .= '<tr>
             <td><strong>' . e($vtRow['label']) . '</strong></td>
@@ -1007,7 +1142,7 @@ if (isset($_GET['download']) && $_GET['download'] === 'pdf') {
 
     $pdfHtml .= '</tbody></table>
 
-        <div class="section-heading">2. Data Archived &amp; Vehicle Movement Report (' . count($allCombinedSessions) . ' records)</div>
+        <div class="section-heading">2. Vehicle Status Report &amp; Data Archived (' . count($allCombinedSessions) . ' records)</div>
         <table class="data-table">
             <thead>
                 <tr>
@@ -1080,6 +1215,45 @@ if (isset($_GET['download']) && $_GET['download'] === 'pdf') {
     }
 
     $pdfHtml .= '</tbody></table>
+
+        <div class="section-heading">4. Exit Without Entry Log (' . count($exitAlertLog) . ' alerts, ' . (int)$exitAlertNew . ' not acknowledged)</div>
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th style="width:22px;">#</th>
+                    <th style="width:110px;">Date &amp; Time</th>
+                    <th>Plate Number</th>
+                    <th>Vehicle</th>
+                    <th>Camera</th>
+                    <th>Status</th>
+                    <th>Acknowledged By</th>
+                    <th>Acknowledged At</th>
+                    <th>Guard\'s Note</th>
+                </tr>
+            </thead>
+            <tbody>';
+
+    if (empty($exitAlertLog)) {
+        $pdfHtml .= '<tr><td colspan="9" style="text-align:center;">No vehicle exited without an entry record in this period.</td></tr>';
+    } else {
+        foreach ($exitAlertLog as $n => $ea) {
+            $eaAcked = ($ea['status'] ?? 'New') === 'Acknowledged';
+            $eaKind = ($ea['vehicle_category'] ?? '') === 'Unknown' ? 'Unregistered' : (string)$ea['vehicle_category'];
+            $pdfHtml .= '<tr>
+                <td>' . ($n + 1) . '</td>
+                <td>' . e(formatDateTime($ea['detected_at'])) . '</td>
+                <td><strong>' . e($ea['plate_number']) . '</strong></td>
+                <td>' . e($eaKind . (!empty($ea['vehicle_type']) ? ' / ' . $ea['vehicle_type'] : '')) . '</td>
+                <td>' . e($ea['camera_name'] ?: 'Exit Cam') . '</td>
+                <td>' . ($eaAcked ? 'Acknowledged' : 'Not Acknowledged') . '</td>
+                <td>' . e($eaAcked ? $ea['acknowledged_label'] : '-') . '</td>
+                <td>' . e($eaAcked ? formatDateTime($ea['acknowledged_at']) : '-') . '</td>
+                <td>' . e((string)($ea['ack_note'] ?? '') !== '' ? $ea['ack_note'] : '-') . '</td>
+            </tr>';
+        }
+    }
+
+    $pdfHtml .= '</tbody></table>
     </body>
     </html>';
 
@@ -1100,11 +1274,14 @@ if (isset($_GET['download']) && $_GET['download'] === 'pdf') {
 /* =========================================================
    PAGINATION FOR ARCHIVED DATA & AUDIT TRAIL
 ========================================================= */
-$perPage = 8;
+// Every table section of the report shows 7 rows per page; the rest go to the next page
+const REPORT_ROWS_PER_PAGE = 7;
+$perPage = REPORT_ROWS_PER_PAGE;
 
 // View mode for Section 2: 'archived' (default) or 'all' (Active + Archived)
-$dataScope = (isset($_GET['scope']) && $_GET['scope'] === 'all') ? 'all' : 'archived';
-$activeDataRows = ($dataScope === 'all') ? $allCombinedSessions : $filteredArchivedSessions;
+// Two separate views (never mixed): Active Logs (default) or Archived Data
+$dataScope = (isset($_GET['scope']) && $_GET['scope'] === 'archived') ? 'archived' : 'active';
+$activeDataRows = ($dataScope === 'archived') ? $filteredArchivedSessions : $filteredActiveSessions;
 
 $archPage = isset($_GET['ap']) ? max(1, (int)$_GET['ap']) : 1;
 $totalArchRows = count($activeDataRows);
@@ -1114,7 +1291,7 @@ if ($archPage > $totalArchPages) {
 }
 $pagedArchRows = array_slice($activeDataRows, ($archPage - 1) * $perPage, $perPage);
 
-$auditPerPage = 10;
+$auditPerPage = REPORT_ROWS_PER_PAGE;
 $auditPage = isset($_GET['tp']) ? max(1, (int)$_GET['tp']) : 1;
 $totalAuditRows = count($auditTrail);
 $totalAuditPages = max(1, (int)ceil($totalAuditRows / $auditPerPage));
@@ -1137,6 +1314,39 @@ if (!function_exists('reportUrl')) {
         return 'report.php' . (!empty($params) ? '?' . http_build_query($params) : '');
     }
 }
+
+if (!function_exists('reportPagerHtml')) {
+    /** Page numbers under a section table ("ep", "gp", ... is that section's page parameter). */
+    function reportPagerHtml($param, $page, $pages)
+    {
+        if ($pages <= 1) {
+            return '';
+        }
+        $html = '<div class="pagination">';
+        if ($page > 1) {
+            $html .= '<a href="' . e(reportUrl([$param => $page - 1])) . '">&lsaquo;</a>';
+        }
+        for ($p = 1; $p <= $pages; $p++) {
+            $html .= $p === $page
+                ? '<span class="active">' . $p . '</span>'
+                : '<a href="' . e(reportUrl([$param => $p])) . '">' . $p . '</a>';
+        }
+        if ($page < $pages) {
+            $html .= '<a href="' . e(reportUrl([$param => $page + 1])) . '">&rsaquo;</a>';
+        }
+        return $html . '</div>';
+    }
+}
+
+/* Pages for the sections that showed every row before */
+$guardPages = max(1, (int)ceil(count($activePeriodGuardsList) / REPORT_ROWS_PER_PAGE));
+$guardPage = min($guardPages, max(1, (int)($_GET['gp'] ?? 1)));
+$pagedPeriodGuards = array_slice($activePeriodGuardsList, ($guardPage - 1) * REPORT_ROWS_PER_PAGE, REPORT_ROWS_PER_PAGE);
+
+$vehicleTypeRows = $vehicleDaySummary['by_type'];
+$vehicleTypePages = max(1, (int)ceil(count($vehicleTypeRows) / REPORT_ROWS_PER_PAGE));
+$vehicleTypePage = min($vehicleTypePages, max(1, (int)($_GET['vp'] ?? 1)));
+$pagedVehicleTypes = array_slice($vehicleTypeRows, ($vehicleTypePage - 1) * REPORT_ROWS_PER_PAGE, REPORT_ROWS_PER_PAGE);
 ?>
 <!DOCTYPE html>
 <html lang="en" class="ui-scale-fixed">
@@ -1306,15 +1516,15 @@ body {
     margin-bottom: 20px;
 }
 .summary-card {
-    background: #ffffff;
-    border: 1px solid #dedede;
+    background: #f0f6fc;
+    border: 1px solid #c8dcf0;
     border-radius: 18px;
     padding: 16px 18px;
-    box-shadow: 0 2px 5px rgba(0,0,0,0.06);
+    box-shadow: 0 2px 6px rgba(15, 23, 42, 0.05);
 }
 .summary-label {
     font-size: 12px;
-    color: #666;
+    color: #0369a1;
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.4px;
@@ -1322,12 +1532,12 @@ body {
 .summary-value {
     font-size: 28px;
     font-weight: 600;
-    color: #1478e8;
+    color: #0c4a6e;
     margin-top: 6px;
 }
 .summary-sub {
     font-size: 11px;
-    color: #777;
+    color: #64748b;
     margin-top: 4px;
 }
 
@@ -1335,12 +1545,12 @@ body {
    FILTER BAR
 ========================================================= */
 .filter-card {
-    background: #ffffff;
-    border: 1px solid #dedede;
+    background: #f0f6fc;
+    border: 1px solid #c8dcf0;
     border-radius: 18px;
     padding: 16px 20px;
     margin-bottom: 22px;
-    box-shadow: 0 2px 5px rgba(0,0,0,0.05);
+    box-shadow: 0 2px 6px rgba(15, 23, 42, 0.05);
 }
 .filter-row {
     display: flex;
@@ -1359,20 +1569,21 @@ body {
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    background: #f7f9fc;
-    border: 1px solid #cfd9e8;
+    background: #ffffff;
+    border: 1px solid #c8dcf0;
     border-radius: 18px;
     padding: 0 12px;
     height: 36px;
     font-size: 12px;
-    color: #333;
+    color: #1e293b;
+    box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
 }
 .filter-pill input,
 .filter-pill select {
     border: none;
     background: transparent;
     font-size: 12px;
-    color: #111;
+    color: #1e293b;
     outline: none;
 }
 
@@ -1380,12 +1591,21 @@ body {
    SECTION CARDS & TABLES
 ========================================================= */
 .section-card {
-    background: #ffffff;
-    border: 1px solid #dedede;
+    background: #f0f6fc;
+    border: 1px solid #c8dcf0;
     border-radius: 20px;
     padding: 20px 22px;
     margin-bottom: 24px;
-    box-shadow: 0 3px 6px rgba(0,0,0,0.06);
+    box-shadow: 0 2px 6px rgba(15, 23, 42, 0.05);
+}
+#liveReportSection1,
+#liveReportSection2,
+#liveReportSection3,
+#liveReportExitAlerts,
+#liveReportVehicleSummary {
+    background: #f0f6fc;
+    border: 1px solid #c8dcf0;
+    box-shadow: 0 2px 6px rgba(15, 23, 42, 0.05);
 }
 .section-top {
     display: flex;
@@ -1395,51 +1615,146 @@ body {
     gap: 10px;
     padding-bottom: 12px;
     margin-bottom: 14px;
-    border-bottom: 1px solid #eeeeee;
+    border-bottom: 1px solid #c8dcf0;
 }
 .section-title {
     font-size: 18px;
     font-weight: 600;
-    color: #111;
+    color: #0369a1;
     display: flex;
     align-items: center;
     gap: 8px;
 }
 .section-subtitle {
     font-size: 12px;
-    color: #666;
+    color: #64748b;
     margin-top: 2px;
 }
 .badge-pill {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    background: #edf5ff;
-    color: #2f80ed;
+    background: #ffffff;
+    color: #0284c7;
+    border: 1px solid #c8dcf0;
     font-size: 11px;
     font-weight: 700;
     padding: 3px 10px;
     border-radius: 12px;
 }
+/* Locked Section 2 header so scope-tabs never shifts or wraps */
+#liveReportSection2 .section-top {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    flex-wrap: nowrap;
+    gap: 16px;
+}
+#liveReportSection2 .section-top > div:first-child {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+#liveReportSection2 .scope-tabs {
+    flex-shrink: 0;
+    align-self: flex-start;
+    margin-top: 2px;
+}
 .scope-tabs {
+    position: relative;
     display: inline-flex;
-    background: #eef4fc;
-    border: 1px solid #c8dcf7;
-    border-radius: 18px;
-    padding: 2px;
-    gap: 4px;
+    align-items: center;
+    width: 290px;
+    height: 38px;
+    background: #e2edf8;
+    border: 1px solid #c8dcf0;
+    border-radius: 20px;
+    padding: 3px;
+    box-sizing: border-box;
+    user-select: none;
+    box-shadow: inset 0 1px 2px rgba(15, 23, 42, 0.05);
+}
+.scope-glider {
+    position: absolute;
+    top: 3px;
+    bottom: 3px;
+    left: 3px;
+    width: calc((100% - 6px) / 2);
+    background: #0284c7;
+    border-radius: 16px;
+    box-shadow: 0 2px 6px rgba(2, 132, 199, 0.32);
+    transition: transform 0.26s cubic-bezier(0.4, 0, 0.2, 1);
+    pointer-events: none;
+    z-index: 1;
+    will-change: transform;
+}
+.scope-tabs[data-active="active"] .scope-glider {
+    transform: translateX(0);
+}
+.scope-tabs[data-active="archived"] .scope-glider {
+    transform: translateX(100%);
 }
 .scope-tab {
-    padding: 5px 12px;
-    border-radius: 15px;
+    position: relative;
+    z-index: 2;
+    flex: 1 1 50%;
+    width: 50%;
+    height: 100%;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    padding: 0 8px;
+    border-radius: 16px;
     font-size: 12px;
     font-weight: 600;
     text-decoration: none;
-    color: #1769d3;
+    color: #0369a1;
+    cursor: pointer;
+    background: transparent !important;
+    border: none;
+    box-shadow: none !important;
+    transition: color 0.22s cubic-bezier(0.4, 0, 0.2, 1);
+    white-space: nowrap;
+    box-sizing: border-box;
+}
+.scope-tab:hover {
+    color: #0284c7;
 }
 .scope-tab.active {
-    background: #2f80ed;
-    color: #ffffff;
+    color: #ffffff !important;
+    background: transparent !important;
+    box-shadow: none !important;
+}
+.scope-tab-count {
+    font-size: 11px;
+    opacity: 0.92;
+}
+@media (max-width: 768px) {
+    #liveReportSection2 .section-top {
+        flex-wrap: wrap;
+        gap: 12px;
+    }
+    #liveReportSection2 .scope-tabs {
+        width: 100%;
+    }
+}
+
+@keyframes sectionSwapFadeIn {
+    0% {
+        opacity: 0.35;
+        transform: translateY(4px);
+    }
+    100% {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+.section-swap-animating {
+    animation: sectionSwapFadeIn 0.24s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+.scope-loading {
+    opacity: 0.55;
+    transition: opacity 0.15s ease;
 }
 
 .table-wrapper { width: 100%; overflow-x: auto; }
@@ -1448,19 +1763,28 @@ thead th {
     text-align: center;
     font-weight: 600;
     padding: 11px 12px;
-    border-bottom: 2px solid #e2e8f0;
-    background: #fafbfc;
-    color: #334155;
+    border-bottom: 2px solid #c8dcf0;
+    background: #f8fafc;
+    color: #0369a1;
     white-space: nowrap;
     vertical-align: middle;
 }
+tbody tr {
+    background: #ffffff;
+}
 tbody td {
+    background: #ffffff;
+    color: #1e293b;
     padding: 11px 12px;
-    border-bottom: 1px solid #f1f5f9;
+    border-bottom: 1px solid #e2edf6;
     vertical-align: middle;
     text-align: center;
 }
-tbody tr:hover { background: #fbfdff; }
+tbody tr:hover td { background: #f8fafc; }
+tbody tr.vehicle-summary-total td {
+    background: #f1f5f9;
+    font-weight: 700;
+}
 .status-badge {
     display: inline-flex;
     align-items: center;
@@ -1489,6 +1813,7 @@ tbody tr:hover { background: #fbfdff; }
     padding: 32px 12px;
     color: #888;
     font-size: 13px;
+    background: #ffffff;
 }
 
 /* =========================================================
@@ -1501,23 +1826,24 @@ tbody tr:hover { background: #fbfdff; }
     margin-bottom: 16px;
 }
 .vehicle-summary-box {
-    background: #f8fbff;
-    border: 1px solid #dbe7f7;
+    background: #ffffff;
+    border: 1px solid #c8dcf0;
     border-radius: 14px;
     padding: 13px 15px;
     text-align: left;
+    box-shadow: 0 1px 3px rgba(15, 23, 42, 0.04);
 }
 .vehicle-summary-box-label {
     font-size: 11px;
     font-weight: 700;
-    color: #475569;
+    color: #0369a1;
     text-transform: uppercase;
     letter-spacing: 0.4px;
 }
 .vehicle-summary-box-val {
     font-size: 20px;
     font-weight: 700;
-    color: #0f172a;
+    color: #0c4a6e;
     margin-top: 5px;
     display: flex;
     align-items: baseline;
@@ -1560,18 +1886,19 @@ tbody tr:hover { background: #fbfdff; }
     min-width: 28px;
     height: 28px;
     padding: 0 7px;
-    border: 1px solid #d4d4d4;
+    border: 1px solid #c8dcf0;
     border-radius: 6px;
-    background: white;
+    background: #ffffff;
     font-size: 12px;
-    color: #333;
+    color: #1e293b;
     text-decoration: none;
     display: inline-flex;
     align-items: center;
     justify-content: center;
+    box-shadow: 0 1px 2px rgba(15, 23, 42, 0.03);
 }
-.pagination a:hover { background: #f0f4fa; border-color: #2f80ed; }
-.pagination .active { background: #2f80ed; border-color: #2f80ed; color: white; font-weight: bold; }
+.pagination a:hover { background: #f8fafc; border-color: #0284c7; }
+.pagination .active { background: #0284c7; border-color: #0284c7; color: white; font-weight: bold; }
 
 @media (max-width: 1100px) {
     .vehicle-summary-grid { grid-template-columns: repeat(2, 1fr); }
@@ -1684,6 +2011,9 @@ tbody tr:hover { background: #fbfdff; }
             <a href="<?php echo e(reportUrl(['download' => 'pdf'])); ?>" class="btn btn-primary" data-download-choice title="Download the report as PDF or CSV">
                 📥 Download Report ▾
             </a>
+            <button type="button" class="btn btn-outline" onclick="openPlateReportModal()" title="Download a detailed report for one plate number">
+                🔎 Plate Report
+            </button>
             <button type="button" class="btn btn-outline" onclick="window.print()">
                 🖨️ Print Report
             </button>
@@ -1736,13 +2066,13 @@ tbody tr:hover { background: #fbfdff; }
                 <!-- Daily / Monthly Basis Filter (Same as Archive) -->
                 <div class="filter-pill" style="gap:6px;">
                     <input type="hidden" name="report_basis" id="reportBasis" value="<?php echo e($report_basis); ?>">
-                    <div style="display:inline-flex; background:#eef4fc; border:1px solid #c8dcf7; border-radius:18px; padding:2px; gap:3px;">
-                        <button type="button" id="btnBasisDaily" onclick="setReportBasis('daily')"
-                                style="border:none; height:28px; padding:0 14px; border-radius:16px; font-size:12px; font-weight:600; cursor:pointer; background:<?php echo $report_basis === 'daily' ? '#2f80ed' : 'transparent'; ?>; color:<?php echo $report_basis === 'daily' ? '#ffffff' : '#1769d3'; ?>;">
+                    <div style="display:inline-flex; background:#f0f6fc; border:1px solid #c8dcf0; border-radius:18px; padding:2px; gap:3px;">
+                        <button type="button" id="btnBasisDaily" data-keep-scroll="reportFilterForm" onclick="setReportBasis('daily')"
+                                style="border:none; height:28px; padding:0 14px; border-radius:16px; font-size:12px; font-weight:600; cursor:pointer; background:<?php echo $report_basis === 'daily' ? '#0284c7' : 'transparent'; ?>; color:<?php echo $report_basis === 'daily' ? '#ffffff' : '#0369a1'; ?>;">
                             Daily
                         </button>
-                        <button type="button" id="btnBasisMonthly" onclick="setReportBasis('monthly')"
-                                style="border:none; height:28px; padding:0 14px; border-radius:16px; font-size:12px; font-weight:600; cursor:pointer; background:<?php echo $report_basis === 'monthly' ? '#2f80ed' : 'transparent'; ?>; color:<?php echo $report_basis === 'monthly' ? '#ffffff' : '#1769d3'; ?>;">
+                        <button type="button" id="btnBasisMonthly" data-keep-scroll="reportFilterForm" onclick="setReportBasis('monthly')"
+                                style="border:none; height:28px; padding:0 14px; border-radius:16px; font-size:12px; font-weight:600; cursor:pointer; background:<?php echo $report_basis === 'monthly' ? '#0284c7' : 'transparent'; ?>; color:<?php echo $report_basis === 'monthly' ? '#ffffff' : '#0369a1'; ?>;">
                             Monthly
                         </button>
                     </div>
@@ -1883,7 +2213,14 @@ tbody tr:hover { background: #fbfdff; }
                     </tr>
                 </thead>
                 <tbody>
-                    <?php foreach ($vehicleDaySummary['by_type'] as $vt): ?>
+                    <?php if (empty($vehicleDaySummary['by_type'])): ?>
+                        <tr>
+                            <td colspan="6" style="text-align:center; color:#64748b; padding:14px;">
+                                No vehicles detected for <?php echo e($periodDisplayLabel); ?>. Each vehicle type (Car, Motorcycle, Truck, ...) gets its own row once it is detected.
+                            </td>
+                        </tr>
+                    <?php endif; ?>
+                    <?php foreach ($pagedVehicleTypes as $vt): ?>
                         <tr>
                             <td style="font-weight:700; color:#1e293b;">
                                 <?php echo e(($vt['icon'] ?? '🚗') . ' ' . $vt['label']); ?>
@@ -1895,7 +2232,7 @@ tbody tr:hover { background: #fbfdff; }
                             <td><strong><?php echo (int)$vt['sessions']; ?></strong></td>
                         </tr>
                     <?php endforeach; ?>
-                    <tr style="background:#f1f5f9; font-weight:700;">
+                    <tr class="vehicle-summary-total" style="background:#f1f5f9; font-weight:700;">
                         <td style="color:#0f172a;">TOTAL</td>
                         <td><?php echo (int)$vehicleDaySummary['registered']['sessions']; ?></td>
                         <td><?php echo (int)$vehicleDaySummary['visitor']['sessions']; ?></td>
@@ -1906,6 +2243,7 @@ tbody tr:hover { background: #fbfdff; }
                 </tbody>
             </table>
         </div>
+        <?php echo reportPagerHtml('vp', $vehicleTypePage, $vehicleTypePages); ?>
     </section>
 
     <!-- =====================================================
@@ -1946,7 +2284,7 @@ tbody tr:hover { background: #fbfdff; }
                             </td>
                         </tr>
                     <?php else: ?>
-                        <?php foreach ($activePeriodGuardsList as $wg): ?>
+                        <?php foreach ($pagedPeriodGuards as $wg): ?>
                             <?php
                                 $isOnline = ($wg['login_status'] === 'Active');
                                 $partnersStr = !empty($wg['partners']) ? implode(', ', $wg['partners']) : 'Solo / None recorded';
@@ -1989,6 +2327,7 @@ tbody tr:hover { background: #fbfdff; }
                 </tbody>
             </table>
         </div>
+        <?php echo reportPagerHtml('gp', $guardPage, $guardPages); ?>
     </section>
 
     <!-- =====================================================
@@ -1998,20 +2337,26 @@ tbody tr:hover { background: #fbfdff; }
         <div class="section-top">
             <div>
                 <div class="section-title">
-                    <span>&#128452; Data Archived by Security Guards &amp; Vehicle Status Report</span>
+                    <span>&#128452; Vehicle Status Report &amp; Data Archived</span>
                     <span class="badge-pill"><?php echo $totalArchRows; ?> Record(s)</span>
                 </div>
                 <div class="section-subtitle">
-                    Looked up by the date archived (latest first). Includes database <strong>Inside / Outside</strong> status and <strong>Time In – Time Out</strong> hour range filtering.
+                    <?php if ($dataScope === 'archived'): ?>
+                        Archived logs only, looked up by the date archived (latest first).
+                    <?php else: ?>
+                        Active vehicle logs only, latest first.
+                    <?php endif; ?>
+                    Includes <strong>Inside / Outside</strong> status and <strong>Time In – Time Out</strong> hour range filtering.
                 </div>
             </div>
 
-            <div class="scope-tabs">
-                <a href="<?php echo e(reportUrl(['scope' => 'archived', 'ap' => 1])); ?>" class="scope-tab <?php echo $dataScope === 'archived' ? 'active' : ''; ?>">
-                    Archived Data Only (<?php echo count($filteredArchivedSessions); ?>)
+            <div class="scope-tabs" data-active="<?php echo $dataScope === 'archived' ? 'archived' : 'active'; ?>">
+                <span class="scope-glider" aria-hidden="true"></span>
+                <a href="<?php echo e(reportUrl(['scope' => null, 'ap' => 1])); ?>" class="scope-tab <?php echo $dataScope === 'active' ? 'active' : ''; ?>" data-scope="active">
+                    <span>Active Logs</span> <span class="scope-tab-count">(<?php echo count($filteredActiveSessions); ?>)</span>
                 </a>
-                <a href="<?php echo e(reportUrl(['scope' => 'all', 'ap' => 1])); ?>" class="scope-tab <?php echo $dataScope === 'all' ? 'active' : ''; ?>">
-                    All Logs (Active + Archived) (<?php echo count($allCombinedSessions); ?>)
+                <a href="<?php echo e(reportUrl(['scope' => 'archived', 'ap' => 1])); ?>" class="scope-tab <?php echo $dataScope === 'archived' ? 'active' : ''; ?>" data-scope="archived">
+                    <span>Archived Data</span> <span class="scope-tab-count">(<?php echo count($filteredArchivedSessions); ?>)</span>
                 </a>
             </div>
         </div>
@@ -2020,17 +2365,17 @@ tbody tr:hover { background: #fbfdff; }
             <table>
                 <thead>
                     <tr>
-                        <th style="width:42px;">#</th>
-                        <th>Archived / Handled By</th>
-                        <th>Plate Number</th>
-                        <th>Vehicle Type</th>
-                        <th>Category</th>
-                        <th>Log Date</th>
-                        <th>Time In</th>
-                        <th>Time Out</th>
-                        <th>Entries / Exits</th>
-                        <th>Status (DB)</th>
-                        <th>Date Archived</th>
+                        <th style="width:44px;">#</th>
+                        <th style="min-width:150px;">Archived / Handled By</th>
+                        <th style="min-width:110px;">Plate Number</th>
+                        <th style="min-width:100px;">Vehicle Type</th>
+                        <th style="min-width:90px;">Category</th>
+                        <th style="min-width:90px;">Log Date</th>
+                        <th style="min-width:80px;">Time In</th>
+                        <th style="min-width:80px;">Time Out</th>
+                        <th style="min-width:105px;">Entries / Exits</th>
+                        <th style="min-width:85px;">Status</th>
+                        <th style="min-width:130px;">Date Archived</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -2109,7 +2454,7 @@ tbody tr:hover { background: #fbfdff; }
                 </div>
             </div>
 
-            <form method="GET" action="report.php" style="display:flex; align-items:center; gap:8px;">
+            <form method="GET" action="report.php" id="auditFilterForm" style="display:flex; align-items:center; gap:8px;">
                 <input type="hidden" name="report_basis" value="<?php echo e($report_basis); ?>">
                 <input type="hidden" name="report_date" value="<?php echo e($report_date); ?>">
                 <input type="hidden" name="report_month" value="<?php echo e($report_month); ?>">
@@ -2126,7 +2471,7 @@ tbody tr:hover { background: #fbfdff; }
                         <option value="Duty" <?php echo $auditType === 'Duty' ? 'selected' : ''; ?>>Duty Shifts</option>
                         <option value="Archive" <?php echo $auditType === 'Archive' ? 'selected' : ''; ?>>Archive Operations</option>
                         <optgroup label="By Module">
-                            <?php foreach (['Login & Logout', 'Forgot Password', 'Duty Roster', 'Visitor Monitoring', 'Logs', 'Visitor Logs', 'Registered Logs', 'Registered Vehicles', 'Security Guard', 'Dashboard Cameras', 'Profile', 'System Settings', 'Backup & Retrieve', 'System (Auto-Archive)'] as $moduleOption): ?>
+                            <?php foreach (REPORT_MODULES as $moduleOption): ?>
                                 <option value="<?php echo e('module:' . $moduleOption); ?>" <?php echo $auditType === 'module:' . $moduleOption ? 'selected' : ''; ?>><?php echo e($moduleOption); ?></option>
                             <?php endforeach; ?>
                         </optgroup>
@@ -2199,7 +2544,244 @@ tbody tr:hover { background: #fbfdff; }
         <?php endif; ?>
     </section>
 
+    <!-- =====================================================
+         SECTION 4: EXIT WITHOUT ENTRY LOG
+         Vehicles the Exit Cam read leaving that were never logged IN
+    ====================================================== -->
+    <section class="section-card" id="liveReportExitAlerts" data-live>
+        <div class="section-top">
+            <div>
+                <div class="section-title">
+                    <span>&#128680; Exit Without Entry Log</span>
+                    <span class="badge-pill"><?php echo count($exitAlertLog); ?> Alert(s)</span>
+                    <?php if ($exitAlertNew > 0): ?>
+                        <span class="badge-pill" style="background:#fee2e2; color:#991b1b; border:1px solid #fca5a5;"><?php echo (int)$exitAlertNew; ?> Not Acknowledged</span>
+                    <?php endif; ?>
+                </div>
+                <div class="section-subtitle">
+                    Vehicles the Exit Cam read leaving that were never logged IN at the entrance, and how the guard on duty handled each one
+                </div>
+            </div>
+        </div>
+
+        <div class="table-wrapper">
+            <table>
+                <thead>
+                    <tr>
+                        <th style="width:44px;">#</th>
+                        <th style="width:165px;">Date &amp; Time</th>
+                        <th>Plate Number</th>
+                        <th>Vehicle</th>
+                        <th>Camera</th>
+                        <th>Status</th>
+                        <th>Acknowledged By</th>
+                        <th>Guard's Note</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php
+                    $exitPerPage = REPORT_ROWS_PER_PAGE;
+                    $exitPages = max(1, (int)ceil(count($exitAlertLog) / $exitPerPage));
+                    $exitPage = min($exitPages, max(1, (int)($_GET['ep'] ?? 1)));
+                    $pagedExitAlerts = array_slice($exitAlertLog, ($exitPage - 1) * $exitPerPage, $exitPerPage);
+                    ?>
+                    <?php if (empty($pagedExitAlerts)): ?>
+                        <tr>
+                            <td colspan="8" class="empty-cell">
+                                No vehicle exited without an entry record in this period.
+                            </td>
+                        </tr>
+                    <?php else: ?>
+                        <?php foreach ($pagedExitAlerts as $n => $ea): ?>
+                            <?php
+                            $eaAcked = ($ea['status'] ?? 'New') === 'Acknowledged';
+                            $eaKind = ($ea['vehicle_category'] ?? '') === 'Unknown' ? 'Unregistered' : (string)$ea['vehicle_category'];
+                            ?>
+                            <tr>
+                                <td><?php echo ($exitPage - 1) * $exitPerPage + $n + 1; ?></td>
+                                <td style="color:#475569; font-size:12px; white-space:nowrap;"><?php echo e(formatDateTime($ea['detected_at'])); ?></td>
+                                <td><?php echo secsysClickablePlateHtml((string)$ea['plate_number'], ['alert_id' => (int)$ea['id']]); ?></td>
+                                <td><?php echo e($eaKind . (!empty($ea['vehicle_type']) ? ' · ' . $ea['vehicle_type'] : '')); ?></td>
+                                <td><?php echo e($ea['camera_name'] ?: 'Exit Cam'); ?></td>
+                                <td>
+                                    <?php if ($eaAcked): ?>
+                                        <span class="badge-pill" style="background:#dcfce7; color:#166534; border:1px solid #86efac;">Acknowledged</span>
+                                    <?php else: ?>
+                                        <span class="badge-pill" style="background:#fee2e2; color:#991b1b; border:1px solid #fca5a5;">Not Acknowledged</span>
+                                    <?php endif; ?>
+                                </td>
+                                <td>
+                                    <?php if ($eaAcked): ?>
+                                        <div style="font-weight:600; color:#1e293b;"><?php echo e($ea['acknowledged_label']); ?></div>
+                                        <div style="font-size:11.5px; color:#64748b;"><?php echo e(formatDateTime($ea['acknowledged_at'])); ?></div>
+                                    <?php else: ?>
+                                        <span style="color:#94a3b8;">—</span>
+                                    <?php endif; ?>
+                                </td>
+                                <td style="color:#334155; line-height:1.4; max-width:260px; white-space:normal;"><?php echo $ea['ack_note'] !== null && $ea['ack_note'] !== '' ? e($ea['ack_note']) : '<span style="color:#94a3b8;">—</span>'; ?></td>
+                            </tr>
+                        <?php endforeach; ?>
+                    <?php endif; ?>
+                </tbody>
+            </table>
+        </div>
+
+        <?php if ($exitPages > 1): ?>
+            <div class="pagination">
+                <?php if ($exitPage > 1): ?>
+                    <a href="<?php echo e(reportUrl(['ep' => $exitPage - 1])); ?>">&lsaquo;</a>
+                <?php endif; ?>
+                <?php for ($p = 1; $p <= $exitPages; $p++): ?>
+                    <?php if ($p === $exitPage): ?>
+                        <span class="active"><?php echo $p; ?></span>
+                    <?php else: ?>
+                        <a href="<?php echo e(reportUrl(['ep' => $p])); ?>"><?php echo $p; ?></a>
+                    <?php endif; ?>
+                <?php endfor; ?>
+                <?php if ($exitPage < $exitPages): ?>
+                    <a href="<?php echo e(reportUrl(['ep' => $exitPage + 1])); ?>">&rsaquo;</a>
+                <?php endif; ?>
+            </div>
+        <?php endif; ?>
+    </section>
+
 </main>
+
+<!-- =====================================================
+     PLATE REPORT WINDOW (detailed report for one plate)
+====================================================== -->
+<?php require_once __DIR__ . '/app/plate_report.php'; $knownPlates = secsysPlateReportKnownPlates($conn); ?>
+<div class="plate-report-backdrop" id="plateReportModal" role="dialog" aria-modal="true" aria-labelledby="plateReportTitle">
+    <form class="plate-report-box" onsubmit="return downloadPlateReport(event)" autocomplete="off">
+        <div class="plate-report-head">
+            <div class="plate-report-title" id="plateReportTitle">🔎 Plate Report</div>
+            <button type="button" class="plate-report-close" onclick="closePlateReportModal()" aria-label="Close">&times;</button>
+        </div>
+
+        <p class="plate-report-hint">
+            Download everything recorded for one plate number: vehicle details, entries and exits (active and archived),
+            visits with time inside, exit-without-entry warnings and audit trail mentions.
+        </p>
+
+        <label class="plate-report-label" for="plateReportInput">Plate Number</label>
+        <input type="text" id="plateReportInput" class="plate-report-input" list="plateReportList"
+               placeholder="Type or pick a plate, e.g. NA16155" maxlength="30" required>
+        <datalist id="plateReportList">
+            <?php foreach ($knownPlates as $kp): ?>
+                <option value="<?php echo e($kp); ?>"></option>
+            <?php endforeach; ?>
+        </datalist>
+
+        <div class="plate-report-label">Date Range</div>
+        <div class="plate-report-options">
+            <label><input type="radio" name="plate_range" value="period" checked> <?php echo e($periodDisplayLabel); ?> (this report)</label>
+            <label><input type="radio" name="plate_range" value="all"> All dates</label>
+        </div>
+
+        <div class="plate-report-label">File Type</div>
+        <div class="plate-report-options">
+            <label><input type="radio" name="plate_format" value="pdf" checked> PDF</label>
+            <label><input type="radio" name="plate_format" value="csv"> CSV (Excel)</label>
+        </div>
+
+        <div class="plate-report-error" id="plateReportError" hidden></div>
+
+        <div class="plate-report-actions">
+            <button type="button" class="btn btn-outline" onclick="closePlateReportModal()">Cancel</button>
+            <button type="submit" class="btn btn-primary">📥 Download Plate Report</button>
+        </div>
+    </form>
+</div>
+
+<style>
+.plate-report-backdrop {
+    display: none; position: fixed; inset: 0; z-index: 10040; background: rgba(15, 23, 42, 0.55);
+    align-items: center; justify-content: center; padding: 16px;
+}
+.plate-report-backdrop.open { display: flex; }
+.plate-report-box {
+    background: #fff; border-radius: 16px; width: 100%; max-width: 460px; max-height: calc(100vh - 32px); overflow-y: auto;
+    padding: 18px 20px 16px; box-shadow: 0 20px 40px rgba(0, 0, 0, 0.25);
+    box-sizing: border-box; overflow-x: hidden;
+}
+.plate-report-box * { box-sizing: border-box; }
+.plate-report-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 6px; }
+.plate-report-title { font-size: 17px; font-weight: 700; color: #0f172a; }
+.plate-report-close { background: none; border: none; font-size: 24px; line-height: 1; color: #64748b; cursor: pointer; }
+.plate-report-hint { font-size: 12.5px; color: #475569; line-height: 1.45; margin: 0 0 12px; }
+.plate-report-label { display: block; font-size: 12.5px; font-weight: 700; color: #1e293b; margin: 10px 0 6px; }
+.plate-report-input {
+    width: 100%; height: 40px; border: 1px solid #cbd5e1; border-radius: 8px; padding: 0 12px;
+    font-size: 14px; letter-spacing: 0.5px; text-transform: uppercase;
+}
+.plate-report-input:focus { outline: none; border-color: #2f80ed; box-shadow: 0 0 0 3px rgba(47, 128, 237, 0.15); }
+.plate-report-options { display: flex; flex-wrap: wrap; gap: 8px 18px; font-size: 13px; color: #1e293b; }
+.plate-report-options label { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+.plate-report-error {
+    margin-top: 12px; background: #fef2f2; color: #991b1b; border: 1px solid #fecaca; border-radius: 8px;
+    padding: 8px 10px; font-size: 12.5px;
+}
+.plate-report-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+@media print { .plate-report-backdrop { display: none !important; } }
+</style>
+
+<script>
+function openPlateReportModal()
+{
+    const modal = document.getElementById("plateReportModal");
+    const input = document.getElementById("plateReportInput");
+    // Start from the plate in the search box, if any
+    const search = document.querySelector('#reportFilterForm input[name="search"]');
+    if (search && search.value.trim() && !input.value.trim()) {
+        input.value = search.value.trim().toUpperCase();
+    }
+    document.getElementById("plateReportError").hidden = true;
+    modal.classList.add("open");
+    setTimeout(function () { input.focus(); input.select(); }, 60);
+}
+
+function closePlateReportModal()
+{
+    document.getElementById("plateReportModal").classList.remove("open");
+}
+
+function downloadPlateReport(event)
+{
+    event.preventDefault();
+    const plate = document.getElementById("plateReportInput").value.trim();
+    const err = document.getElementById("plateReportError");
+    if (!/[A-Za-z0-9]/.test(plate)) {
+        err.textContent = "Please enter a plate number.";
+        err.hidden = false;
+        return false;
+    }
+    err.hidden = true;
+    const range = document.querySelector('input[name="plate_range"]:checked').value;
+    const format = document.querySelector('input[name="plate_format"]:checked').value;
+
+    // Keep the report's current period (date / month), then ask for this plate
+    const params = new URLSearchParams(window.location.search);
+    ["search", "status", "category", "time_from", "time_to", "sort", "dir", "scope", "audit_type", "ap", "tp", "ep", "gp", "vp"].forEach(function (k) { params.delete(k); });
+    params.set("download", "plate");
+    params.set("plate", plate);
+    params.set("range", range);
+    if (format === "csv") {
+        params.set("format", "csv");
+    } else {
+        params.delete("format");
+    }
+    window.location.href = "report.php?" + params.toString();
+    setTimeout(closePlateReportModal, 400);
+    return false;
+}
+
+document.addEventListener("keydown", function (event) {
+    if (event.key === "Escape") closePlateReportModal();
+});
+document.getElementById("plateReportModal").addEventListener("click", function (event) {
+    if (event.target === this) closePlateReportModal();
+});
+</script>
 
 <script>
 function setReportBasis(basis) {
@@ -2214,19 +2796,21 @@ function setReportBasis(basis) {
     if (basis === 'monthly') {
         if (dailyBox) dailyBox.style.display = 'none';
         if (monthlyBox) monthlyBox.style.display = 'inline-flex';
-        if (btnDaily) { btnDaily.style.background = 'transparent'; btnDaily.style.color = '#1769d3'; }
-        if (btnMonthly) { btnMonthly.style.background = '#2f80ed'; btnMonthly.style.color = '#ffffff'; }
+        if (btnDaily) { btnDaily.style.background = 'transparent'; btnDaily.style.color = '#0369a1'; }
+        if (btnMonthly) { btnMonthly.style.background = '#0284c7'; btnMonthly.style.color = '#ffffff'; }
     } else {
         if (dailyBox) dailyBox.style.display = 'inline-flex';
         if (monthlyBox) monthlyBox.style.display = 'none';
-        if (btnDaily) { btnDaily.style.background = '#2f80ed'; btnDaily.style.color = '#ffffff'; }
-        if (btnMonthly) { btnMonthly.style.background = 'transparent'; btnMonthly.style.color = '#1769d3'; }
+        if (btnDaily) { btnDaily.style.background = '#0284c7'; btnDaily.style.color = '#ffffff'; }
+        if (btnMonthly) { btnMonthly.style.background = 'transparent'; btnMonthly.style.color = '#0369a1'; }
     }
 
     const form = document.getElementById('reportFilterForm');
     if (form) form.submit();
 }
 </script>
+
+<script src="assets/js/keep_scroll.js?v=<?php echo (int)@filemtime(__DIR__ . '/assets/js/keep_scroll.js'); ?>"></script>
 
 <script>window.AUTO_REFRESH_SECONDS = 5;</script>
 <!-- =====================================================
@@ -2655,7 +3239,7 @@ function setReportBasis(basis) {
                     .then(function (r) { return r.text(); })
                     .then(function (html) {
                         const doc = new DOMParser().parseFromString(html, "text/html");
-                        ["liveReportSummary", "liveReportPlateSearch", "liveReportVehicleSummary", "liveReportSection1", "liveReportSection2", "liveReportSection3"].forEach(function (id) {
+                        ["liveReportSummary", "liveReportPlateSearch", "liveReportVehicleSummary", "liveReportSection1", "liveReportSection2", "liveReportSection3", "liveReportExitAlerts"].forEach(function (id) {
                             const cur = document.getElementById(id);
                             const next = doc.getElementById(id);
                             if (cur && next) {
@@ -2667,12 +3251,218 @@ function setReportBasis(basis) {
             }, 300);
         });
     }
+
+    // Keep Section 2 from shrinking when its list is swapped (Active <-> Archived,
+    // or another page). A shorter list made the page shorter, the browser pulled
+    // the page up, and the tabs jumped on screen. The card keeps the height of the
+    // tallest list shown so far, so the tabs stay exactly where they are.
+    function lockSection2Height(section) {
+        if (!section) return;
+        const current = section.offsetHeight;
+        const locked = parseFloat(section.style.minHeight) || 0;
+        if (current > locked) {
+            section.style.minHeight = current + "px";
+        }
+    }
+
+    // In-place smooth toggle for Scope Tabs (Active Logs vs Archived Data) in Section 2
+    let isScopeSwitching = false;
+    document.addEventListener("click", function (e) {
+        const tab = e.target.closest(".scope-tab");
+        if (!tab) return;
+
+        const container = tab.closest(".scope-tabs");
+        const section = tab.closest("#liveReportSection2") || document.getElementById("liveReportSection2");
+        if (!section || !container) return;
+
+        const href = tab.getAttribute("href");
+        if (!href || tab.classList.contains("active") || isScopeSwitching) {
+            e.preventDefault();
+            return;
+        }
+
+        e.preventDefault();
+        isScopeSwitching = true;
+        lockSection2Height(section);
+
+        const targetScope = tab.getAttribute("data-scope") || (href.indexOf("scope=archived") !== -1 ? "archived" : "active");
+
+        // 1. Immediately animate sliding glider and active tab highlight smoothly
+        container.setAttribute("data-active", targetScope);
+        const allTabs = container.querySelectorAll(".scope-tab");
+        allTabs.forEach(function (t) { t.classList.remove("active"); });
+        tab.classList.add("active");
+
+        const tableWrapper = section.querySelector(".table-wrapper");
+        if (tableWrapper) {
+            tableWrapper.classList.add("scope-loading");
+        }
+
+        fetch(href, { credentials: "same-origin", cache: "no-store" })
+            .then(function (r) { return r.text(); })
+            .then(function (html) {
+                const doc = new DOMParser().parseFromString(html, "text/html");
+                const nextSection = doc.getElementById("liveReportSection2");
+                if (nextSection && section) {
+                    // Update subtitle & badge pill
+                    const curSubtitle = section.querySelector(".section-subtitle");
+                    const nextSubtitle = nextSection.querySelector(".section-subtitle");
+                    if (curSubtitle && nextSubtitle) {
+                        curSubtitle.innerHTML = nextSubtitle.innerHTML;
+                    }
+                    const curBadge = section.querySelector(".section-title .badge-pill");
+                    const nextBadge = nextSection.querySelector(".section-title .badge-pill");
+                    if (curBadge && nextBadge) {
+                        curBadge.innerHTML = nextBadge.innerHTML;
+                    }
+
+                    // Update counts in tabs without destroying the .scope-tabs DOM container
+                    const nextTabs = nextSection.querySelectorAll(".scope-tab");
+                    nextTabs.forEach(function (nt) {
+                        const sc = nt.getAttribute("data-scope");
+                        const curCount = section.querySelector('.scope-tab[data-scope="' + sc + '"] .scope-tab-count');
+                        const nextCount = nt.querySelector(".scope-tab-count");
+                        if (curCount && nextCount) {
+                            curCount.textContent = nextCount.textContent;
+                        }
+                    });
+
+                    // Update table content with smooth fade
+                    const curTableWrapper = section.querySelector(".table-wrapper");
+                    const nextTableWrapper = nextSection.querySelector(".table-wrapper");
+                    if (curTableWrapper && nextTableWrapper) {
+                        curTableWrapper.innerHTML = nextTableWrapper.innerHTML;
+                        curTableWrapper.classList.remove("scope-loading");
+                        curTableWrapper.classList.add("section-swap-animating");
+                        setTimeout(function () {
+                            curTableWrapper.classList.remove("section-swap-animating");
+                        }, 250);
+                    }
+
+                    // Update pagination
+                    let curPagination = section.querySelector(".pagination");
+                    const nextPagination = nextSection.querySelector(".pagination");
+                    if (nextPagination) {
+                        if (curPagination) {
+                            curPagination.innerHTML = nextPagination.innerHTML;
+                        } else {
+                            section.insertAdjacentHTML("beforeend", nextPagination.outerHTML);
+                        }
+                    } else if (curPagination) {
+                        curPagination.remove();
+                    }
+                }
+                const nextSummary = doc.getElementById("liveReportSummary");
+                const curSummary = document.getElementById("liveReportSummary");
+                if (nextSummary && curSummary) {
+                    curSummary.innerHTML = nextSummary.innerHTML;
+                }
+                const scopeMatch = href.match(/[?&]scope=([^&#]*)/);
+                const scopeVal = scopeMatch ? decodeURIComponent(scopeMatch[1]) : "";
+                document.querySelectorAll('input[name="scope"]').forEach(function (inp) {
+                    inp.value = scopeVal;
+                });
+                if (window.history && window.history.pushState) {
+                    window.history.pushState(null, "", href);
+                }
+            })
+            .catch(function () {
+                window.location.href = href;
+            })
+            .finally(function () {
+                if (tableWrapper) {
+                    tableWrapper.classList.remove("scope-loading");
+                }
+                isScopeSwitching = false;
+            });
+    });
+
+    // In-place pagination for Section 2 (Vehicle Status Report & Data Archived)
+    document.addEventListener("click", function (e) {
+        const pageLink = e.target.closest("#liveReportSection2 .pagination a");
+        if (!pageLink) return;
+
+        const href = pageLink.getAttribute("href");
+        if (!href) return;
+
+        e.preventDefault();
+        const section = document.getElementById("liveReportSection2");
+        if (!section) {
+            window.location.href = href;
+            return;
+        }
+        lockSection2Height(section);
+
+        const tableWrapper = section.querySelector(".table-wrapper");
+        if (tableWrapper) {
+            tableWrapper.classList.add("scope-loading");
+        }
+
+        fetch(href, { credentials: "same-origin", cache: "no-store" })
+            .then(function (r) { return r.text(); })
+            .then(function (html) {
+                const doc = new DOMParser().parseFromString(html, "text/html");
+                const nextSection = doc.getElementById("liveReportSection2");
+                if (nextSection && section) {
+                    const curTableWrapper = section.querySelector(".table-wrapper");
+                    const nextTableWrapper = nextSection.querySelector(".table-wrapper");
+                    if (curTableWrapper && nextTableWrapper) {
+                        curTableWrapper.innerHTML = nextTableWrapper.innerHTML;
+                        curTableWrapper.classList.remove("scope-loading");
+                        curTableWrapper.classList.add("section-swap-animating");
+                        setTimeout(function () {
+                            curTableWrapper.classList.remove("section-swap-animating");
+                        }, 250);
+                    }
+                    let curPagination = section.querySelector(".pagination");
+                    const nextPagination = nextSection.querySelector(".pagination");
+                    if (nextPagination) {
+                        if (curPagination) {
+                            curPagination.innerHTML = nextPagination.innerHTML;
+                        } else {
+                            section.insertAdjacentHTML("beforeend", nextPagination.outerHTML);
+                        }
+                    } else if (curPagination) {
+                        curPagination.remove();
+                    }
+                }
+                if (window.history && window.history.pushState) {
+                    window.history.pushState(null, "", href);
+                }
+            })
+            .catch(function () {
+                window.location.href = href;
+            })
+            .finally(function () {
+                if (tableWrapper) {
+                    tableWrapper.classList.remove("scope-loading");
+                }
+            });
+    });
+
+    // Seamless browser back/forward navigation
+    window.addEventListener("popstate", function () {
+        fetch(window.location.href, { credentials: "same-origin", cache: "no-store" })
+            .then(function (r) { return r.text(); })
+            .then(function (html) {
+                const doc = new DOMParser().parseFromString(html, "text/html");
+                ["liveReportSummary", "liveReportPlateSearch", "liveReportVehicleSummary", "liveReportSection1", "liveReportSection2", "liveReportSection3", "liveReportExitAlerts"].forEach(function (id) {
+                    const cur = document.getElementById(id);
+                    const next = doc.getElementById(id);
+                    if (cur && next) {
+                        cur.innerHTML = next.innerHTML;
+                    }
+                });
+            })
+            .catch(function () {});
+    });
 })();
 </script>
 
 <script src="assets/js/download_format.js?v=<?php echo (int)@filemtime(__DIR__ . '/assets/js/download_format.js'); ?>"></script>
 <script src="assets/js/auto_refresh.js?v=<?php echo (int)@filemtime(__DIR__ . '/assets/js/auto_refresh.js'); ?>"></script>
 
+<script src="assets/js/logout_confirm.js?v=<?php echo (int)@filemtime(__DIR__ . '/assets/js/logout_confirm.js'); ?>"></script>
 </body>
 </html>
 <?php $conn->close(); ?>

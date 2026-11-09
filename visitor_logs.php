@@ -571,7 +571,7 @@ $archivedLogs = secsysFilterRowsBySearch($archivedLogs, $archiveSearch, ["plate_
 /* =========================================================
    PAGINATION SETUP (ACTIVE LOGS)
 ========================================================= */
-$itemsPerPage = 8;
+$itemsPerPage = 7;  // rows per page in every log table (the rest go to the next page)
 $page = isset($_GET['p']) ? max(1, (int)$_GET['p']) : 1;
 $totalRecords = count($filteredActiveLogs);
 $totalPages = max(1, ceil($totalRecords / $itemsPerPage));
@@ -673,28 +673,28 @@ body {
    CONTROLS & ACTION BAR
 ========================================================= */
 .action-card {
-    background: #ffffff; border: 1px solid #dedede; border-radius: 18px;
-    padding: 14px 18px; box-shadow: 0 2px 4px rgba(0,0,0,0.06);
+    background: #f0f6fc; border: 1px solid #c8dcf0; border-radius: 18px;
+    padding: 14px 18px; box-shadow: 0 2px 6px rgba(15, 23, 42, 0.05);
     margin-bottom: 18px; display: flex; flex-direction: column; gap: 12px;
 }
 .toolbar-top { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; }
 .filter-group { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .search-input-box {
-    display: flex; align-items: center; background: #f7f9fc; border: 1px solid #cfd9e8;
+    display: flex; align-items: center; background: #ffffff; border: 1px solid #c8dcf0;
     border-radius: 20px; padding: 0 12px; height: 36px; min-width: 220px;
 }
 .search-input-box input { border: none; outline: none; background: transparent; font-size: 13px; width: 100%; color: #111; }
 .custom-select {
-    height: 36px; border: 1px solid #cfd9e8; border-radius: 18px; padding: 0 12px;
-    background: #f7f9fc; font-size: 13px; color: #333; outline: none; cursor: pointer;
+    height: 36px; border: 1px solid #c8dcf0; border-radius: 18px; padding: 0 12px;
+    background: #ffffff; font-size: 13px; color: #333; outline: none; cursor: pointer;
 }
-.custom-select:focus { border-color: #2f80ed; }
+.custom-select:focus { border-color: #0284c7; }
 .btn-group { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .btn { height: 36px; padding: 0 16px; border: none; border-radius: 18px; font-size: 13px; font-weight: 500; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; gap: 6px; text-decoration: none; transition: background 0.2s ease, opacity 0.2s ease; box-sizing: border-box; }
-.btn-primary { background: #2f80ed; color: white; }
-.btn-primary:hover { background: #176bd1; }
-.btn-secondary { background: #ffffff; color: #2f80ed; border: 1px solid #2f80ed; }
-.btn-secondary:hover { background: #edf5ff; }
+.btn-primary { background: #0284c7; color: white; }
+.btn-primary:hover { background: #0369a1; }
+.btn-secondary { background: #ffffff; color: #0284c7; border: 1px solid #0284c7; }
+.btn-secondary:hover { background: #eff6ff; }
 .btn-archive { background: #6c5ce7; color: white; }
 .btn-archive:hover { background: #5b4cc4; }
 .btn-danger { background: #e74c3c; color: white; }
@@ -707,18 +707,19 @@ body {
    TABLE CARD
 ========================================================= */
 .table-card {
-    width: 100%; background: #ffffff; border: 1px solid #dedede;
-    border-radius: 20px; box-shadow: 0 3px 6px rgba(0,0,0,0.06);
+    width: 100%; background: #f0f6fc; border: 1px solid #c8dcf0;
+    border-radius: 20px; box-shadow: 0 2px 6px rgba(15, 23, 42, 0.05);
     padding: 18px 20px; margin-bottom: 20px; overflow: hidden;
 }
-.table-header-bar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; padding-bottom: 10px; border-bottom: 1px solid #eee; flex-wrap: wrap; gap: 8px; }
-.table-title { font-size: 16px; font-weight: 600; color: #222; display: flex; align-items: center; gap: 8px; }
-.badge-count { background: #edf5ff; color: #2f80ed; font-size: 11px; padding: 2px 8px; border-radius: 12px; font-weight: bold; }
+.table-header-bar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; padding-bottom: 10px; border-bottom: 1px solid #c8dcf0; flex-wrap: wrap; gap: 8px; }
+.table-title { font-size: 16px; font-weight: 600; color: #0369a1; display: flex; align-items: center; gap: 8px; }
+.badge-count { background: #ffffff; color: #0284c7; border: 1px solid #c8dcf0; font-size: 11px; padding: 2px 8px; border-radius: 12px; font-weight: bold; }
 .table-wrapper { width: 100%; overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; font-size: 13px; text-align: center; }
-thead th { text-align: center; font-weight: 600; padding: 10px 12px; border-bottom: 2px solid #e0e0e0; background: #fafbfc; color: #444; white-space: nowrap; vertical-align: middle; }
-tbody td { padding: 11px 12px; border-bottom: 1px solid #f0f0f0; white-space: nowrap; vertical-align: middle; text-align: center; }
-tbody tr:hover { background: #fbfdff; }
+thead th { text-align: center; font-weight: 600; padding: 10px 12px; border-bottom: 2px solid #c8dcf0; background: #f8fafc; color: #0369a1; white-space: nowrap; vertical-align: middle; }
+tbody tr { background: #ffffff; }
+tbody td { background: #ffffff; color: #1e293b; padding: 11px 12px; border-bottom: 1px solid #e2edf6; white-space: nowrap; vertical-align: middle; text-align: center; }
+tbody tr:hover td { background: #f8fafc; }
 tbody tr:last-child td { border-bottom: none; }
 /* Long purposes (e.g. "Needs Review: ...") wrap instead of widening the table */
 tbody td.purpose-cell { white-space: normal; min-width: 130px; max-width: 220px; line-height: 1.35; }
@@ -1414,6 +1415,7 @@ document.addEventListener("keydown", function(e) {
 <script>window.AUTO_REFRESH_SECONDS = 5;</script>
 <script src="assets/js/auto_refresh.js?v=<?php echo (int)@filemtime(__DIR__ . '/assets/js/auto_refresh.js'); ?>"></script>
 
+<script src="assets/js/logout_confirm.js?v=<?php echo (int)@filemtime(__DIR__ . '/assets/js/logout_confirm.js'); ?>"></script>
 </body>
 </html>
 <?php $conn->close(); ?>

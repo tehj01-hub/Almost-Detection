@@ -104,6 +104,51 @@ class CameraModeTests(unittest.TestCase):
         self.apply()
         self.detector.handle_detection(dict(normalized='ABC1234'),self.detector.channels['entrance'])
         self.assertEqual(self.logs,['IN','OUT'])
+    def test_exit_without_entry_raises_one_guarded_alert(self):
+        self.cfg['camera_mode']='dual'
+        self.apply()
+        alerts=[]
+        state=dict(pending=False, similar_inside=False, recent_out=False)
+        class FakeConn:
+            def close(self): pass
+        ns.update(
+            EXIT_ALERT_REPEAT_SECONDS=600,
+            is_visitor_pending_or_suppressed=lambda p,**k:state['pending'],
+            similar_plate_inside=lambda p:state['similar_inside'],
+            is_plate_currently_inside=lambda p,**k:False,
+            get_db_connection=lambda:FakeConn(),
+            record_exit_without_entry=lambda conn,plate,info,**k:(alerts.append(plate) or dict(id=len(alerts),plate=plate,category='Unknown')),
+            attach_alert_image=lambda *a,**k:None,
+        )
+        ns['is_plate_recently_logged_in_db']=lambda *a,**k:state['recent_out']
+        self.detector._capture_vehicle=lambda *a,**k:None
+        self.detector.can_scan_plate=lambda plate,direction,use_cache=True:direction!='OUT'
+        exit_ch=self.detector.channels['exit']
+        try:
+            # Low-confidence read: no alarm
+            self.assertFalse(self.detector.handle_detection(dict(normalized='REV111',decision='NEEDS_REVIEW'),exit_ch))
+            # Just logged OUT and still in view: no alarm
+            state['recent_out']=True
+            self.assertFalse(self.detector.handle_detection(dict(normalized='LEFT111'),exit_ch))
+            state['recent_out']=False
+            # Misread of a vehicle that is inside: no alarm
+            state['similar_inside']=True
+            self.assertFalse(self.detector.handle_detection(dict(normalized='MIS111'),exit_ch))
+            state['similar_inside']=False
+            # Visitor still waiting for the guard's form: no alarm
+            state['pending']=True
+            self.assertFalse(self.detector.handle_detection(dict(normalized='PEN111'),exit_ch))
+            state['pending']=False
+            # Never came in: one alarm, not repeated while it stays in view
+            self.assertFalse(self.detector.handle_detection(dict(normalized='GHOST11',text='GHOST 11'),exit_ch))
+            self.assertFalse(self.detector.handle_detection(dict(normalized='GHOST11',text='GHOST 11'),exit_ch))
+            self.assertEqual(alerts,['GHOST 11'])
+            self.assertEqual(self.logs,[])
+        finally:
+            for k in ('EXIT_ALERT_REPEAT_SECONDS','is_visitor_pending_or_suppressed','similar_plate_inside',
+                      'is_plate_currently_inside','get_db_connection','record_exit_without_entry','attach_alert_image'):
+                ns.pop(k,None)
+            ns['is_plate_recently_logged_in_db']=lambda *a,**k:False
     def test_inside_vehicle_is_not_scanned_on_entrance_and_outside_vehicle_is_not_scanned_on_exit(self):
         self.cfg['camera_mode']='dual'
         self.apply()

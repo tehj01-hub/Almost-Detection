@@ -125,6 +125,314 @@ body {
 
 
 /* ---------------------------------------------------------
+   EYE-COMFORT LIGHT BLUE/SLATE TINT FOR MODULE CARDS
+   Ultra-soft #f0f6fc with crisp #ffffff table bodies, high
+   contrast #1e293b text, subtle #e2edf6 dividers, and gentle
+   #f8fafc hover to prevent chromatic glare and visual fatigue.
+--------------------------------------------------------- */
+
+/* Dashboard Activity Cards & Vehicle Cards (superadmin_dashboard.php) */
+.main .vehicle-card,
+.main .activity-card,
+.main .activity-cards,
+.main .admin-activity .activity-card,
+.main .admin-activity .activity-cards {
+    background: #f0f6fc !important;
+    border: 1px solid #c8dcf0 !important;
+    box-shadow: 0 2px 6px rgba(15, 23, 42, 0.05) !important;
+}
+
+/* Vehicle Logs & Registration Tables */
+.main #liveRegisteredLogs .table-card,
+.main .registered-log-card,
+.main .archive-registered-card,
+.main #liveRegisteredTable,
+.main #liveVisitorLogs .table-card,
+.main .visitor-log-card,
+.main .exit-alert-log-card,
+.main .archive-visitor-card,
+.main #liveVisitorTable {
+    background: #f0f6fc !important;
+    border: 1px solid #c8dcf0 !important;
+    box-shadow: 0 2px 6px rgba(15, 23, 42, 0.05) !important;
+}
+.main #liveRegisteredLogs .table-toolbar,
+.main .registered-log-card .table-toolbar,
+.main .archive-registered-card .archive-toolbar-card,
+.main #liveVisitorLogs .table-toolbar,
+.main .visitor-log-card .table-toolbar,
+.main .exit-alert-log-card .table-toolbar,
+.main .archive-visitor-card .archive-toolbar-card {
+    background: #ffffff !important;
+    border-bottom: 1px solid #c8dcf0 !important;
+}
+.main #liveRegisteredLogs .log-table th,
+.main .registered-log-card .log-table th,
+.main .archive-registered-card .log-table th,
+.main #liveVisitorLogs .log-table th,
+.main .visitor-log-card .log-table th,
+.main .exit-alert-log-card .log-table th,
+.main .archive-visitor-card .log-table th,
+.main #liveRegisteredTable table th,
+.main #liveVisitorTable table th {
+    background: #f8fafc !important;
+    border-bottom: 2px solid #c8dcf0 !important;
+    color: #0369a1 !important;
+}
+.main #liveRegisteredLogs .log-table tbody tr,
+.main .registered-log-card .log-table tbody tr,
+.main .archive-registered-card .log-table tbody tr,
+.main #liveVisitorLogs .log-table tbody tr,
+.main .visitor-log-card .log-table tbody tr,
+.main .exit-alert-log-card .log-table tbody tr,
+.main .archive-visitor-card .log-table tbody tr,
+.main #liveRegisteredTable table tbody tr,
+.main #liveVisitorTable table tbody tr {
+    background: #ffffff !important;
+}
+.main #liveRegisteredLogs .log-table td,
+.main .registered-log-card .log-table td,
+.main .archive-registered-card .log-table td,
+.main #liveVisitorLogs .log-table td,
+.main .visitor-log-card .log-table td,
+.main .exit-alert-log-card .log-table td,
+.main .archive-visitor-card .log-table td,
+.main #liveRegisteredTable table td,
+.main #liveVisitorTable table td {
+    background: #ffffff !important;
+    color: #1e293b !important;
+    border-bottom: 1px solid #e2edf6 !important;
+}
+.main #liveRegisteredLogs .log-table tbody tr:hover td,
+.main .registered-log-card .log-table tbody tr:hover td,
+.main .archive-registered-card .log-table tbody tr:hover td,
+.main #liveVisitorLogs .log-table tbody tr:hover td,
+.main .visitor-log-card .log-table tbody tr:hover td,
+.main .exit-alert-log-card .log-table tbody tr:hover td,
+.main .archive-visitor-card .log-table tbody tr:hover td,
+.main #liveRegisteredTable table tbody tr:hover td,
+.main #liveVisitorTable table tbody tr:hover td {
+    background: #f8fafc !important;
+}
+
+/* Security Guard Module: Stat Cards & Guard Roster Table */
+.main #liveGuardTable,
+.main #liveArchivedGuards,
+.main .stats-grid .stat-card,
+.main .stat-card {
+    background: #f0f6fc !important;
+    border: 1px solid #c8dcf0 !important;
+    box-shadow: 0 2px 6px rgba(15, 23, 42, 0.05) !important;
+}
+.main #liveGuardTable table th,
+.main #liveArchivedGuards table th {
+    background: #f8fafc !important;
+    border-bottom: 2px solid #c8dcf0 !important;
+    color: #0369a1 !important;
+}
+.main #liveGuardTable table tbody tr,
+.main #liveArchivedGuards table tbody tr {
+    background: #ffffff !important;
+}
+.main #liveGuardTable table td,
+.main #liveArchivedGuards table td {
+    background: #ffffff !important;
+    color: #1e293b !important;
+    border-bottom: 1px solid #e2edf6 !important;
+}
+.main #liveGuardTable table tbody tr:hover td,
+.main #liveArchivedGuards table tbody tr:hover td {
+    background: #f8fafc !important;
+}
+
+/* Security Information Module: Guard Info & Security Contacts */
+.main .shift-banner,
+.main #liveShiftBanner,
+.main .stats .stat,
+.main .stat,
+.main #liveStats .stat,
+.main #liveGuardInfo,
+.main #liveSecurityContacts {
+    background: #f0f6fc !important;
+    border: 1px solid #c8dcf0 !important;
+    box-shadow: 0 2px 6px rgba(15, 23, 42, 0.05) !important;
+}
+.main #liveGuardInfo .card-header,
+.main #liveSecurityContacts .card-header {
+    border-bottom: 1px solid #c8dcf0 !important;
+}
+.main #liveGuardInfo table th {
+    background: #f8fafc !important;
+    border-bottom: 2px solid #c8dcf0 !important;
+    color: #0369a1 !important;
+}
+.main #liveGuardInfo table tbody tr {
+    background: #ffffff !important;
+}
+.main #liveGuardInfo table td {
+    background: #ffffff !important;
+    color: #1e293b !important;
+    border-bottom: 1px solid #e2edf6 !important;
+}
+.main #liveGuardInfo table tbody tr:hover td {
+    background: #f8fafc !important;
+}
+.main #liveSecurityContacts .contact,
+.main #liveSecurityContacts .contact-card {
+    background: #ffffff !important;
+    border: 1px solid #c8dcf0 !important;
+    box-shadow: 0 1px 3px rgba(15, 23, 42, 0.04) !important;
+}
+
+/* Report Module: Summary Cards, Vehicle Summary & Report Sections */
+.main #liveReportSummary .summary-card,
+.main .summary-card,
+.main .section-card,
+.main .filter-card,
+.main #liveReportVehicleSummary,
+.main #liveReportSection1,
+.main #liveReportSection2,
+.main #liveReportSection3 {
+    background: #f0f6fc !important;
+    border: 1px solid #c8dcf0 !important;
+    box-shadow: 0 2px 6px rgba(15, 23, 42, 0.05) !important;
+}
+.main .section-card .section-top {
+    border-bottom: 1px solid #c8dcf0 !important;
+}
+.main #liveReportSection2 .section-top {
+    display: flex !important;
+    align-items: flex-start !important;
+    justify-content: space-between !important;
+    flex-wrap: nowrap !important;
+    gap: 16px !important;
+}
+.main #liveReportSection2 .section-top > div:first-child {
+    flex: 1 1 auto !important;
+    min-width: 0 !important;
+}
+.main #liveReportSection2 .scope-tabs,
+.main .scope-tabs {
+    position: relative !important;
+    display: inline-flex !important;
+    align-items: center !important;
+    width: 290px !important;
+    height: 38px !important;
+    background: #e2edf8 !important;
+    border: 1px solid #c8dcf0 !important;
+    border-radius: 20px !important;
+    padding: 3px !important;
+    box-sizing: border-box !important;
+    box-shadow: inset 0 1px 2px rgba(15, 23, 42, 0.05) !important;
+    flex-shrink: 0 !important;
+    align-self: flex-start !important;
+    margin-top: 2px !important;
+}
+.main .scope-glider {
+    position: absolute !important;
+    top: 3px !important;
+    bottom: 3px !important;
+    left: 3px !important;
+    width: calc((100% - 6px) / 2) !important;
+    background: #0284c7 !important;
+    border-radius: 16px !important;
+    box-shadow: 0 2px 6px rgba(2, 132, 199, 0.32) !important;
+    transition: transform 0.26s cubic-bezier(0.4, 0, 0.2, 1) !important;
+    pointer-events: none !important;
+    z-index: 1 !important;
+    will-change: transform !important;
+}
+.main .scope-tabs[data-active="active"] .scope-glider {
+    transform: translateX(0) !important;
+}
+.main .scope-tabs[data-active="archived"] .scope-glider {
+    transform: translateX(100%) !important;
+}
+.main .scope-tab {
+    position: relative !important;
+    z-index: 2 !important;
+    flex: 1 1 50% !important;
+    width: 50% !important;
+    height: 100% !important;
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    gap: 6px !important;
+    padding: 0 8px !important;
+    border-radius: 16px !important;
+    font-size: 12px !important;
+    font-weight: 600 !important;
+    color: #0369a1 !important;
+    background: transparent !important;
+    border: none !important;
+    box-shadow: none !important;
+    transition: color 0.22s cubic-bezier(0.4, 0, 0.2, 1) !important;
+    white-space: nowrap !important;
+    box-sizing: border-box !important;
+}
+.main .scope-tab:hover {
+    color: #0284c7 !important;
+    background: transparent !important;
+}
+.main .scope-tab.active {
+    background: transparent !important;
+    color: #ffffff !important;
+    box-shadow: none !important;
+}
+@media (max-width: 768px) {
+    .main #liveReportSection2 .section-top {
+        flex-wrap: wrap !important;
+        gap: 12px !important;
+    }
+    .main #liveReportSection2 .scope-tabs,
+    .main .scope-tabs {
+        width: 100% !important;
+    }
+}
+.main #liveReportVehicleSummary .vehicle-summary-box,
+.main .vehicle-summary-box {
+    background: #ffffff !important;
+    border: 1px solid #c8dcf0 !important;
+    box-shadow: 0 1px 3px rgba(15, 23, 42, 0.04) !important;
+}
+.main #liveReportVehicleSummary table tbody tr.vehicle-summary-total td {
+    background: #f1f5f9 !important;
+}
+.main #liveReportVehicleSummary table th,
+.main #liveReportSection1 table th,
+.main #liveReportSection2 table th,
+.main #liveReportSection3 table th,
+.main #liveReportExitAlerts table th {
+    background: #f8fafc !important;
+    border-bottom: 2px solid #c8dcf0 !important;
+    color: #0369a1 !important;
+}
+.main #liveReportVehicleSummary table tbody tr,
+.main #liveReportSection1 table tbody tr,
+.main #liveReportSection2 table tbody tr,
+.main #liveReportSection3 table tbody tr,
+.main #liveReportExitAlerts table tbody tr {
+    background: #ffffff !important;
+}
+.main #liveReportVehicleSummary table td,
+.main #liveReportSection1 table td,
+.main #liveReportSection2 table td,
+.main #liveReportSection3 table td,
+.main #liveReportExitAlerts table td {
+    background: #ffffff !important;
+    color: #1e293b !important;
+    border-bottom: 1px solid #e2edf6 !important;
+}
+.main #liveReportVehicleSummary table tbody tr:hover td,
+.main #liveReportSection1 table tbody tr:hover td,
+.main #liveReportSection2 table tbody tr:hover td,
+.main #liveReportSection3 table tbody tr:hover td,
+.main #liveReportExitAlerts table tbody tr:hover td {
+    background: #f8fafc !important;
+}
+
+
+/* ---------------------------------------------------------
    SMALL SCREENS: pages shrink their side padding below 800px
 --------------------------------------------------------- */
 

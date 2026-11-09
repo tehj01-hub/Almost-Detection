@@ -116,6 +116,98 @@ if ($ajaxAction !== '') {
     }
 
     /* ---------------------------------------------------------
+       0A. EXIT WITHOUT ENTRY: guard acknowledges the warning
+    --------------------------------------------------------- */
+    if ($ajaxAction === 'ack_exit_alert' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+        header("Content-Type: application/json; charset=utf-8");
+        $alertId = (int)($_POST['alert_id'] ?? 0);
+        $note = trim((string)($_POST['note'] ?? ''));
+        $note = mb_substr(preg_replace('/\s+/', ' ', $note), 0, 200);
+        $actor = $guardID !== '' ? $guardID : 'Security Guard';
+        $plate = '';
+        $stmtA = $conn->prepare("SELECT plate_number FROM exit_without_entry_alerts WHERE id = ? AND status = 'New'");
+        if ($stmtA) {
+            $stmtA->bind_param("i", $alertId);
+            $stmtA->execute();
+            $rowA = $stmtA->get_result()->fetch_assoc();
+            $plate = $rowA ? (string)$rowA['plate_number'] : '';
+            $stmtA->close();
+        }
+        if ($plate === '') {
+            echo json_encode(['success' => false, 'message' => 'This warning was already acknowledged or no longer exists.']);
+            $conn->close();
+            exit();
+        }
+        $noteOrNull = $note !== '' ? $note : null;
+        $stmtU = $conn->prepare("UPDATE exit_without_entry_alerts SET status = 'Acknowledged', acknowledged_by = ?, acknowledged_at = NOW(), ack_note = ? WHERE id = ? AND status = 'New'");
+        $stmtU->bind_param("ssi", $actor, $noteOrNull, $alertId);
+        $stmtU->execute();
+        $stmtU->close();
+        secsysLogActivity(
+            $conn,
+            $actor,
+            'Exit Alert Acknowledged',
+            "Acknowledged the exit-without-entry warning for $plate" . ($note !== '' ? " — Note: $note" : '.')
+        );
+        echo json_encode(['success' => true]);
+        $conn->close();
+        exit();
+    }
+
+    /* ---------------------------------------------------------
+       0B. MANUAL "ADD REGISTERED": list of registered vehicles
+           (with whether each one is inside right now)
+    --------------------------------------------------------- */
+    if ($ajaxAction === 'registered_vehicles' && $_SERVER['REQUEST_METHOD'] === 'GET') {
+        header("Content-Type: application/json; charset=utf-8");
+        header("Cache-Control: no-store");
+        $vehicles = [];
+        $res = $conn->query("SELECT id, plate_number, brand, model, vehicle_type FROM registered_vehicles WHERE status = 'Active' ORDER BY plate_number ASC");
+        while ($res && ($row = $res->fetch_assoc())) {
+            $norm = preg_replace('/[^A-Z0-9]/', '', strtoupper((string)$row['plate_number']));
+            $vehicles[] = [
+                'id'           => (int)$row['id'],
+                'plate_number' => (string)$row['plate_number'],
+                'description'  => trim(implode(' ', array_filter([(string)$row['brand'], (string)$row['model']]))),
+                'vehicle_type' => secsysNormalizeVehicleType($row['vehicle_type'] ?? 'Car'),
+                'inside'       => secsysFindOpenVisit($conn, $norm) !== null,
+            ];
+        }
+        echo json_encode(['success' => true, 'vehicles' => $vehicles]);
+        $conn->close();
+        exit();
+    }
+
+    /* ---------------------------------------------------------
+       0C. MANUAL "ADD REGISTERED": log a registered vehicle IN / OUT
+           (same rules as a camera read; see secsysRecordManualRegisteredVisit)
+    --------------------------------------------------------- */
+    if ($ajaxAction === 'manual_registered_log' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+        header("Content-Type: application/json; charset=utf-8");
+        $result = secsysRecordManualRegisteredVisit(
+            $conn,
+            (int)($_POST['registered_id'] ?? 0),
+            (string)($_POST['direction'] ?? 'AUTO')
+        );
+        if ($result['ok']) {
+            secsysLogActivity(
+                $conn,
+                $guardID !== '' ? $guardID : 'Security Guard',
+                'Manual Registered Log',
+                'Manually logged registered vehicle ' . $result['plate'] . ' ' . $result['direction'] . ' (camera not used).'
+            );
+        }
+        echo json_encode([
+            'success'   => (bool)$result['ok'],
+            'message'   => $result['message'],
+            'direction' => $result['direction'] ?? null,
+            'log_id'    => $result['log_id'] ?? null,
+        ]);
+        $conn->close();
+        exit();
+    }
+
+    /* ---------------------------------------------------------
        1. SAVE VISITOR INFORMATION (INSTANT SAVE)
     --------------------------------------------------------- */
     if ($ajaxAction === 'save_visitor_info' && $_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -180,6 +272,64 @@ if ($ajaxAction !== '') {
             ]);
             $conn->close();
             exit();
+        }
+
+        // Plate: at least 2 letters and 3 numbers (same rule as the form)
+        if (preg_match_all('/[A-Z]/', $plateNoSpaces) < 2 || preg_match_all('/[0-9]/', $plateNoSpaces) < 3) {
+            echo json_encode([
+                'success' => false,
+                'message' => 'Plate Number must have at least 2 letters and 3 numbers (e.g. NBC 1234).'
+            ]);
+            $conn->close();
+            exit();
+        }
+
+        // Visitor name (when an ID was presented): 16+ characters, letters and spaces only
+        if ($hasConsent) {
+            $cleanName = trim(preg_replace('/\s+/u', ' ', $visitorName));
+            if (!preg_match('/^[\p{L} ]+$/u', $cleanName)) {
+                echo json_encode([
+                    'success' => false,
+                    'message' => 'Name must contain letters and spaces only (no numbers or special characters).'
+                ]);
+                $conn->close();
+                exit();
+            }
+            if (mb_strlen($cleanName, 'UTF-8') < 16) {
+                echo json_encode([
+                    'success' => false,
+                    'message' => 'Name must be at least 16 characters long (enter the visitor\'s full name).'
+                ]);
+                $conn->close();
+                exit();
+            }
+            $visitorName = $cleanName;
+            $saveVisitorName = $cleanName;
+        }
+
+        // A visitor who already left cannot be edited any more (saving would
+        // otherwise reopen the visit as if the vehicle came back in).
+        if ($logId > 0) {
+            $logPlate = '';
+            $logDirection = '';
+            $stmtLog = $conn->prepare("SELECT plate_number, direction FROM vehicle_logs WHERE id = ? LIMIT 1");
+            if ($stmtLog) {
+                $stmtLog->bind_param("i", $logId);
+                $stmtLog->execute();
+                $logRow = $stmtLog->get_result()->fetch_assoc();
+                $stmtLog->close();
+                $logPlate = (string)($logRow['plate_number'] ?? '');
+                $logDirection = strtoupper((string)($logRow['direction'] ?? ''));
+            }
+            $logNorm = preg_replace('/[^A-Z0-9]/', '', strtoupper($logPlate !== '' ? $logPlate : $plateClean));
+            if ($logDirection === 'OUT' || secsysFindOpenVisit($conn, $logNorm) === null) {
+                echo json_encode([
+                    'success' => false,
+                    'message' => 'This visitor (' . ($logPlate !== '' ? $logPlate : $plateClean) . ') has already left, so the visitor information can no longer be edited.'
+                ]);
+                $conn->close();
+                exit();
+            }
         }
 
         // Resolve duration & tailored reminder milestones via shared config
@@ -622,6 +772,7 @@ if ($ajaxAction !== '') {
             'success' => true,
             'new_logs' => $newLogs,
             'pending_visitors' => $pendingVisitors,
+            'exit_alerts' => secsysOpenExitAlerts($conn),
             'max_id' => $maxId,
             'total_registered' => $totalRegisteredToday,
             'total_visitors' => $totalVisitorsToday,
@@ -1518,6 +1669,54 @@ body {
 }
 
 /* OVERSTAY REMINDER ALERT BANNER */
+.exit-alert-banner {
+    background: #fef2f2;
+    border: 1px solid #fecaca;
+    border-left: 6px solid #dc2626;
+    border-radius: 12px;
+    padding: 12px 16px;
+    margin-bottom: 18px;
+    box-shadow: 0 3px 10px rgba(220, 38, 38, 0.14);
+    animation: alertSlideDown 0.3s ease-out;
+}
+.exit-alert-head {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    color: #7f1d1d;
+    font-size: 14px;
+}
+.exit-alert-icon { font-size: 20px; line-height: 1; }
+.exit-alert-help { font-size: 12px; color: #991b1b; margin-top: 2px; }
+.exit-alert-list { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
+.exit-alert-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px;
+    background: #ffffff;
+    border: 1px solid #fecaca;
+    border-radius: 8px;
+    padding: 7px 10px;
+}
+.exit-alert-info { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; font-size: 12px; color: #475569; }
+.exit-alert-plate { font-size: 14px; color: #b91c1c; letter-spacing: 0.5px; }
+.exit-alert-actions { display: flex; gap: 6px; }
+.exit-alert-btn {
+    font-size: 11.5px;
+    font-weight: 700;
+    border-radius: 6px;
+    padding: 4px 10px;
+    cursor: pointer;
+    text-decoration: none;
+    border: 1px solid transparent;
+}
+.exit-alert-photo { background: #f1f5f9; color: #0f172a; border-color: #cbd5e1; }
+.exit-alert-ack { background: #dc2626; color: #ffffff; border-color: #b91c1c; }
+.exit-alert-ack:hover { background: #b91c1c; }
+.exit-alert-ack:disabled { opacity: 0.6; cursor: default; }
+
 .overstay-alert-banner {
     background: #fff1f2;
     border: 1px solid #fecdd3;
@@ -2708,35 +2907,13 @@ body {
    ACTIVITY CARD
 ========================================================= */
 
-.activity-card {
-
-    background: #baf7b4;
-
-    border: 1px solid #dedede;
-
-    border-radius: 21px;
-
-    padding: 13px 15px 15px;
-
-    box-shadow:
-        0 2px 5px rgba(0, 0, 0, 0.13);
-
-    min-width: 0;
-}
-
+.activity-card,
 .activity-cards {
-
-    background: #b3dcf4;
-
-    border: 1px solid #dedede;
-
+    background: #f0f6fc;
+    border: 1px solid #c8dcf0;
     border-radius: 21px;
-
     padding: 13px 15px 15px;
-
-    box-shadow:
-        0 2px 5px rgba(0, 0, 0, 0.13);
-
+    box-shadow: 0 2px 6px rgba(15, 23, 42, 0.05);
     min-width: 0;
 }
 
@@ -2826,6 +3003,39 @@ body {
     animation: stackSlideIn 0.22s ease-out;
     transition: all 0.18s ease;
     box-sizing: border-box;
+}
+
+/* Pencil in the top-right corner of visitor rows that open the Visitor
+   Information form, so guards know the row can be edited (exited rows only
+   show details, so they have none). Works for rows added live too. */
+#visitorActivityStack .vehicle-item.visitor-item-row {
+    position: relative;
+    padding-right: 26px;
+    cursor: pointer;
+}
+#visitorActivityStack .vehicle-item.visitor-item-row::after {
+    content: "\270E";
+    position: absolute;
+    top: 4px;
+    right: 6px;
+    width: 18px;
+    height: 18px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 6px;
+    background: rgba(255, 255, 255, 0.85);
+    border: 1px solid rgba(15, 23, 42, 0.12);
+    color: #1d4ed8;
+    font-size: 11px;
+    line-height: 1;
+    pointer-events: none;
+    transition: background 0.15s ease, color 0.15s ease, transform 0.15s ease;
+}
+#visitorActivityStack .vehicle-item.visitor-item-row:hover::after {
+    background: #1d4ed8;
+    color: #ffffff;
+    transform: scale(1.08);
 }
 
 /* VEHICLES ENTERING (IN): Entire row is soft emerald green with bold green accent bar */
@@ -3844,6 +4054,7 @@ body {
 
     .camera-card,
     .activity-card,
+    .activity-cards,
     .total-card,
     .chart-container {
 
@@ -4015,12 +4226,8 @@ body {
             </button>
 
             <div class="dual-clock">
-                <div class="clock-card" title="Time from internet time servers (NTP)">
-                    <div class="clock-label"><span>🌐 Internet Time</span><span class="clock-badge" id="internetClockStatus">Syncing…</span></div>
-                    <div class="clock" id="internetClock">--:--:--</div>
-                </div>
                 <div class="clock-card" title="This unit's own clock">
-                    <div class="clock-label"><span>🖥️ System Time</span><span class="clock-badge" id="systemClockDrift"></span></div>
+                    <div class="clock-label"><span></span></div>
                     <div class="clock" id="liveClock"><?php echo date('h:i:s A'); ?></div>
                 </div>
             </div>
@@ -4042,6 +4249,18 @@ body {
             <button type="button" class="btn-view-overstay" onclick="openNotificationDrawerWithTab('ALERT')">View Details</button>
             <button type="button" class="btn-dismiss-alert" onclick="dismissOverstayBanner()" aria-label="Dismiss">&times;</button>
         </div>
+    </div>
+
+    <!-- EXIT WITHOUT ENTRY WARNING (stays until a guard acknowledges each one) -->
+    <div class="exit-alert-banner" id="exitAlertBanner" style="display:none;" role="alert">
+        <div class="exit-alert-head">
+            <span class="exit-alert-icon">🚨</span>
+            <div>
+                <strong>Exit Without Entry (<span id="exitAlertCount">0</span>)</strong>
+                <div class="exit-alert-help">The exit camera read these vehicles leaving, but they were never logged IN at the entrance. Check them, then acknowledge.</div>
+            </div>
+        </div>
+        <div class="exit-alert-list" id="exitAlertList"></div>
     </div>
 
 
@@ -4282,7 +4501,7 @@ body {
                         $isInsideVis = !$isOutVis && !empty($vehicle['still_inside']);
                         ?>
                         <div
-                            class="vehicle-item <?php echo $isOutVis ? 'row-out visitor-item-out' : (($isInsideVis ? 'row-in' : 'row-entered') . ' visitor-item-row'); ?>"
+                            class="vehicle-item <?php echo $isOutVis ? 'row-out visitor-item-out' : ($isInsideVis ? 'row-in visitor-item-row' : 'row-entered visitor-item-out'); ?>"
                             data-log-id="<?php echo $vLogId; ?>"
                             data-direction="<?php echo $vDir; ?>"
                             data-plate="<?php echo htmlspecialchars($vPlate, ENT_QUOTES); ?>"
@@ -4292,9 +4511,9 @@ body {
                             data-address="<?php echo htmlspecialchars($vAddr, ENT_QUOTES); ?>"
                             data-id-type="<?php echo htmlspecialchars($vIdType, ENT_QUOTES); ?>"
                             data-id-number="<?php echo htmlspecialchars($vIdNum, ENT_QUOTES); ?>"
-                            <?php if ($isOutVis): ?>
+                            <?php if ($isOutVis || !$isInsideVis): ?>
                                 onclick="openVisitorExitModalFromRow(this)"
-                                title="Visitor vehicle exited premises (Click to view exit details)"
+                                title="<?php echo $isOutVis ? 'Visitor vehicle exited premises (Click to view exit details)' : 'This visitor already left, so the information can no longer be edited (Click to view details)'; ?>"
                             <?php else: ?>
                                 onclick="openVisitorModalFromRow(this)"
                                 title="Click to enter or update visitor information"
@@ -4370,6 +4589,15 @@ body {
                     Registered
                 </div>
 
+                <button
+                    type="button"
+                    class="btn-manual-add-visitor btn-manual-add-registered"
+                    onclick="openManualRegisteredModal()"
+                    title="Manually log a registered vehicle IN or OUT"
+                >
+                    <span style="font-size: 13px; line-height: 1;">➕</span> Add Registered
+                </button>
+
             </div>
 
             <div class="activity-stack" id="registeredActivityStack">
@@ -4395,6 +4623,8 @@ body {
                             data-log-id="<?php echo $rLogId; ?>"
                             data-direction="<?php echo $rDir; ?>"
                             data-plate="<?php echo htmlspecialchars($rPlate, ENT_QUOTES); ?>"
+                            role="button" tabindex="0"
+                            title="Click to view the captured plate &amp; vehicle photo"
                         >
 
                             <div class="vehicle-info">
@@ -4789,6 +5019,7 @@ body {
                         style="text-transform: uppercase; font-weight: 600; letter-spacing: 0.5px;"
                         required
                     >
+                    <div style="font-size:11px; color:#64748b; margin-top:4px;">At least 2 letters and 3 numbers.</div>
 
                 </div>
 
@@ -4924,6 +5155,7 @@ body {
                                     placeholder="Visitor Full Name"
                                     style="width:100%; padding:8px 10px; border:1px solid #cbd5e1; border-radius:7px; font-size:12.5px; background:#ffffff;"
                                 >
+                                <div style="font-size:10.5px; color:#64748b; margin-top:3px;">At least 16 characters; letters and spaces only.</div>
                             </div>
 
                             <div>
@@ -4973,6 +5205,69 @@ body {
 <!-- =========================================================
      VISITOR EXIT / DEPARTURE DETAILS MODAL (EXIT ONLY)
 ========================================================= -->
+<!-- =========================================================
+     MANUAL "ADD REGISTERED": log a registered vehicle IN / OUT
+     (for when the camera missed or could not read the plate)
+========================================================= -->
+<div class="visitor-modal-overlay" id="manualRegisteredModal">
+
+    <div class="visitor-modal-box">
+
+        <div class="visitor-modal-header">
+
+            <div class="visitor-modal-title">
+                <span>🚗 Add Registered Vehicle Log</span>
+                <span class="visitor-modal-badge" style="background:#dcfce7; color:#166534;">Registered</span>
+            </div>
+
+            <button type="button" class="tapo-modal-close" onclick="closeManualRegisteredModal()" aria-label="Close">
+                &times;
+            </button>
+
+        </div>
+
+        <form id="manualRegisteredForm" onsubmit="saveManualRegistered(event)">
+
+            <div class="visitor-modal-body">
+
+                <div class="visitor-form-error" id="manualRegisteredError"></div>
+
+                <div class="visitor-form-group">
+                    <label for="manualRegisteredSearch">Search Plate / Sticker</label>
+                    <input type="text" id="manualRegisteredSearch" placeholder="Type to filter, e.g. NA16155" autocomplete="off"
+                           style="text-transform: uppercase;" oninput="renderManualRegisteredOptions()">
+                </div>
+
+                <div class="visitor-form-group">
+                    <label for="manualRegisteredSelect">Registered Vehicle</label>
+                    <select id="manualRegisteredSelect" required onchange="onManualRegisteredPick()">
+                        <option value="">Loading registered vehicles...</option>
+                    </select>
+                    <div id="manualRegisteredStatus" style="font-size:11.5px; color:#64748b; margin-top:5px;"></div>
+                </div>
+
+                <div class="visitor-form-group" style="margin-bottom: 4px;">
+                    <label for="manualRegisteredDirection">Log As</label>
+                    <select id="manualRegisteredDirection" required>
+                        <option value="IN">🟢 IN (entering)</option>
+                        <option value="OUT">🔴 OUT (leaving)</option>
+                    </select>
+                    <div style="font-size:11px; color:#64748b; margin-top:4px;">Picked automatically from whether the vehicle is inside. A vehicle already inside cannot be logged IN again.</div>
+                </div>
+
+            </div>
+
+            <div class="visitor-modal-footer">
+                <button type="button" class="btn-tapo-cancel" onclick="closeManualRegisteredModal()">Cancel</button>
+                <button type="submit" class="btn-tapo-save" id="manualRegisteredSaveBtn">Save Log</button>
+            </div>
+
+        </form>
+
+    </div>
+
+</div>
+
 <div class="visitor-modal-overlay" id="visitorExitModal">
 
     <div class="visitor-modal-box" style="max-width: 480px;">
@@ -5062,7 +5357,7 @@ function normalizeVehicleTypeJs(value) {
    LIVE CLOCK
 ========================================================= */
 
-/* Live clocks (Internet + System) are driven by assets/js/dual_clock.js */
+/* The live System Time clock is driven by assets/js/dual_clock.js */
 
 /* =========================================================
    GUARD HEARTBEAT
@@ -5193,6 +5488,7 @@ const vehicleChart =
                 {
 
                     label: "Motor",
+                    hidden: true, // Car/Motor not shown on this chart
 
                     data:
 
@@ -5220,6 +5516,7 @@ const vehicleChart =
                 {
 
                     label: "Car",
+                    hidden: true, // Car/Motor not shown on this chart
 
                     data:
 
@@ -5267,6 +5564,7 @@ const vehicleChart =
                     position: "bottom",
 
                     labels: {
+                        filter: function (item) { return item.text !== "Car" && item.text !== "Motor"; },
 
                         boxWidth: 20,
 
@@ -5503,6 +5801,269 @@ function toggleVisitorConsent() {
     }
 }
 
+/* ---------- Exit without entry warnings ---------- */
+// Alert ids already announced (sound/toast/bell), kept per browser so a reload does not re-announce them.
+const EXIT_ALERT_SEEN_KEY = "secsys_exit_alerts_seen";
+let exitAlertSeenIds = new Set();
+try {
+    exitAlertSeenIds = new Set(JSON.parse(localStorage.getItem(EXIT_ALERT_SEEN_KEY) || "[]").map(Number));
+} catch (e) {}
+let exitAlertsOpen = [];
+
+function exitAlertCategoryLabel(a) {
+    const cat = String(a.vehicle_category || "Unknown");
+    return cat === "Unknown" ? "Unregistered vehicle" : (cat + " vehicle");
+}
+
+function handleExitWithoutEntryAlerts(alerts) {
+    exitAlertsOpen = alerts.slice();
+    let announced = false;
+    alerts.forEach(function (a) {
+        const id = Number(a.id);
+        if (exitAlertSeenIds.has(id)) return;
+        exitAlertSeenIds.add(id);
+        announced = true;
+        addNotification(
+            "EXIT_ALERT",
+            "🚨 Exit Without Entry: " + (a.plate_number || "Unknown"),
+            exitAlertCategoryLabel(a) + " left through " + (a.camera_name || "the Exit Cam") + " but was never logged IN.",
+            a
+        );
+        showExitAlertToast(a);
+    });
+    if (announced) {
+        try {
+            localStorage.setItem(EXIT_ALERT_SEEN_KEY, JSON.stringify(Array.from(exitAlertSeenIds).slice(-200)));
+        } catch (e) {}
+        if (typeof playOverstayAlarmSound === "function") {
+            playOverstayAlarmSound();
+        } else {
+            playVisitorNotificationSound();
+        }
+    }
+    renderExitAlertBanner();
+}
+
+function showExitAlertToast(a) {
+    const container = document.getElementById("visitorToastContainer");
+    if (!container) return;
+    const toast = document.createElement("div");
+    toast.className = "visitor-toast";
+    toast.style.borderLeft = "4px solid #dc2626";
+    toast.style.background = "#fef2f2";
+    toast.innerHTML =
+        '<div>' +
+            '<div class="visitor-toast-title" style="color:#b91c1c;">🚨 Vehicle Exited Without Entry</div>' +
+            '<div class="visitor-toast-body">' +
+                '<div>Plate: <strong>' + escapeHtmlText(a.plate_number || "") + '</strong> (' + escapeHtmlText(exitAlertCategoryLabel(a)) + ')</div>' +
+                '<div style="color:#7f1d1d; font-size:11px; margin-top:2px;">Seen at ' + escapeHtmlText(a.camera_name || "Exit Cam") + ' • ' + escapeHtmlText(a.time_label || "") + ' — no entry record.</div>' +
+            '</div>' +
+        '</div>' +
+        '<button type="button" class="visitor-toast-close" aria-label="Dismiss">&times;</button>';
+    toast.querySelector(".visitor-toast-close").onclick = function () { toast.remove(); };
+    container.appendChild(toast);
+    setTimeout(function () { if (toast.parentNode) toast.remove(); }, 12000);
+}
+
+function renderExitAlertBanner() {
+    const banner = document.getElementById("exitAlertBanner");
+    const list = document.getElementById("exitAlertList");
+    if (!banner || !list) return;
+    if (!exitAlertsOpen.length) {
+        banner.style.display = "none";
+        list.innerHTML = "";
+        return;
+    }
+    const countEl = document.getElementById("exitAlertCount");
+    if (countEl) countEl.textContent = String(exitAlertsOpen.length);
+    list.innerHTML = exitAlertsOpen.map(function (a) {
+        const alertId = Number(a.id);
+        const plateStr = String(a.plate_number || "");
+        const pFile = a.plate_image ? a.plate_image.split('/').pop() : "";
+        const vFile = a.vehicle_image ? a.vehicle_image.split('/').pop() : "";
+        const photoUrl = a.photo_url || (vFile ? ('vehicle_photo.php?raw=vehicle&file=' + encodeURIComponent(vFile))
+                       : (pFile ? ('vehicle_photo.php?raw=plate&file=' + encodeURIComponent(pFile)) : null));
+        const modalUrl = a.modal_url || ('vehicle_photo.php?alert_id=' + alertId + '&plate=' + encodeURIComponent(plateStr));
+        const hasPhoto = Boolean(photoUrl || pFile || vFile || a.vehicle_image || a.plate_image);
+
+        return '<div class="exit-alert-row" data-alert-id="' + alertId + '">' +
+            '<div class="exit-alert-info">' +
+                '<a href="' + escapeHtmlText(modalUrl) + '" class="secsys-plate-link exit-alert-plate" data-plate="' + escapeHtmlText(plateStr) + '" data-alert-id="' + alertId + '" onclick="return window.secsysOpenPlateCaptureModal ? window.secsysOpenPlateCaptureModal(event, this) : true;" title="Click to view captured license plate &amp; vehicle image"><strong style="color:inherit;">' + escapeHtmlText(plateStr) + '</strong></a>' +
+                '<span>' + escapeHtmlText(exitAlertCategoryLabel(a)) + (a.vehicle_type ? ' • ' + escapeHtmlText(a.vehicle_type) : '') + '</span>' +
+                '<span>' + escapeHtmlText(a.camera_name || "Exit Cam") + ' • ' + escapeHtmlText(a.time_label || "") + '</span>' +
+            '</div>' +
+            '<div class="exit-alert-actions">' +
+                (hasPhoto ? '<a href="' + escapeHtmlText(photoUrl || modalUrl) + '" target="_blank" rel="noopener" class="exit-alert-btn exit-alert-photo" data-plate="' + escapeHtmlText(plateStr) + '" data-alert-id="' + alertId + '" onclick="return window.secsysOpenPlateCaptureModal ? window.secsysOpenPlateCaptureModal(event, this) : true;" title="Click to view captured photo">📷 Photo</a>' : '') +
+                '<button type="button" class="exit-alert-btn exit-alert-ack" onclick="acknowledgeExitAlert(' + alertId + ', this)">✔ Acknowledge</button>' +
+            '</div>' +
+        '</div>';
+    }).join("");
+    banner.style.display = "block";
+}
+
+async function acknowledgeExitAlert(alertId, btn) {
+    const note = window.prompt("Optional note for this warning (what you found / action taken):", "");
+    if (note === null) return;
+    if (btn) { btn.disabled = true; btn.textContent = "Saving..."; }
+    try {
+        const body = new URLSearchParams();
+        body.set("action", "ack_exit_alert");
+        body.set("alert_id", String(alertId));
+        body.set("note", note);
+        const res = await fetch("guard_dashboard.php", {
+            method: "POST",
+            credentials: "same-origin",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: body.toString()
+        });
+        const data = await res.json();
+        if (!data || !data.success) {
+            alert((data && data.message) || "Could not acknowledge the warning.");
+        }
+        exitAlertsOpen = exitAlertsOpen.filter(function (a) { return Number(a.id) !== Number(alertId); });
+        renderExitAlertBanner();
+    } catch (e) {
+        alert("Could not acknowledge the warning. Please check the connection and try again.");
+        if (btn) { btn.disabled = false; btn.textContent = "✔ Acknowledge"; }
+    }
+}
+
+/* ---------- Manual "Add Registered" (log a registered vehicle IN/OUT) ---------- */
+let manualRegisteredVehicles = [];
+
+function manualRegisteredShowError(msg) {
+    const box = document.getElementById("manualRegisteredError");
+    if (!box) return;
+    box.textContent = msg || "";
+    box.style.display = msg ? "block" : "none";
+}
+
+function renderManualRegisteredOptions() {
+    const select = document.getElementById("manualRegisteredSelect");
+    const search = document.getElementById("manualRegisteredSearch");
+    if (!select) return;
+    const q = String(search ? search.value : "").toUpperCase().replace(/\s+/g, "");
+    const previous = select.value;
+    const list = manualRegisteredVehicles.filter(function (v) {
+        if (!q) return true;
+        const hay = (v.plate_number + v.description + v.vehicle_type).toUpperCase().replace(/\s+/g, "");
+        return hay.indexOf(q) !== -1;
+    });
+    select.innerHTML = "";
+    if (list.length === 0) {
+        const opt = document.createElement("option");
+        opt.value = "";
+        opt.textContent = manualRegisteredVehicles.length ? "No registered vehicle matches" : "No active registered vehicles";
+        select.appendChild(opt);
+    } else {
+        const ph = document.createElement("option");
+        ph.value = "";
+        ph.textContent = "-- Select a registered vehicle --";
+        select.appendChild(ph);
+        list.forEach(function (v) {
+            const opt = document.createElement("option");
+            opt.value = String(v.id);
+            opt.textContent = v.plate_number + (v.description ? " — " + v.description : "") + " (" + v.vehicle_type + ")" + (v.inside ? "  • INSIDE" : "");
+            select.appendChild(opt);
+        });
+        if (list.length === 1) {
+            select.value = String(list[0].id);
+        } else if (previous && list.some(function (v) { return String(v.id) === previous; })) {
+            select.value = previous;
+        }
+    }
+    onManualRegisteredPick();
+}
+
+function onManualRegisteredPick() {
+    const select = document.getElementById("manualRegisteredSelect");
+    const status = document.getElementById("manualRegisteredStatus");
+    const dir = document.getElementById("manualRegisteredDirection");
+    const v = manualRegisteredVehicles.find(function (x) { return select && String(x.id) === select.value; });
+    if (!v) {
+        if (status) status.textContent = "";
+        return;
+    }
+    if (dir) dir.value = v.inside ? "OUT" : "IN";
+    if (status) {
+        status.innerHTML = v.inside
+            ? '<span style="color:#a16207; font-weight:600;">🟡 Currently INSIDE</span> — will be logged OUT.'
+            : '<span style="color:#166534; font-weight:600;">Outside</span> — will be logged IN.';
+    }
+}
+
+async function openManualRegisteredModal() {
+    const modal = document.getElementById("manualRegisteredModal");
+    if (!modal) return;
+    manualRegisteredShowError("");
+    const search = document.getElementById("manualRegisteredSearch");
+    if (search) search.value = "";
+    const select = document.getElementById("manualRegisteredSelect");
+    if (select) select.innerHTML = '<option value="">Loading registered vehicles...</option>';
+    const status = document.getElementById("manualRegisteredStatus");
+    if (status) status.textContent = "";
+    modal.classList.add("active");
+    if (search) setTimeout(function () { search.focus(); }, 50);
+
+    try {
+        const res = await fetch("guard_dashboard.php?action=registered_vehicles&_=" + Date.now(), {
+            credentials: "same-origin",
+            cache: "no-store"
+        });
+        const data = await res.json();
+        manualRegisteredVehicles = (data && Array.isArray(data.vehicles)) ? data.vehicles : [];
+        renderManualRegisteredOptions();
+    } catch (e) {
+        manualRegisteredVehicles = [];
+        if (select) select.innerHTML = '<option value="">Could not load registered vehicles</option>';
+        manualRegisteredShowError("Could not load the registered vehicles. Please try again.");
+    }
+}
+
+function closeManualRegisteredModal() {
+    const modal = document.getElementById("manualRegisteredModal");
+    if (modal) modal.classList.remove("active");
+}
+
+async function saveManualRegistered(ev) {
+    if (ev) ev.preventDefault();
+    const select = document.getElementById("manualRegisteredSelect");
+    const dir = document.getElementById("manualRegisteredDirection");
+    const btn = document.getElementById("manualRegisteredSaveBtn");
+    manualRegisteredShowError("");
+    if (!select || !select.value) {
+        manualRegisteredShowError("Please select a registered vehicle.");
+        return;
+    }
+    const body = new URLSearchParams();
+    body.set("action", "manual_registered_log");
+    body.set("registered_id", select.value);
+    body.set("direction", dir ? dir.value : "AUTO");
+
+    if (btn) { btn.disabled = true; btn.textContent = "Saving..."; }
+    try {
+        const res = await fetch("guard_dashboard.php", {
+            method: "POST",
+            credentials: "same-origin",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: body.toString()
+        });
+        const data = await res.json();
+        if (!data || !data.success) {
+            manualRegisteredShowError((data && data.message) || "Could not save the log.");
+            return;
+        }
+        closeManualRegisteredModal();
+        if (typeof pollLiveCaptures === "function") {
+            pollLiveCaptures();   // the new row shows up in the Registered card right away
+        }
+    } catch (e) {
+        manualRegisteredShowError("Could not save the log. Please check the connection and try again.");
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = "Save Log"; }
+    }
+}
+
 function openManualVisitorModal() {
     openVisitorModal("", "Car", "", 0, false, "", {
         isManual: true,
@@ -5633,6 +6194,11 @@ function openVisitorModal(plateNumber, vehicleType, purpose, logId, isAutoDetect
 }
 
 function openVisitorModalFromRow(rowEl) {
+    // A visitor who already left (OUT, or an entry that has been closed) is view only
+    if (rowEl && (rowEl.classList.contains("row-out") || rowEl.classList.contains("row-entered") || rowEl.classList.contains("visitor-item-out"))) {
+        openVisitorExitModalFromRow(rowEl);
+        return;
+    }
 
     if (!rowEl) return;
     const logId = parseInt(rowEl.getAttribute("data-log-id") || "0", 10);
@@ -5652,6 +6218,34 @@ function openVisitorModalFromRow(rowEl) {
         visitorName: vName,
         address: vAddr
     });
+}
+
+/**
+ * The vehicle in the open Visitor Information form just went OUT: close the
+ * form (its visit is over, so it can no longer be edited). Closed as "saved"
+ * so the entry is kept - a normal cancel would discard an auto-detected entry.
+ */
+function closeVisitorFormIfPlateExited(plate) {
+    const modal = document.getElementById("visitorInfoModal");
+    const plateInput = document.getElementById("visitorPlateInput");
+    if (!modal || !modal.classList.contains("active") || !plateInput) return;
+    const norm = function (p) { return String(p || "").toUpperCase().replace(/[^A-Z0-9]/g, ""); };
+    if (!plate || norm(plateInput.value) !== norm(plate)) return;
+    const pendingInput = document.getElementById("visitorPendingId");
+    if (pendingInput && pendingInput.value.trim() !== "") return; // a new arrival not saved yet: keep its own flow
+    closeVisitorModal(true);
+    const box = document.getElementById("visitorToastContainer");
+    if (box) {
+        const toast = document.createElement("div");
+        toast.className = "visitor-toast";
+        toast.style.borderLeft = "4px solid #64748b";
+        toast.innerHTML = '<div><div class="visitor-toast-title">Visitor form closed</div>' +
+            '<div class="visitor-toast-body">' + escapeHtmlText(plate) + ' has exited, so its information can no longer be edited.</div></div>' +
+            '<button type="button" class="visitor-toast-close" aria-label="Dismiss">&times;</button>';
+        toast.querySelector(".visitor-toast-close").onclick = function () { toast.remove(); };
+        box.appendChild(toast);
+        setTimeout(function () { if (toast.parentNode) toast.remove(); }, 7000);
+    }
 }
 
 function closeVisitorModal(wasSaved) {
@@ -5926,7 +6520,7 @@ function stackVehicleItem(logData) {
 
         const plateSpan = existingItem.querySelector(".plate-text");
         if (plateSpan) {
-            plateSpan.innerHTML = '<a href="vehicle_photo.php?plate=' + encodeURIComponent(plate) + (logId > 0 ? '&ids=' + logId : '') + '" class="secsys-plate-link" data-plate="' + escapeHtmlText(plate) + '" data-ids="' + (logId > 0 ? logId : '') + '" onclick="return window.secsysOpenPlateCaptureModal ? window.secsysOpenPlateCaptureModal(event, this) : true;" title="Click to view YOLOv10 captured license plate &amp; vehicle image">' + escapeHtmlText(plate) + '</a>';
+            plateSpan.innerHTML = '<a href="vehicle_photo.php?plate=' + encodeURIComponent(plate) + (logId > 0 ? '&ids=' + logId : '') + '" class="secsys-plate-link" data-plate="' + escapeHtmlText(plate) + '" data-ids="' + (logId > 0 ? logId : '') + '" onclick="return window.secsysOpenPlateCaptureModal ? window.secsysOpenPlateCaptureModal(event, this) : true;" title="Click to view captured license plate &amp; vehicle image">' + escapeHtmlText(plate) + '</a>';
         }
 
         const subContainer = existingItem.querySelector(".vehicle-direction");
@@ -5944,7 +6538,14 @@ function stackVehicleItem(logData) {
             const badgesBox = existingItem.querySelector(".vehicle-badges");
             let timerBadge = existingItem.querySelector("[data-vda-plate]");
             const pill = existingItem.querySelector(".purpose-pill");
-            if (isOut) {
+            if (!isOut && !isInside) {
+                // Entered earlier but already left: view only, no editing
+                existingItem.classList.remove("visitor-item-row");
+                existingItem.classList.add("visitor-item-out");
+                existingItem.onclick = function() { openVisitorExitModalFromRow(existingItem); };
+                existingItem.setAttribute("title", "This visitor already left, so the information can no longer be edited (Click to view details)");
+                if (timerBadge) timerBadge.remove();
+            } else if (isOut) {
                 existingItem.classList.remove("visitor-item-row");
                 existingItem.classList.add("visitor-item-out");
                 existingItem.onclick = function() { openVisitorExitModalFromRow(existingItem); };
@@ -6000,8 +6601,14 @@ function stackVehicleItem(logData) {
     const itemDiv = document.createElement("div");
     const rowColorClass = isOut ? "row-out" : inRowClass;
     itemDiv.className = isVisitor
-        ? ("vehicle-item " + rowColorClass + (isOut ? " visitor-item-out" : " visitor-item-row"))
+        ? ("vehicle-item " + rowColorClass + ((isOut || !isInside) ? " visitor-item-out" : " visitor-item-row"))
         : ("vehicle-item " + rowColorClass);
+    if (!isVisitor) {
+        // Registered rows open the capture overlay (delegated handler near </body>)
+        itemDiv.setAttribute("role", "button");
+        itemDiv.setAttribute("tabindex", "0");
+        itemDiv.setAttribute("title", "Click to view the captured plate & vehicle photo");
+    }
     itemDiv.setAttribute("data-direction", direction);
     if (logId > 0) {
         itemDiv.setAttribute("data-log-id", String(logId));
@@ -6018,7 +6625,16 @@ function stackVehicleItem(logData) {
 
         let pillHtml = "";
         let timerHtml = "";
-        if (isOut) {
+        if (!isOut && !isInside) {
+            // Entered earlier but already left: view only, no editing
+            itemDiv.setAttribute("title", "This visitor already left, so the information can no longer be edited (Click to view details)");
+            itemDiv.onclick = function () {
+                openVisitorExitModalFromRow(itemDiv);
+            };
+            pillHtml = (purpose !== "" && purpose.toLowerCase() !== "visitor entry")
+                ? '<span class="purpose-pill" title="' + escapeHtmlText(purpose) + '">' + escapeHtmlText(purpose) + '</span>'
+                : '';
+        } else if (isOut) {
             itemDiv.setAttribute("title", "Visitor vehicle exited (Click to view exit details)");
             itemDiv.onclick = function () {
                 openVisitorExitModalFromRow(itemDiv);
@@ -6036,7 +6652,7 @@ function stackVehicleItem(logData) {
                 : '<span class="purpose-pill needs-info">Input Info</span>';
         }
 
-        const clickablePlateLink = '<a href="vehicle_photo.php?plate=' + encodeURIComponent(plate) + (logId > 0 ? '&ids=' + logId : '') + '" class="secsys-plate-link" data-plate="' + escapeHtmlText(plate) + '" data-ids="' + (logId > 0 ? logId : '') + '" onclick="return window.secsysOpenPlateCaptureModal ? window.secsysOpenPlateCaptureModal(event, this) : true;" title="Click to view YOLOv10 captured license plate &amp; vehicle image">' + escapeHtmlText(plate) + '</a>';
+        const clickablePlateLink = '<a href="vehicle_photo.php?plate=' + encodeURIComponent(plate) + (logId > 0 ? '&ids=' + logId : '') + '" class="secsys-plate-link" data-plate="' + escapeHtmlText(plate) + '" data-ids="' + (logId > 0 ? logId : '') + '" onclick="return window.secsysOpenPlateCaptureModal ? window.secsysOpenPlateCaptureModal(event, this) : true;" title="Click to view captured license plate &amp; vehicle image">' + escapeHtmlText(plate) + '</a>';
 
         itemDiv.innerHTML =
             '<div class="vehicle-info">' +
@@ -6052,7 +6668,7 @@ function stackVehicleItem(logData) {
                 activityTimesHtml(isOut, isOut ? logData.time_out_label : logData.time_in_label) +
             '</div>';
     } else {
-        const clickablePlateLink = '<a href="vehicle_photo.php?plate=' + encodeURIComponent(plate) + (logId > 0 ? '&ids=' + logId : '') + '" class="secsys-plate-link" data-plate="' + escapeHtmlText(plate) + '" data-ids="' + (logId > 0 ? logId : '') + '" onclick="return window.secsysOpenPlateCaptureModal ? window.secsysOpenPlateCaptureModal(event, this) : true;" title="Click to view YOLOv10 captured license plate &amp; vehicle image">' + escapeHtmlText(plate) + '</a>';
+        const clickablePlateLink = '<a href="vehicle_photo.php?plate=' + encodeURIComponent(plate) + (logId > 0 ? '&ids=' + logId : '') + '" class="secsys-plate-link" data-plate="' + escapeHtmlText(plate) + '" data-ids="' + (logId > 0 ? logId : '') + '" onclick="return window.secsysOpenPlateCaptureModal ? window.secsysOpenPlateCaptureModal(event, this) : true;" title="Click to view captured license plate &amp; vehicle image">' + escapeHtmlText(plate) + '</a>';
 
         itemDiv.innerHTML =
             '<div class="vehicle-info">' +
@@ -6077,6 +6693,28 @@ function stackVehicleItem(logData) {
             items[i].remove();
         }
     }
+}
+
+/* Visitor form rules (the server checks the same rules when saving) */
+function visitorPlateProblem(plate) {
+    const p = String(plate || "").toUpperCase();
+    const letters = (p.match(/[A-Z]/g) || []).length;
+    const numbers = (p.match(/[0-9]/g) || []).length;
+    if (letters < 2 || numbers < 3) {
+        return "Plate Number must have at least 2 letters and 3 numbers (e.g. NBC 1234).";
+    }
+    return "";
+}
+
+function visitorNameProblem(name) {
+    const n = String(name || "").trim().replace(/\s+/g, " ");
+    if (!/^[\p{L} ]+$/u.test(n)) {
+        return "Name must contain letters and spaces only (no numbers or special characters).";
+    }
+    if (n.length < 16) {
+        return "Name must be at least 16 characters long (enter the visitor's full name).";
+    }
+    return "";
 }
 
 async function saveVisitorInfo(e) {
@@ -6121,6 +6759,17 @@ async function saveVisitorInfo(e) {
         return;
     }
 
+    // Plate: at least 2 letters and 3 numbers (spaces ignored), e.g. NBC 1234 or 123 ABC
+    const plateCheck = visitorPlateProblem(plate);
+    if (plateCheck) {
+        if (errBox) {
+            errBox.textContent = plateCheck;
+            errBox.style.display = "block";
+        }
+        if (plateInput) plateInput.focus();
+        return;
+    }
+
     if (consentChecked) {
         if (!idType) {
             if (errBox) {
@@ -6141,6 +6790,16 @@ async function saveVisitorInfo(e) {
         if (!visitorName) {
             if (errBox) {
                 errBox.textContent = "Please enter the visitor's Name.";
+                errBox.style.display = "block";
+            }
+            if (nameInput) nameInput.focus();
+            return;
+        }
+        // Name: at least 16 characters, letters and spaces only
+        const nameCheck = visitorNameProblem(visitorName);
+        if (nameCheck) {
+            if (errBox) {
+                errBox.textContent = nameCheck;
                 errBox.style.display = "block";
             }
             if (nameInput) nameInput.focus();
@@ -6320,6 +6979,11 @@ async function pollLiveCaptures() {
             }
         }
 
+        // Exit camera read a vehicle leaving that never came in
+        if (Array.isArray(data.exit_alerts)) {
+            handleExitWithoutEntryAlerts(data.exit_alerts);
+        }
+
         // Process pending visitor arrivals (awaiting guard form confirmation before DB insert)
         if (Array.isArray(data.pending_visitors) && data.pending_visitors.length > 0) {
             for (let p = 0; p < data.pending_visitors.length; p++) {
@@ -6403,6 +7067,9 @@ async function pollLiveCaptures() {
                             item.vehicle_type || "Car",
                             item.purpose || ""
                         );
+                        closeVisitorFormIfPlateExited(item.plate_number || "");
+                    } else if (Number(item.still_inside) === 0) {
+                        // Entered and already left before this update: nothing left to edit
                     } else {
                         const hasConfirmedPurpose = itemPurpose !== ""
                             && itemPurpose.toLowerCase() !== "visitor entry"
@@ -6591,7 +7258,7 @@ function updateNotificationUI() {
     } else if (currentNotifFilter === "OUT") {
         filtered = notificationsList.filter(n => n.type === "OUT");
     } else if (currentNotifFilter === "ALERT") {
-        filtered = notificationsList.filter(n => n.type === "OVERDUE" || n.type === "DUE_SOON");
+        filtered = notificationsList.filter(n => n.type === "OVERDUE" || n.type === "DUE_SOON" || n.type === "EXIT_ALERT");
     }
 
     if (filtered.length === 0) {
@@ -6621,6 +7288,9 @@ function updateNotificationUI() {
         } else if (item.type === "DUE_SOON") {
             itemClass += " notif-duesoon";
             icon = "⏰";
+        } else if (item.type === "EXIT_ALERT") {
+            itemClass += " notif-overdue";
+            icon = "🚨";
         }
 
         if (!item.read) {
@@ -7380,7 +8050,7 @@ document.addEventListener("DOMContentLoaded", function() { initTapoCameras(); lo
         <button type="button" class="notif-tab active" data-filter="all" onclick="filterNotifications('all')">All</button>
         <button type="button" class="notif-tab" data-filter="IN" onclick="filterNotifications('IN')">🟢 Entries</button>
         <button type="button" class="notif-tab" data-filter="OUT" onclick="filterNotifications('OUT')">🔴 Exits</button>
-        <button type="button" class="notif-tab" data-filter="ALERT" onclick="filterNotifications('ALERT')">⚠️ Due Alerts</button>
+        <button type="button" class="notif-tab" data-filter="ALERT" onclick="filterNotifications('ALERT')">⚠️ Alerts</button>
     </div>
 
     <div class="notif-actions-bar">
@@ -7401,8 +8071,45 @@ document.addEventListener("DOMContentLoaded", function() { initTapoCameras(); lo
 
 </aside>
 
-<?php echo secsysYoloCaptureModalAssetsHtml(); ?>
 <?php echo secsysYoloCaptureModalAssetsHtml(); /* clickable plate styles + viewer, also for plates added live */ ?>
+
+<style>
+/* Registered rows open the captured plate & vehicle photo (same as the admin dashboard) */
+#registeredActivityStack .vehicle-item {
+    cursor: pointer;
+}
+#registeredActivityStack .vehicle-item:focus-visible {
+    outline: 2px solid #2563eb;
+    outline-offset: 2px;
+}
+#registeredActivityStack .vehicle-item:active {
+    transform: scale(0.99);
+}
+</style>
+<script>
+(function () {
+    // Delegated, so rows the camera adds live behave the same as the ones rendered by PHP.
+    function openRow(row, ev) {
+        const link = row.querySelector(".secsys-plate-link");
+        if (link && typeof window.secsysOpenPlateCaptureModal === "function") {
+            window.secsysOpenPlateCaptureModal(ev, link);
+        }
+    }
+    document.addEventListener("click", function (ev) {
+        const row = ev.target.closest && ev.target.closest("#registeredActivityStack .vehicle-item");
+        if (!row || ev.target.closest("a, button")) return;
+        openRow(row, ev);
+    });
+    document.addEventListener("keydown", function (ev) {
+        if (ev.key !== "Enter" && ev.key !== " ") return;
+        const row = ev.target.closest && ev.target.closest("#registeredActivityStack .vehicle-item");
+        if (!row || ev.target !== row) return;
+        ev.preventDefault();
+        openRow(row, ev);
+    });
+})();
+</script>
+<script src="assets/js/logout_confirm.js?v=<?php echo (int)@filemtime(__DIR__ . '/assets/js/logout_confirm.js'); ?>"></script>
 </body>
 
 </html>
