@@ -2724,6 +2724,7 @@ body {
          assets/js/auto_refresh.js (data-live).
     ================================================== -->
 
+    <?php echo secsysYoloCaptureModalAssetsHtml(); /* plate styles + photo viewer, loaded once outside the auto-refreshed area */ ?>
     <div class="activity-grid admin-activity" id="adminLiveActivity" data-live>
 
         <!-- VISITOR (LEFT) -->
@@ -2742,10 +2743,10 @@ body {
                         $isInsideVis = !$isOutVis && !empty($vehicle['still_inside']);
                         $vTime    = !empty($vehicle['date_created']) ? date('h:i A', strtotime($vehicle['date_created'])) : '';
                     ?>
-                        <div class="vehicle-item <?php echo $isOutVis ? 'row-out' : ($isInsideVis ? 'row-in' : 'row-entered'); ?>">
+                        <div class="vehicle-item admin-clickable-row <?php echo $isOutVis ? 'row-out' : ($isInsideVis ? 'row-in' : 'row-entered'); ?>" role="button" tabindex="0" title="Click to view the captured plate &amp; vehicle photo">
                             <div class="vehicle-info">
                                 <div class="vehicle-plate">
-                                    <span class="plate-text"><?php echo htmlspecialchars($vPlate); ?></span>
+                                    <span class="plate-text"><?php echo secsysClickablePlateHtml($vPlate, ['log_id' => (int)($vehicle['id'] ?? 0)]); ?></span>
                                 </div>
                                 <div class="vehicle-direction">
                                     <span class="type-text"><?php echo htmlspecialchars($vType); ?></span>
@@ -2785,10 +2786,10 @@ body {
                         $isInsideReg = !$isOutReg && !empty($vehicle['still_inside']);
                         $rTime    = !empty($vehicle['date_created']) ? date('h:i A', strtotime($vehicle['date_created'])) : '';
                     ?>
-                        <div class="vehicle-item <?php echo $isOutReg ? 'row-out' : ($isInsideReg ? 'row-in' : 'row-entered'); ?>">
+                        <div class="vehicle-item admin-clickable-row <?php echo $isOutReg ? 'row-out' : ($isInsideReg ? 'row-in' : 'row-entered'); ?>" role="button" tabindex="0" title="Click to view the captured plate &amp; vehicle photo">
                             <div class="vehicle-info">
                                 <div class="vehicle-plate">
-                                    <span class="plate-text"><?php echo htmlspecialchars($rPlate); ?></span>
+                                    <span class="plate-text"><?php echo secsysClickablePlateHtml($rPlate, ['log_id' => (int)($vehicle['id'] ?? 0)]); ?></span>
                                 </div>
                                 <div class="vehicle-direction">
                                     <?php if ($rType !== '' && strtolower($rType) !== 'unknown'): ?>
@@ -4066,6 +4067,44 @@ document.addEventListener("visibilitychange", function () {
 <script src="assets/js/auto_refresh.js?v=<?php echo (int)@filemtime(__DIR__ . '/assets/js/auto_refresh.js'); ?>"></script>
 
 
+<style>
+/* IN / OUT rows open the captured plate & vehicle photo */
+.admin-activity .vehicle-item.admin-clickable-row {
+    cursor: pointer;
+}
+.admin-activity .vehicle-item.admin-clickable-row:focus-visible {
+    outline: 2px solid #2563eb;
+    outline-offset: 2px;
+}
+.admin-activity .vehicle-item.admin-clickable-row:active {
+    transform: scale(0.99);
+}
+</style>
+<script>
+/* Clicking anywhere on an IN / OUT row (or Enter / Space) opens the same viewer
+   as its plate number, with the plate's press animation. Delegated, so it keeps
+   working after the activity list auto-refreshes. */
+(function () {
+    function openRow(row, ev) {
+        const link = row.querySelector(".secsys-plate-link");
+        if (link && window.secsysOpenPlateCaptureModal) {
+            window.secsysOpenPlateCaptureModal(ev, link);
+        }
+    }
+    document.addEventListener("click", function (ev) {
+        const row = ev.target.closest(".admin-activity .admin-clickable-row");
+        if (!row || ev.target.closest("a, button")) return;
+        openRow(row, ev);
+    });
+    document.addEventListener("keydown", function (ev) {
+        if (ev.key !== "Enter" && ev.key !== " ") return;
+        const row = ev.target.closest && ev.target.closest(".admin-activity .admin-clickable-row");
+        if (!row || ev.target !== row) return;
+        ev.preventDefault();
+        openRow(row, ev);
+    });
+})();
+</script>
 </body>
 
 </html>

@@ -491,7 +491,10 @@
         }
         // Ripple starts where the plate was clicked (keyboard: from the centre)
         var rect = el.getBoundingClientRect();
-        if (ev && typeof ev.clientX === "number" && ev.clientX > 0 && rect.width > 0) {
+        var insideChip = ev && typeof ev.clientX === "number" && rect.width > 0
+            && ev.clientX >= rect.left && ev.clientX <= rect.right
+            && ev.clientY >= rect.top && ev.clientY <= rect.bottom;
+        if (insideChip) {
             el.style.setProperty("--rx", ((ev.clientX - rect.left) / rect.width * 100).toFixed(1) + "%");
             el.style.setProperty("--ry", ((ev.clientY - rect.top) / rect.height * 100).toFixed(1) + "%");
         } else {
