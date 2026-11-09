@@ -21,29 +21,8 @@
         }
         var style = document.createElement("style");
         style.id = STYLE_ID;
+        // Plate number styles live in assets/css/plate_link.css (loaded with the page)
         style.textContent =
-            ".secsys-plate-link {" +
-            "  display: inline-flex;" +
-            "  align-items: center;" +
-            "  gap: 5px;" +
-            "  font-family: Consolas, 'Courier New', monospace;" +
-            "  font-weight: 700;" +
-            "  color: #1e3a8a;" +
-            "  background: #eff6ff;" +
-            "  border: 1px solid #bfdbfe;" +
-            "  border-radius: 6px;" +
-            "  padding: 2px 8px;" +
-            "  text-decoration: none;" +
-            "  cursor: pointer;" +
-            "  transition: all 0.15s ease;" +
-            "}" +
-            ".secsys-plate-link:hover {" +
-            "  background: #dbeafe;" +
-            "  border-color: #60a5fa;" +
-            "  color: #1d4ed8;" +
-            "  transform: translateY(-1px);" +
-            "  box-shadow: 0 2px 6px rgba(37, 99, 235, 0.18);" +
-            "}" +
             ".secsys-plate-overlay {" +
             "  position: fixed;" +
             "  inset: 0;" +
@@ -496,6 +475,42 @@
         return false;
     };
 
+    /* Play the plate "press" animation (assets/css/plate_link.css), then open
+       the viewer once the bounce is visible. */
+    var reduceMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+    function pressAndOpen(el, ev) {
+        if (el.getAttribute("data-opening") === "1") {
+            return; // ignore double clicks while the animation runs
+        }
+        var plate = el.getAttribute("data-plate") || el.textContent || "";
+        var ids = el.getAttribute("data-ids") || "";
+        if (reduceMotion) {
+            openByPlateAndIds(plate, ids);
+            return;
+        }
+        // Ripple starts where the plate was clicked (keyboard: from the centre)
+        var rect = el.getBoundingClientRect();
+        if (ev && typeof ev.clientX === "number" && ev.clientX > 0 && rect.width > 0) {
+            el.style.setProperty("--rx", ((ev.clientX - rect.left) / rect.width * 100).toFixed(1) + "%");
+            el.style.setProperty("--ry", ((ev.clientY - rect.top) / rect.height * 100).toFixed(1) + "%");
+        } else {
+            el.style.setProperty("--rx", "50%");
+            el.style.setProperty("--ry", "50%");
+        }
+        el.classList.remove("is-pressed");
+        void el.offsetWidth; // restart the animation if it was clicked again
+        el.classList.add("is-pressed");
+        el.setAttribute("data-opening", "1");
+        setTimeout(function () {
+            el.removeAttribute("data-opening");
+            openByPlateAndIds(plate, ids);
+        }, 220);
+        setTimeout(function () {
+            el.classList.remove("is-pressed");
+        }, 480);
+    }
+
     window.secsysOpenPlateCaptureModal = function (event, el) {
         if (event) {
             event.preventDefault();
@@ -504,9 +519,7 @@
         if (!el) {
             return false;
         }
-        var plate = el.getAttribute("data-plate") || el.textContent || "";
-        var ids = el.getAttribute("data-ids") || "";
-        openByPlateAndIds(plate, ids);
+        pressAndOpen(el, event);
         return false;
     };
 
@@ -518,8 +531,18 @@
         }
         ev.preventDefault();
         ev.stopPropagation();
-        var plate = target.getAttribute("data-plate") || target.textContent || "";
-        var ids = target.getAttribute("data-ids") || "";
-        openByPlateAndIds(plate, ids);
+        pressAndOpen(target, ev);
     });
+
+    // Load the plate styles right away (not only when the viewer first opens),
+    // also on pages that build plate numbers in JavaScript
+    (function ensurePlateStylesheet() {
+        if (document.querySelector('link[href*="assets/css/plate_link.css"]')) {
+            return;
+        }
+        var link = document.createElement("link");
+        link.rel = "stylesheet";
+        link.href = "assets/css/plate_link.css";
+        (document.head || document.documentElement).appendChild(link);
+    })();
 })();

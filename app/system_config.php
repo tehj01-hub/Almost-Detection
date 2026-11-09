@@ -664,7 +664,12 @@ function secsysYoloCaptureModalAssetsHtml(): string
         return '';
     }
     $injected = true;
-    return '<script src="assets/js/yolo_capture_modal.js?v=2"></script>';
+    // Version by file time so browsers pick up changes; the stylesheet loads
+    // with the page so plate numbers are styled before the first click
+    $cssVer = (int)@filemtime(__DIR__ . '/../assets/css/plate_link.css');
+    $jsVer = (int)@filemtime(__DIR__ . '/../assets/js/yolo_capture_modal.js');
+    return '<link rel="stylesheet" href="assets/css/plate_link.css?v=' . $cssVer . '">'
+        . '<script src="assets/js/yolo_capture_modal.js?v=' . $jsVer . '"></script>';
 }
 
 /**

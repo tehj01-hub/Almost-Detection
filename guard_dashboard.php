@@ -7402,6 +7402,7 @@ document.addEventListener("DOMContentLoaded", function() { initTapoCameras(); lo
 </aside>
 
 <?php echo secsysYoloCaptureModalAssetsHtml(); ?>
+<?php echo secsysYoloCaptureModalAssetsHtml(); /* clickable plate styles + viewer, also for plates added live */ ?>
 </body>
 
 </html>

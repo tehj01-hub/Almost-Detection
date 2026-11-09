@@ -5586,6 +5586,7 @@ document.addEventListener("DOMContentLoaded", function() {
 <script src="assets/js/download_format.js?v=<?php echo (int)@filemtime(__DIR__ . '/assets/js/download_format.js'); ?>"></script>
 <script src="assets/js/auto_refresh.js?v=<?php echo (int)@filemtime(__DIR__ . '/assets/js/auto_refresh.js'); ?>"></script>
 
+<?php echo secsysYoloCaptureModalAssetsHtml(); /* clickable plate styles + viewer, also for plates added live */ ?>
 </body>
 
 </html>
