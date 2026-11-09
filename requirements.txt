@@ -8,6 +8,21 @@ flask-cors>=4.0.0
 opencv-python>=4.8.0
 numpy>=1.24.0
 
+# ---------------------------------------------------------
+#  NVIDIA GPU (e.g. GTX 1650 Ti) -- install these FIRST, from their
+#  CUDA indexes, so YOLO + EasyOCR + PaddleOCR all run on the GPU:
+#
+#    uv pip install --python .venv\Scripts\python.exe "torch==2.6.0" "torchvision==0.21.0" ^
+#        --index-url https://download.pytorch.org/whl/cu126
+#    uv pip install --python .venv\Scripts\python.exe "paddlepaddle-gpu==3.3.1" ^
+#        --index-url https://www.paddlepaddle.org.cn/packages/stable/cu126/
+#
+#  Keep torch on cu126 + paddlepaddle-gpu on cu126: both then use cuDNN 9.5.1.
+#  Mixing versions (e.g. torch cu124 = cuDNN 9.1) crashes on import with
+#  "WinError 127 ... cudnn_cnn64_9.dll". Do NOT also install CPU `paddlepaddle`.
+#  CPU-only machines: use plain `torch`/`torchvision` and `paddlepaddle` instead.
+# ---------------------------------------------------------
+
 # YOLOv10 / Ultralytics
 torch>=2.0.0
 torchvision>=0.15.0
@@ -16,6 +31,9 @@ huggingface_hub>=0.20.0
 
 # OCR for reading plate text
 easyocr>=1.7.0
+paddleocr>=3.7.0,<4.0.0
+# paddlepaddle-gpu==3.3.1 on NVIDIA machines (see above); CPU fallback:
+# paddlepaddle>=3.3.1,<4.0.0
 
 # Database
 mysql-connector-python>=8.0.0

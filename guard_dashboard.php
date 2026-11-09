@@ -47,18 +47,41 @@ if (empty($_SESSION['guard_id'])) {
    Database: security_system
 ========================================================= */
 
-$conn = new mysqli(
-    "localhost:3307",
-    "root",
-    "",
-    "security_system"
-);
+$conn = secsysConnectDb();
 
-if ($conn->connect_error) {
-    die("Database Connection Failed: " . $conn->connect_error);
+/* =========================================================
+   TIME FOR ACTIVITY ROWS (alias: vl)
+   Each row shows only its own time:
+   - IN row:  time in  (its visit record, else when it was logged)
+   - OUT row: time out (when the exit was logged)
+   Returned pre-formatted, e.g. "6:06 AM".
+========================================================= */
+$activityTimeColumns = "
+        CASE WHEN vl.direction = 'IN' THEN DATE_FORMAT(
+            COALESCE((
+                SELECT vld_own.time_in
+                FROM vehicle_log_dates vld_own
+                WHERE vld_own.vehicle_log_id = vl.id
+                ORDER BY vld_own.id DESC
+                LIMIT 1
+            ), vl.date_created),
+            '%l:%i %p'
+        ) END AS time_in_label,
+        CASE WHEN vl.direction = 'OUT' THEN DATE_FORMAT(vl.date_created, '%l:%i %p') END AS time_out_label
+";
+
+/** Time shown on an activity row: "In 6:34 AM" on IN rows, "Out 6:35 AM" on OUT rows. */
+function guardActivityTimesHtml($direction, $timeInLabel, $timeOutLabel): string
+{
+    $isOut = strtoupper(trim((string)$direction)) === 'OUT';
+    $label = $isOut ? 'Out' : 'In';
+    $time  = trim((string)($isOut ? $timeOutLabel : $timeInLabel));
+    $time  = $time !== '' ? $time : '—';
+
+    return '<div class="activity-times" title="Time ' . $label . ': ' . htmlspecialchars($time, ENT_QUOTES) . '">'
+        . '<span class="activity-time"><b>' . $label . '</b> <span class="time-value">' . htmlspecialchars($time) . '</span></span>'
+        . '</div>';
 }
-
-$conn->set_charset("utf8mb4");
 
 /* =========================================================
    FAST-PATH AJAX DISPATCHER
@@ -78,20 +101,33 @@ if ($ajaxAction !== '') {
     $today = date("Y-m-d");
 
     /* ---------------------------------------------------------
+       0. ADMIN-ADDED CAMERAS (polled so new cameras appear live)
+    --------------------------------------------------------- */
+    if ($ajaxAction === 'extra_cameras') {
+        header("Content-Type: application/json; charset=utf-8");
+        header("Cache-Control: no-store, no-cache, must-revalidate, max-age=0");
+        echo json_encode([
+            'success' => true,
+            'cameras' => secsysLoadExtraCameras($conn),
+        ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        $conn->close();
+        exit();
+    }
+
+    /* ---------------------------------------------------------
        1. SAVE VISITOR INFORMATION (INSTANT SAVE)
     --------------------------------------------------------- */
     if ($ajaxAction === 'save_visitor_info' && $_SERVER['REQUEST_METHOD'] === 'POST') {
         header("Content-Type: application/json; charset=utf-8");
 
         $logId = (int)($_POST['log_id'] ?? 0);
+        $pendingId = trim((string)($_POST['pending_id'] ?? ''));
         $rawPlate = strtoupper(trim($_POST['plate_number'] ?? ''));
         $plateNormalized = preg_replace('/[^A-Z0-9 ]/', '', $rawPlate);
         $plateClean = trim(preg_replace('/\s+/', ' ', $plateNormalized));
         $plateNoSpaces = str_replace(' ', '', $plateClean);
         $vehicleType = trim($_POST['vehicle_type'] ?? 'Car');
-        if (!in_array($vehicleType, ['Car', 'Motorcycle', 'Truck'], true)) {
-            $vehicleType = 'Car';
-        }
+        $vehicleType = secsysNormalizeVehicleType($vehicleType);
         $purposeRaw = trim($_POST['purpose'] ?? '');
         $customMinutes = isset($_POST['custom_minutes']) && (int)$_POST['custom_minutes'] > 0
             ? max(1, min(2880, (int)$_POST['custom_minutes']))
@@ -111,6 +147,29 @@ if ($ajaxAction !== '') {
             $purpose = $baseLabel . ' - ' . ucwords(secsysFormatDuration($customMinutes));
         } else {
             $purpose = $purposeRaw;
+        }
+
+        // ID Consent inputs
+        $hasConsent = !empty($_POST['visitor_consent']) && ($_POST['visitor_consent'] === '1' || $_POST['visitor_consent'] === 1 || $_POST['visitor_consent'] === 'true');
+        $idType = $hasConsent ? trim((string)($_POST['id_type'] ?? '')) : null;
+        $idNumber = $hasConsent ? trim((string)($_POST['id_number'] ?? '')) : null;
+        $visitorName = $hasConsent ? trim((string)($_POST['visitor_name'] ?? '')) : '';
+        $addressToVisit = $hasConsent ? trim((string)($_POST['address_to_visit'] ?? '')) : '';
+
+        $saveVisitorName = ($visitorName !== '') ? $visitorName : 'Visitor';
+        $saveAddress = ($addressToVisit !== '') ? $addressToVisit : '-';
+        $saveIdType = ($idType !== null && $idType !== '') ? $idType : null;
+        $saveIdNumber = ($idNumber !== null && $idNumber !== '') ? $idNumber : null;
+
+        if ($hasConsent) {
+            if ($saveIdType === null || $saveIdNumber === null || $visitorName === '') {
+                echo json_encode([
+                    'success' => false,
+                    'message' => 'Please provide the ID Type, ID Number, and Name since the visitor consented to present ID.'
+                ]);
+                $conn->close();
+                exit();
+            }
         }
 
         if ($plateClean === '' || $purpose === '') {
@@ -150,14 +209,18 @@ if ($ajaxAction !== '') {
         }
 
         if ($visitorVehicleId) {
-            if ($visitorPrevStatus === 'OUT') {
-                // Returning visitor entering again manually -> start fresh time_in & timer
+            if ($visitorPrevStatus === 'OUT' || $logId <= 0) {
+                // New arrival or returning visitor entering again -> start fresh time_in & timer
                 $updVv = $conn->prepare("
                     UPDATE visitor_vehicles
                     SET plate_number = ?,
                         vehicle_type = ?,
                         purpose = ?,
                         allowed_minutes = ?,
+                        visitor_name = ?,
+                        address_to_visit = ?,
+                        id_type = ?,
+                        id_number = ?,
                         status = 'IN',
                         date_in = CURDATE(),
                         time_in = NOW(),
@@ -173,6 +236,10 @@ if ($ajaxAction !== '') {
                         vehicle_type = ?,
                         purpose = ?,
                         allowed_minutes = ?,
+                        visitor_name = ?,
+                        address_to_visit = ?,
+                        id_type = ?,
+                        id_number = ?,
                         status = 'IN',
                         date_in = COALESCE(date_in, CURDATE()),
                         time_in = COALESCE(time_in, NOW()),
@@ -183,19 +250,19 @@ if ($ajaxAction !== '') {
                 ");
             }
             if ($updVv) {
-                $updVv->bind_param("sssiii", $plateClean, $vehicleType, $purpose, $allowedMinutes, $allowedMinutes, $visitorVehicleId);
+                $updVv->bind_param("sssissssii", $plateClean, $vehicleType, $purpose, $allowedMinutes, $saveVisitorName, $saveAddress, $saveIdType, $saveIdNumber, $allowedMinutes, $visitorVehicleId);
                 $updVv->execute();
                 $updVv->close();
             }
         } else {
             $insVv = $conn->prepare("
                 INSERT INTO visitor_vehicles
-                    (visitor_name, address_to_visit, vehicle_type, plate_number, purpose, allowed_minutes, status, date_in, time_in, expected_time_out, date_created)
+                    (visitor_name, address_to_visit, vehicle_type, plate_number, purpose, allowed_minutes, id_type, id_number, status, date_in, time_in, expected_time_out, date_created)
                 VALUES
-                    ('Visitor', '-', ?, ?, ?, ?, 'IN', CURDATE(), NOW(), DATE_ADD(NOW(), INTERVAL ? MINUTE), NOW())
+                    (?, ?, ?, ?, ?, ?, ?, ?, 'IN', CURDATE(), NOW(), DATE_ADD(NOW(), INTERVAL ? MINUTE), NOW())
             ");
             if ($insVv) {
-                $insVv->bind_param("sssii", $vehicleType, $plateClean, $purpose, $allowedMinutes, $allowedMinutes);
+                $insVv->bind_param("sssssissi", $saveVisitorName, $saveAddress, $vehicleType, $plateClean, $purpose, $allowedMinutes, $saveIdType, $saveIdNumber, $allowedMinutes);
                 if ($insVv->execute()) {
                     $visitorVehicleId = (int)$conn->insert_id;
                 }
@@ -203,21 +270,35 @@ if ($ajaxAction !== '') {
             }
         }
 
-        // Step 2: Update existing vehicle_logs row (fast indexed lookup or primary key)
+        // Step 2: Update existing unconfirmed vehicle_logs row or insert new confirmed entry
         $direction = 'IN';
+        $recMethod = ($pendingId !== '') ? 'OCR' : 'Manual';
 
         if ($logId <= 0) {
+            $plateAlnum = preg_replace('/[^A-Z0-9]/', '', $plateClean);
             $findLog = $conn->prepare("
-                SELECT id, direction
-                FROM vehicle_logs
-                WHERE (plate_number = ? OR plate_number = ?)
-                  AND vehicle_category = 'Visitor'
-                  AND date_created >= CURDATE()
-                ORDER BY id DESC
+                SELECT vl.id, vl.direction
+                FROM vehicle_logs vl
+                WHERE (
+                      vl.plate_number = ?
+                      OR vl.plate_number = ?
+                      OR REGEXP_REPLACE(UPPER(vl.plate_number), '[^A-Z0-9]', '') = ?
+                )
+                  AND vl.vehicle_category = 'Visitor'
+                  AND vl.direction = 'IN'
+                  AND vl.date_out IS NULL
+                  AND vl.date_created >= CURDATE()
+                  AND NOT EXISTS (
+                      SELECT 1 FROM vehicle_logs vl_out
+                      WHERE REGEXP_REPLACE(UPPER(vl_out.plate_number), '[^A-Z0-9]', '') = ?
+                        AND vl_out.direction = 'OUT'
+                        AND vl_out.id > vl.id
+                  )
+                ORDER BY vl.id DESC
                 LIMIT 1
             ");
             if ($findLog) {
-                $findLog->bind_param("ss", $plateClean, $plateNoSpaces);
+                $findLog->bind_param("ssss", $plateClean, $plateNoSpaces, $plateAlnum, $plateAlnum);
                 $findLog->execute();
                 $resLog = $findLog->get_result();
                 if ($rowLog = $resLog->fetch_assoc()) {
@@ -235,29 +316,44 @@ if ($ajaxAction !== '') {
                     vehicle_type = ?,
                     purpose = ?,
                     allowed_minutes = ?,
+                    visitor_name = ?,
+                    id_type = ?,
+                    id_number = ?,
                     expected_time_out = DATE_ADD(date_created, INTERVAL ? MINUTE),
                     date_in = COALESCE(date_in, DATE(date_created)),
                     visitor_vehicle_id = ?
                 WHERE id = ?
             ");
             if ($updLog) {
-                $updLog->bind_param("sssiiii", $plateClean, $vehicleType, $purpose, $allowedMinutes, $allowedMinutes, $visitorVehicleId, $logId);
+                $updLog->bind_param("sssisssiii", $plateClean, $vehicleType, $purpose, $allowedMinutes, $saveVisitorName, $saveIdType, $saveIdNumber, $allowedMinutes, $visitorVehicleId, $logId);
                 $updLog->execute();
                 $updLog->close();
             }
         } else {
             $insLog = $conn->prepare("
                 INSERT INTO vehicle_logs
-                    (plate_number, vehicle_type, vehicle_category, visitor_vehicle_id, visitor_name, purpose, allowed_minutes, expected_time_out, direction, recognition_method, date_in, date_created)
+                    (plate_number, vehicle_type, vehicle_category, visitor_vehicle_id, visitor_name, id_type, id_number, purpose, allowed_minutes, expected_time_out, direction, recognition_method, date_in, date_created)
                 VALUES
-                    (?, ?, 'Visitor', ?, 'Visitor', ?, ?, DATE_ADD(NOW(), INTERVAL ? MINUTE), 'IN', 'Manual', CURDATE(), NOW())
+                    (?, ?, 'Visitor', ?, ?, ?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL ? MINUTE), 'IN', ?, CURDATE(), NOW())
             ");
             if ($insLog) {
-                $insLog->bind_param("ssisii", $plateClean, $vehicleType, $visitorVehicleId, $purpose, $allowedMinutes, $allowedMinutes);
+                $insLog->bind_param("ssissssiis", $plateClean, $vehicleType, $visitorVehicleId, $saveVisitorName, $saveIdType, $saveIdNumber, $purpose, $allowedMinutes, $allowedMinutes, $recMethod);
                 if ($insLog->execute()) {
                     $logId = (int)$conn->insert_id;
                 }
                 $insLog->close();
+            }
+        }
+
+        // Step 2b: attach the YOLOv10 vehicle photo taken when this plate was read
+        // (the detection server names it after the pending id)
+        $pendingPhoto = secsysPendingVehiclePhotoPath($pendingId);
+        if ($logId > 0 && $pendingPhoto !== null) {
+            $setPhoto = $conn->prepare("UPDATE vehicle_logs SET vehicle_image = ? WHERE id = ? AND (vehicle_image IS NULL OR vehicle_image = '')");
+            if ($setPhoto) {
+                $setPhoto->bind_param("si", $pendingPhoto, $logId);
+                $setPhoto->execute();
+                $setPhoto->close();
             }
         }
 
@@ -298,10 +394,39 @@ if ($ajaxAction !== '') {
             }
         }
 
+        // Mark pending visitor queue entry as saved so it is cleared from pending prompts
+        secsysResolvePendingVisitor($pendingId, $plateClean, 'saved');
+
+        $totalVisitorsToday = 0;
+        $qVisTot = $conn->query("
+            SELECT COALESCE(SUM(CASE WHEN vehicle_category = 'Visitor' AND direction = 'IN' THEN 1 ELSE 0 END), 0) AS vis_tot
+            FROM vehicle_logs
+            WHERE date_created >= CURDATE()
+        ");
+        if ($qVisTot && $rowVisTot = $qVisTot->fetch_assoc()) {
+            $totalVisitorsToday = (int)$rowVisTot['vis_tot'];
+        }
+
+        // Time in / time out of the saved visit, for the activity row
+        $savedTimeIn = '';
+        $savedTimeOut = '';
+        if ($logId > 0) {
+            $stmtTimes = $conn->prepare("SELECT {$activityTimeColumns} FROM vehicle_logs vl WHERE vl.id = ? LIMIT 1");
+            if ($stmtTimes) {
+                $stmtTimes->bind_param("i", $logId);
+                $stmtTimes->execute();
+                $rowTimes = $stmtTimes->get_result()->fetch_assoc();
+                $savedTimeIn = (string)($rowTimes['time_in_label'] ?? '');
+                $savedTimeOut = (string)($rowTimes['time_out_label'] ?? '');
+                $stmtTimes->close();
+            }
+        }
+
         $timerSnapshot = secsysFetchActiveVisitorTimers($conn);
 
         echo json_encode(array_merge([
             'success' => true,
+            'total_visitors' => $totalVisitorsToday,
             'log' => [
                 'id' => $logId,
                 'plate_number' => $plateClean,
@@ -309,10 +434,91 @@ if ($ajaxAction !== '') {
                 'vehicle_type' => $vehicleType,
                 'purpose' => $purpose,
                 'allowed_minutes' => $allowedMinutes,
-                'direction' => $direction
+                'direction' => $direction,
+                'visitor_name' => $saveVisitorName,
+                'address_to_visit' => $saveAddress,
+                'id_type' => $saveIdType ?? '',
+                'id_number' => $saveIdNumber ?? '',
+                'time_in_label' => $savedTimeIn,
+                'time_out_label' => $savedTimeOut
             ]
         ], $timerSnapshot));
 
+        $conn->close();
+        exit();
+    }
+
+    /* ---------------------------------------------------------
+       1B. CANCEL VISITOR MODAL (DISCARD WITHOUT SAVING TO DB)
+    --------------------------------------------------------- */
+    if ($ajaxAction === 'cancel_visitor_info' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+        header("Content-Type: application/json; charset=utf-8");
+
+        $pendingId = trim((string)($_POST['pending_id'] ?? ''));
+        $rawPlate = strtoupper(trim((string)($_POST['plate_number'] ?? '')));
+        $logId = (int)($_POST['log_id'] ?? 0);
+        $isAutoDetected = (int)($_POST['is_auto_detected'] ?? 0);
+
+        // Mark pending detection as cancelled so it is never inserted into MySQL
+        secsysResolvePendingVisitor($pendingId, $rawPlate, 'cancelled');
+
+        // Safety-net cleanup if an unconfirmed auto-detected placeholder row existed
+        if ($isAutoDetected === 1 && $logId > 0) {
+            $chkStmt = $conn->prepare("
+                SELECT id, visitor_vehicle_id, purpose, allowed_minutes
+                FROM vehicle_logs
+                WHERE id = ? AND vehicle_category = 'Visitor'
+                LIMIT 1
+            ");
+            if ($chkStmt) {
+                $chkStmt->bind_param("i", $logId);
+                $chkStmt->execute();
+                $chkRes = $chkStmt->get_result();
+                if ($chkRow = $chkRes->fetch_assoc()) {
+                    $purpLower = strtolower(trim((string)($chkRow['purpose'] ?? '')));
+                    $isUnconfirmed = ($chkRow['allowed_minutes'] === null)
+                        && ($purpLower === '' || $purpLower === 'visitor entry' || strpos($purpLower, 'needs review:') === 0);
+                    if ($isUnconfirmed) {
+                        $vvId = (int)($chkRow['visitor_vehicle_id'] ?? 0);
+                        $delVld = $conn->prepare("DELETE FROM vehicle_log_dates WHERE vehicle_log_id = ?");
+                        if ($delVld) {
+                            $delVld->bind_param("i", $logId);
+                            $delVld->execute();
+                            $delVld->close();
+                        }
+                        $delVl = $conn->prepare("DELETE FROM vehicle_logs WHERE id = ?");
+                        if ($delVl) {
+                            $delVl->bind_param("i", $logId);
+                            $delVl->execute();
+                            $delVl->close();
+                        }
+                        if ($vvId > 0) {
+                            $cntVv = $conn->prepare("SELECT COUNT(*) AS cnt FROM vehicle_logs WHERE visitor_vehicle_id = ?");
+                            if ($cntVv) {
+                                $cntVv->bind_param("i", $vvId);
+                                $cntVv->execute();
+                                $cntRow = $cntVv->get_result()->fetch_assoc();
+                                $cntVv->close();
+                                if ((int)($cntRow['cnt'] ?? 0) === 0) {
+                                    $delVv = $conn->prepare("DELETE FROM visitor_vehicles WHERE id = ?");
+                                    if ($delVv) {
+                                        $delVv->bind_param("i", $vvId);
+                                        $delVv->execute();
+                                        $delVv->close();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                $chkStmt->close();
+            }
+        }
+
+        echo json_encode([
+            'success' => true,
+            'cancelled' => true
+        ]);
         $conn->close();
         exit();
     }
@@ -334,8 +540,13 @@ if ($ajaxAction !== '') {
                 vl.vehicle_category,
                 vl.vehicle_type,
                 COALESCE(NULLIF(vl.purpose, ''), vv.purpose, '') AS purpose,
+                COALESCE(NULLIF(vl.visitor_name, ''), vv.visitor_name, '') AS visitor_name,
+                COALESCE(vv.address_to_visit, '') AS address_to_visit,
+                COALESCE(NULLIF(vl.id_type, ''), vv.id_type, '') AS id_type,
+                COALESCE(NULLIF(vl.id_number, ''), vv.id_number, '') AS id_number,
                 vl.direction,
-                vl.date_created
+                vl.date_created,
+                {$activityTimeColumns}
             FROM vehicle_logs vl
             LEFT JOIN visitor_vehicles vv
                 ON vl.visitor_vehicle_id = vv.id
@@ -374,15 +585,53 @@ if ($ajaxAction !== '') {
             $totalVisitorsToday = (int)$rowTot['vis_tot'];
         }
 
+        // Hourly breakdown for live vehicleChart update
+        $registeredHourly = array_fill(0, 24, 0);
+        $visitorHourly = array_fill(0, 24, 0);
+        $motorcycleHourly = array_fill(0, 24, 0);
+        $carHourly = array_fill(0, 24, 0);
+        $qHourly = $conn->query("
+            SELECT
+                HOUR(date_created) AS log_hour,
+                SUM(CASE WHEN vehicle_category = 'Registered' THEN 1 ELSE 0 END) AS reg_cnt,
+                SUM(CASE WHEN vehicle_category = 'Visitor' THEN 1 ELSE 0 END) AS vis_cnt,
+                SUM(CASE WHEN vehicle_type = 'Motorcycle' THEN 1 ELSE 0 END) AS moto_cnt,
+                SUM(CASE WHEN vehicle_type = 'Car' THEN 1 ELSE 0 END) AS car_cnt
+            FROM vehicle_logs
+            WHERE date_created >= CURDATE()
+            GROUP BY HOUR(date_created)
+        ");
+        if ($qHourly) {
+            while ($hrRow = $qHourly->fetch_assoc()) {
+                $h = (int)$hrRow['log_hour'];
+                if ($h >= 0 && $h < 24) {
+                    $registeredHourly[$h] = (int)$hrRow['reg_cnt'];
+                    $visitorHourly[$h] = (int)$hrRow['vis_cnt'];
+                    $motorcycleHourly[$h] = (int)$hrRow['moto_cnt'];
+                    $carHourly[$h] = (int)$hrRow['car_cnt'];
+                }
+            }
+        }
+
         // Second-precision per-duration reminders & overstay alarms
         $timerSnapshot = secsysFetchActiveVisitorTimers($conn);
+        $pendingVisitors = secsysGetPendingVisitors();
 
         echo json_encode(array_merge([
             'success' => true,
             'new_logs' => $newLogs,
+            'pending_visitors' => $pendingVisitors,
             'max_id' => $maxId,
             'total_registered' => $totalRegisteredToday,
             'total_visitors' => $totalVisitorsToday,
+            'chart' => [
+                'data' => [
+                    $registeredHourly,
+                    $visitorHourly,
+                    $motorcycleHourly,
+                    $carHourly
+                ]
+            ],
         ], $timerSnapshot));
 
         $conn->close();
@@ -435,6 +684,7 @@ if ($ajaxAction !== '') {
 ========================================================= */
 
 secsysEnsureSchema($conn);
+$guardExtraCameras = secsysLoadExtraCameras($conn);
 $systemName = secsysGetSystemName($conn);
 $systemIcon = secsysGetSystemIcon($conn);
 
@@ -786,8 +1036,13 @@ $sqlRecentVisitors = "
         vl.vehicle_category,
         vl.vehicle_type,
         COALESCE(NULLIF(vl.purpose, ''), vv.purpose, '') AS purpose,
+        COALESCE(NULLIF(vl.visitor_name, ''), vv.visitor_name, '') AS visitor_name,
+        COALESCE(vv.address_to_visit, '') AS address_to_visit,
+        COALESCE(NULLIF(vl.id_type, ''), vv.id_type, '') AS id_type,
+        COALESCE(NULLIF(vl.id_number, ''), vv.id_number, '') AS id_number,
         vl.direction,
-        vl.date_created
+        vl.date_created,
+        {$activityTimeColumns}
     FROM vehicle_logs vl
     LEFT JOIN visitor_vehicles vv
         ON vl.visitor_vehicle_id = vv.id
@@ -815,7 +1070,8 @@ $sqlRecentRegistered = "
         vl.vehicle_category,
         vl.vehicle_type,
         vl.direction,
-        vl.date_created
+        vl.date_created,
+        {$activityTimeColumns}
     FROM vehicle_logs vl
     WHERE DATE(vl.date_created) = ?
       AND LOWER(TRIM(vl.vehicle_category)) = 'registered'
@@ -870,7 +1126,7 @@ $conn->close();
 
 <!DOCTYPE html>
 
-<html lang="en">
+<html lang="en" class="ui-scale-fixed">
 
 <head>
 
@@ -889,6 +1145,7 @@ $conn->close();
 ====================================================== -->
 
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script src="assets/js/chart_zoom_fix.js?v=<?php echo (int)@filemtime(__DIR__ . '/assets/js/chart_zoom_fix.js'); ?>"></script>
 
 
 <style>
@@ -1677,7 +1934,6 @@ body {
     margin: 0 auto;
 }
 
-
 /* =========================================================
    CAMERA CARD
 ========================================================= */
@@ -2367,6 +2623,19 @@ body {
     color: #b91c1c !important;
     border: 1px solid #fca5a5 !important;
 }
+.dir-badge-monitor {
+    background: #e0f2fe !important;
+    color: #0369a1 !important;
+    border: 1px solid #7dd3fc !important;
+}
+.camera-card .camera-title {
+    min-width: 0;
+}
+.camera-card .camera-name {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
 .type-text {
     font-size: 11px;
     font-weight: 600;
@@ -2492,6 +2761,36 @@ body {
 .activity-header .activity-title {
 
     margin-bottom: 0;
+}
+
+.btn-manual-add-visitor {
+    position: absolute;
+    right: 0;
+    top: 50%;
+    transform: translateY(-50%);
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 3px 10px;
+    font-size: 11.5px;
+    font-weight: 700;
+    color: #ffffff;
+    background: #0284c7;
+    border: 1px solid #0369a1;
+    border-radius: 6px;
+    cursor: pointer;
+    box-shadow: 0 1px 3px rgba(2, 132, 199, 0.25);
+    transition: all 0.15s ease-in-out;
+}
+
+.btn-manual-add-visitor:hover {
+    background: #0369a1;
+    box-shadow: 0 2px 6px rgba(2, 132, 199, 0.35);
+    transform: translateY(-50%) scale(1.02);
+}
+
+.btn-manual-add-visitor:active {
+    transform: translateY(-50%) scale(0.98);
 }
 
 .activity-stack {
@@ -2661,24 +2960,43 @@ body {
     border: 1px solid #f59e0b;
 }
 
-.captured {
+/* Time In / Time Out on each activity row (replaced the "Captured" badge) */
+.activity-times {
 
-    background: #c5d8ef;
+    display: flex;
 
-    border-radius: 10px;
+    flex-direction: column;
 
-    padding: 3px 7px;
+    align-items: flex-end;
 
-    font-size: 8px;
+    gap: 1px;
+
+    background: rgba(255, 255, 255, 0.78);
+
+    border-radius: 8px;
+
+    padding: 2px 7px;
+
+    font-size: 9px;
 
     font-weight: 600;
 
+    line-height: 1.25;
+
     color: #374151;
+
+    white-space: nowrap;
 }
 
-.activity-card .captured {
+.activity-times .activity-time b {
 
-    background: #bbf2b5;
+    display: inline-block;
+
+    min-width: 20px;
+
+    font-weight: 800;
+
+    color: #6b7280;
 }
 
 
@@ -2765,6 +3083,20 @@ body {
     color: #333;
 
     margin-left: 15px;
+
+    display: inline-block;
+
+    transition: color 0.3s ease;
+}
+
+@keyframes statNumberPulse {
+    0% { transform: scale(1); }
+    35% { transform: scale(1.22); color: #16a34a; font-weight: 700; text-shadow: 0 0 10px rgba(22, 163, 74, 0.4); }
+    100% { transform: scale(1); }
+}
+
+.stat-number-updated {
+    animation: statNumberPulse 0.9s cubic-bezier(0.175, 0.885, 0.32, 1.275) !important;
 }
 
 
@@ -2901,9 +3233,15 @@ body {
 
     border-radius: 18px;
 
-    max-width: 440px;
+    max-width: 480px;
 
-    width: 100%;
+    width: 95%;
+
+    max-height: 92vh;
+
+    display: flex;
+
+    flex-direction: column;
 
     box-shadow: 0 14px 34px rgba(0, 0, 0, 0.26);
 
@@ -2925,6 +3263,8 @@ body {
     align-items: center;
 
     justify-content: space-between;
+
+    flex-shrink: 0;
 }
 
 .visitor-modal-title {
@@ -2960,6 +3300,10 @@ body {
 .visitor-modal-body {
 
     padding: 18px 20px;
+
+    overflow-y: auto;
+
+    max-height: calc(92vh - 130px);
 }
 
 .visitor-form-group {
@@ -3083,6 +3427,8 @@ body {
     justify-content: flex-end;
 
     gap: 8px;
+
+    flex-shrink: 0;
 }
 
 
@@ -3141,50 +3487,6 @@ body {
 }
 
 
-/* =========================================================
-   PRINT BUTTON
-========================================================= */
-
-.print-button {
-
-    display: block;
-
-    width: 175px;
-
-    height: 38px;
-
-    margin: 20px auto 0;
-
-    border: none;
-
-    border-radius: 22px;
-
-    background: #2f80ed;
-
-    color: white;
-
-    font-size: 14px;
-
-    cursor: pointer;
-
-    transition:
-        background 0.2s ease,
-        transform 0.15s ease;
-}
-
-
-.print-button:hover {
-
-    background: #176bd1;
-
-    transform: translateY(-1px);
-}
-
-
-.print-button:active {
-
-    transform: translateY(0);
-}
 
 
 /* =========================================================
@@ -3470,12 +3772,7 @@ body {
     }
 
 
-    .print-button {
 
-        width: 100%;
-
-        margin-top: 16px;
-    }
 }
 
 
@@ -3517,10 +3814,7 @@ body {
     }
 
 
-    .print-button {
 
-        display: none;
-    }
 
 
     .camera-card,
@@ -3533,6 +3827,9 @@ body {
 }
 
 </style>
+
+<!-- Enlarges the dashboard 25% on desktop (loaded after the page styles) -->
+<link rel="stylesheet" href="assets/css/ui_scale.css?v=<?php echo (int)@filemtime(__DIR__ . '/assets/css/ui_scale.css'); ?>">
 
 </head>
 
@@ -3692,8 +3989,15 @@ body {
                 <span class="notif-badge" id="notifBadge" style="display:none;">0</span>
             </button>
 
-            <div class="clock" id="liveClock">
-                12:30 AM
+            <div class="dual-clock">
+                <div class="clock-card" title="Time from internet time servers (NTP)">
+                    <div class="clock-label"><span>🌐 Internet Time</span><span class="clock-badge" id="internetClockStatus">Syncing…</span></div>
+                    <div class="clock" id="internetClock">--:--:--</div>
+                </div>
+                <div class="clock-card" title="This unit's own clock">
+                    <div class="clock-label"><span>🖥️ System Time</span><span class="clock-badge" id="systemClockDrift"></span></div>
+                    <div class="clock" id="liveClock"><?php echo date('h:i:s A'); ?></div>
+                </div>
             </div>
 
         </div>
@@ -3721,7 +4025,9 @@ body {
          CAMERA SECTION (TAPO C500 - 2 CAMERAS)
     ================================================== -->
 
-    <div class="camera-grid">
+    <!-- Entrance & Exit cards are fixed; cameras added by the Administrator
+         are appended after them by renderGuardExtraCameras() -->
+    <div class="camera-grid" id="cameraGrid">
 
 
         <!-- =============================================
@@ -3752,8 +4058,8 @@ body {
 
                 <img
                     id="entranceCamFeed"
-                    src="http://127.0.0.1:5000/video/entrance"
-                    alt="Tapo C500 Entrance Stream"
+                    src="http://localhost:5000/video/entrance"
+                    alt="Entrance Stream"
                     onload="onCamStreamLoad('entrance')"
                     onerror="onCamStreamError('entrance')"
                 >
@@ -3771,7 +4077,7 @@ body {
                     </div>
 
                     <div class="camera-offline-sub">
-                        Tapo C500 stream or AI detection server is not connected on this address.
+                        Camera stream or AI detection server is not connected on this address.
                     </div>
 
                     <div class="camera-offline-actions">
@@ -3789,7 +4095,7 @@ body {
                             class="btn-offline-setup"
                             onclick="openTapoModal('entrance')"
                         >
-                            ⚙️ Setup Tapo C500
+                            ⚙️ Setup
                         </button>
 
                     </div>
@@ -3838,8 +4144,8 @@ body {
 
                 <img
                     id="exitCamFeed"
-                    src="http://127.0.0.1:5000/video/exit"
-                    alt="Tapo C500 Exit Stream"
+                    src="http://localhost:5000/video/exit"
+                    alt="Exit Stream"
                     onload="onCamStreamLoad('exit')"
                     onerror="onCamStreamError('exit')"
                 >
@@ -3857,7 +4163,7 @@ body {
                     </div>
 
                     <div class="camera-offline-sub">
-                        Tapo C500 stream or AI detection server is not connected on this address.
+                        Camera stream or AI detection server is not connected on this address.
                     </div>
 
                     <div class="camera-offline-actions">
@@ -3875,7 +4181,7 @@ body {
                             class="btn-offline-setup"
                             onclick="openTapoModal('exit')"
                         >
-                            ⚙️ Setup Tapo C500
+                            ⚙️ Setup
                         </button>
 
                     </div>
@@ -3903,7 +4209,7 @@ body {
          RECENT VEHICLE ACTIVITY (STACKED, MAX 5, NO REFRESH)
     ================================================== -->
 
-    <div class="activity-grid" id="liveActivity" data-live>
+    <div class="activity-grid" id="liveActivity">
 
 
         <!-- =============================================
@@ -3918,6 +4224,15 @@ body {
                     Visitor
                 </div>
 
+                <button
+                    type="button"
+                    class="btn-manual-add-visitor"
+                    onclick="openManualVisitorModal()"
+                    title="Manually record a visitor"
+                >
+                    <span style="font-size: 13px; line-height: 1;">➕</span> Add Visitor
+                </button>
+
             </div>
 
             <div class="activity-stack" id="visitorActivityStack">
@@ -3928,11 +4243,13 @@ body {
                         $vLogId   = (int)($vehicle['id'] ?? 0);
                         $vPlate   = trim((string)($vehicle['plate_number'] ?? ''));
                         $vType    = trim((string)($vehicle['vehicle_type'] ?? 'Car'));
-                        if (!in_array($vType, ['Car', 'Motorcycle', 'Truck'], true)) {
-                            $vType = 'Car';
-                        }
+                        $vType = secsysNormalizeVehicleType($vType);
                         $vPurpose = trim((string)($vehicle['purpose'] ?? ''));
                         $vDir     = trim((string)($vehicle['direction'] ?? 'IN'));
+                        $vName    = trim((string)($vehicle['visitor_name'] ?? ''));
+                        $vAddr    = trim((string)($vehicle['address_to_visit'] ?? ''));
+                        $vIdType  = trim((string)($vehicle['id_type'] ?? ''));
+                        $vIdNum   = trim((string)($vehicle['id_number'] ?? ''));
                     ?>
 
                         <?php
@@ -3945,6 +4262,10 @@ body {
                             data-plate="<?php echo htmlspecialchars($vPlate, ENT_QUOTES); ?>"
                             data-vehicle-type="<?php echo htmlspecialchars($vType, ENT_QUOTES); ?>"
                             data-purpose="<?php echo htmlspecialchars($vPurpose, ENT_QUOTES); ?>"
+                            data-visitor-name="<?php echo htmlspecialchars($vName, ENT_QUOTES); ?>"
+                            data-address="<?php echo htmlspecialchars($vAddr, ENT_QUOTES); ?>"
+                            data-id-type="<?php echo htmlspecialchars($vIdType, ENT_QUOTES); ?>"
+                            data-id-number="<?php echo htmlspecialchars($vIdNum, ENT_QUOTES); ?>"
                             <?php if ($isOutVis): ?>
                                 onclick="openVisitorExitModalFromRow(this)"
                                 title="Visitor vehicle exited premises (Click to view exit details)"
@@ -3957,7 +4278,7 @@ body {
                             <div class="vehicle-info">
 
                                 <div class="vehicle-plate">
-                                    <span class="plate-text"><?php echo htmlspecialchars($vPlate); ?></span>
+                                    <span class="plate-text"><?php echo secsysClickablePlateHtml($vPlate, ['log_id' => $vLogId]); ?></span>
                                 </div>
 
                                 <div class="vehicle-direction">
@@ -3989,9 +4310,7 @@ body {
                                     </span>
                                 <?php endif; ?>
 
-                                <div class="captured">
-                                    Captured
-                                </div>
+                                <?php echo guardActivityTimesHtml($vDir, $vehicle['time_in_label'] ?? '', $vehicle['time_out_label'] ?? ''); ?>
 
                             </div>
 
@@ -4054,7 +4373,7 @@ body {
                             <div class="vehicle-info">
 
                                 <div class="vehicle-plate">
-                                    <span class="plate-text"><?php echo htmlspecialchars($rPlate); ?></span>
+                                    <span class="plate-text"><?php echo secsysClickablePlateHtml($rPlate, ['log_id' => $rLogId]); ?></span>
                                 </div>
 
                                 <div class="vehicle-direction">
@@ -4070,9 +4389,7 @@ body {
 
                             <div class="vehicle-badges">
 
-                                <div class="captured">
-                                    Captured
-                                </div>
+                                <?php echo guardActivityTimesHtml($rDir, $vehicle['time_in_label'] ?? '', $vehicle['time_out_label'] ?? ''); ?>
 
                             </div>
 
@@ -4101,7 +4418,7 @@ body {
          TOTALS (ALIGNED UNDER VISITOR & REGISTERED CARDS)
     ================================================== -->
 
-    <div class="total-cards" id="liveTotals" data-live>
+    <div class="total-cards" id="liveTotals">
 
 
         <!-- VISITOR (LEFT - ALIGNED WITH VISITOR ACTIVITY CARD ABOVE) -->
@@ -4198,17 +4515,6 @@ body {
 
 
 
-    <!-- =================================================
-         PRINT
-    ================================================== -->
-
-    <button
-        class="print-button"
-        onclick="printDashboard()">
-
-        🖨️ Print Report
-
-    </button>
 
 
 </main>
@@ -4268,10 +4574,10 @@ body {
                 </label>
                 <div class="cam-presets-container">
                     <button type="button" class="btn-cam-preset" onclick="applyPresetDualTapo()">
-                        📹 2x Tapo C500 (RTSP)
+                        📹 2x (RTSP)
                     </button>
                     <button type="button" class="btn-cam-preset" onclick="applyPresetTapoAndWebcam()">
-                        🎥 Tapo Entrance + USB Exit
+                        🎥 Entrance + USB Exit
                     </button>
                     <button type="button" class="btn-cam-preset" onclick="applyPresetDualWebcams()">
                         💻 Dual USB Webcams (0 & 1)
@@ -4291,8 +4597,13 @@ body {
                     </span>
                 </div>
 
+                <div class="tapo-form-group" id="entranceEnabledRow">
+                    <label style="display:block;"><input type="checkbox" id="cfgEntranceEnabled" checked> Enable entrance camera (automatic IN)</label>
+                    <div class="tapo-help-text">Turn a camera off when it is not installed or not needed; its panel is hidden from the dashboard.</div>
+                </div>
+
                 <div class="tapo-form-group">
-                    <label for="cfgEntranceSource">Hardware Source (Tapo RTSP URL or USB Cam Index):</label>
+                    <label for="cfgEntranceSource">Hardware Source ( RTSP URL or USB Cam Index):</label>
                     <input
                         type="text"
                         id="cfgEntranceSource"
@@ -4318,7 +4629,7 @@ body {
                     <input
                         type="text"
                         id="cfgEntranceUrl"
-                        placeholder="http://127.0.0.1:5000/video/entrance"
+                        placeholder="http://localhost:5000/video/entrance"
                     >
                 </div>
             </div>
@@ -4337,14 +4648,14 @@ body {
 
                 <div class="tapo-form-group">
                     <label style="display:block; margin-bottom:10px;"><input type="checkbox" id="cfgExitEnabled" checked> Enable exit camera (automatic OUT)</label>
-                    <label for="cfgExitSource">Hardware Source (Tapo RTSP URL or USB Cam Index):</label>
+                    <label for="cfgExitSource">Hardware Source (RTSP URL or USB Cam Index):</label>
                     <input
                         type="text"
                         id="cfgExitSource"
-                        placeholder="rtsp://username:password@SECOND_CAMERA_IP:554/stream1"
+                        placeholder="1"
                     >
                     <div class="tapo-help-text">
-                        For a second Tapo camera: <code>rtsp://...IP:554/stream2</code> | For USB webcam: <code>0</code> or <code>1</code>
+                        For local USB webcam: <code>1</code> (or <code>0</code>) | For RTSP: <code>rtsp://username:password@IP:554/stream2</code>
                     </div>
                 </div>
 
@@ -4363,7 +4674,7 @@ body {
                     <input
                         type="text"
                         id="cfgExitUrl"
-                        placeholder="http://127.0.0.1:5000/video/exit"
+                        placeholder="http://localhost:5000/video/exit"
                     >
                 </div>
             </div>
@@ -4436,6 +4747,8 @@ body {
                 <div class="visitor-form-error" id="visitorFormError"></div>
 
                 <input type="hidden" id="visitorLogId" value="0">
+                <input type="hidden" id="visitorPendingId" value="">
+                <input type="hidden" id="visitorIsAutoDetected" value="0">
 
                 <div class="visitor-form-group">
 
@@ -4460,6 +4773,9 @@ body {
                         <option value="Car">Car</option>
                         <option value="Motorcycle">Motorcycle</option>
                         <option value="Truck">Truck</option>
+                        <option value="Tricycle">Tricycle</option>
+                        <option value="E-Bike">E-Bike</option>
+                        <option value="Bike">Bike</option>
                     </select>
 
                 </div>
@@ -4515,6 +4831,86 @@ body {
 
                     <!-- Live Reminder & Overstay Alarm Schedule Preview -->
                     <div id="visitorSchedulePreview" style="display:none; margin-top:10px; padding:9px 12px; background:#fffbeb; border:1px solid #fde68a; border-left:4px solid #f59e0b; border-radius:8px; font-size:11.5px; color:#78350f; line-height:1.45;">
+                    </div>
+
+                </div>
+
+                <!-- =============================================
+                     VISITOR ID CONSENT & IDENTIFICATION (OPTIONAL)
+                ============================================== -->
+                <div class="visitor-form-group visitor-consent-section" style="margin-top: 14px; padding-top: 12px; border-top: 1px solid #e2e8f0;">
+
+                    <label for="visitorConsentCheckbox" style="display:flex; align-items:center; justify-content:space-between; margin-bottom:0; cursor:pointer; user-select:none;">
+                        <span style="display:flex; align-items:center; gap:8px; font-size:13px; font-weight:600; color:#1e293b;">
+                            <input
+                                type="checkbox"
+                                id="visitorConsentCheckbox"
+                                name="visitor_consent"
+                                value="1"
+                                onchange="toggleVisitorConsent()"
+                                style="width:17px; height:17px; cursor:pointer; accent-color:#0284c7;"
+                            >
+                            <span>Visitor consents to give ID</span>
+                        </span>
+                        <span style="font-size:11px; font-weight:500; color:#64748b; background:#f1f5f9; padding:2px 7px; border-radius:10px;">Optional</span>
+                    </label>
+
+                    <!-- ID Fill Box (visible only when consent is checked) -->
+                    <div id="visitorIdFillBox" style="display:none; margin-top:10px; padding:12px; background:#f8fafc; border:1px solid #cbd5e1; border-radius:10px; transition: all 0.2s ease;">
+
+                        <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px; margin-bottom:10px;">
+                            <div>
+                                <label for="visitorIdTypeInput" style="font-size:11.5px; color:#334155; font-weight:700; display:block; margin-bottom:4px;">ID Type</label>
+                                <select id="visitorIdTypeInput" name="id_type" style="width:100%; padding:8px 10px; border:1px solid #cbd5e1; border-radius:7px; font-size:12.5px; background:#ffffff;">
+                                    <option value="" disabled selected>-- Select ID --</option>
+                                    <option value="PhilHealth">PhilHealth</option>
+                                    <option value="National ID">National ID</option>
+                                    <option value="SSS">SSS</option>
+                                    <option value="Postal">Postal</option>
+                                    <option value="PWD">PWD</option>
+                                    <option value="Senior Citizen">Senior Citizen</option>
+                                    <option value="Driver's License">Driver's License</option>
+                                    <option value="TIN">TIN</option>
+                                    <option value="Pag-Ibig">Pag-Ibig</option>
+                                </select>
+                            </div>
+
+                            <div>
+                                <label for="visitorIdNumberInput" style="font-size:11.5px; color:#334155; font-weight:700; display:block; margin-bottom:4px;">ID Number</label>
+                                <input
+                                    type="text"
+                                    id="visitorIdNumberInput"
+                                    name="id_number"
+                                    placeholder="e.g. 12-3456789-0"
+                                    style="width:100%; padding:8px 10px; border:1px solid #cbd5e1; border-radius:7px; font-size:12.5px; background:#ffffff;"
+                                >
+                            </div>
+                        </div>
+
+                        <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px;">
+                            <div>
+                                <label for="visitorNameInput" style="font-size:11.5px; color:#334155; font-weight:700; display:block; margin-bottom:4px;">Name</label>
+                                <input
+                                    type="text"
+                                    id="visitorNameInput"
+                                    name="visitor_name"
+                                    placeholder="Visitor Full Name"
+                                    style="width:100%; padding:8px 10px; border:1px solid #cbd5e1; border-radius:7px; font-size:12.5px; background:#ffffff;"
+                                >
+                            </div>
+
+                            <div>
+                                <label for="visitorAddressInput" style="font-size:11.5px; color:#334155; font-weight:700; display:block; margin-bottom:4px;">Address</label>
+                                <input
+                                    type="text"
+                                    id="visitorAddressInput"
+                                    name="address_to_visit"
+                                    placeholder="House / Unit / Address"
+                                    style="width:100%; padding:8px 10px; border:1px solid #cbd5e1; border-radius:7px; font-size:12.5px; background:#ffffff;"
+                                >
+                            </div>
+                        </div>
+
                     </div>
 
                 </div>
@@ -4625,47 +5021,21 @@ body {
 <script>
 
 /* =========================================================
+   VEHICLE TYPES (mirrors SECSYS_VEHICLE_TYPES in app/system_config.php)
+========================================================= */
+const SECSYS_VEHICLE_TYPES = <?php echo json_encode(SECSYS_VEHICLE_TYPES, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT); ?>;
+
+function normalizeVehicleTypeJs(value) {
+    const v = String(value || "").trim().toLowerCase();
+    const match = SECSYS_VEHICLE_TYPES.find(t => t.toLowerCase() === v);
+    return match || "Car";
+}
+
+/* =========================================================
    LIVE CLOCK
 ========================================================= */
 
-function updateClock() {
-
-    const now = new Date();
-
-    let hours = now.getHours();
-
-    let minutes = now.getMinutes();
-
-    let seconds = now.getSeconds();
-
-    const period = hours >= 12 ? "PM" : "AM";
-
-    hours = hours % 12;
-
-    hours = hours ? hours : 12;
-
-    minutes =
-        minutes < 10
-            ? "0" + minutes
-            : minutes;
-
-    seconds =
-        seconds < 10
-            ? "0" + seconds
-            : seconds;
-
-
-    document.getElementById("liveClock").textContent =
-        hours + ":" +
-        minutes + ":" +
-        seconds + " " +
-        period;
-}
-
-
-updateClock();
-
-setInterval(updateClock, 1000);
+/* Live clocks (Internet + System) are driven by assets/js/dual_clock.js */
 
 /* =========================================================
    GUARD HEARTBEAT
@@ -4954,15 +5324,7 @@ const vehicleChart =
 
 
 
-/* =========================================================
-   PRINT DASHBOARD
-========================================================= */
 
-function printDashboard() {
-
-    window.print();
-
-}
 
 
 /* =========================================================
@@ -4973,6 +5335,8 @@ const MAX_STACK_ITEMS = 5;
 let lastSeenLogId = <?php echo (int)$latestLogIdToday; ?>;
 const INITIAL_TODAY_LOGS = <?php echo json_encode($initialLogsToday ?? []); ?>;
 const promptedVisitorLogIds = new Set();
+const handledPendingVisitorIds = new Set();
+let pendingVisitorModalQueue = [];
 
 function escapeHtmlText(str) {
     const div = document.createElement("div");
@@ -5096,15 +5460,53 @@ function showVisitorArrivalNotification(plateNumber, vehicleType, purpose) {
     }, 8000);
 }
 
-function openVisitorModal(plateNumber, vehicleType, purpose, logId, isAutoDetected) {
+function toggleVisitorConsent() {
+    const consentCb = document.getElementById("visitorConsentCheckbox");
+    const fillBox = document.getElementById("visitorIdFillBox");
+    const idTypeSelect = document.getElementById("visitorIdTypeInput");
+    if (!consentCb || !fillBox) return;
+
+    if (consentCb.checked) {
+        fillBox.style.display = "block";
+        if (idTypeSelect && !idTypeSelect.value) {
+            idTypeSelect.focus();
+        }
+    } else {
+        fillBox.style.display = "none";
+    }
+}
+
+function openManualVisitorModal() {
+    openVisitorModal("", "Car", "", 0, false, "", {
+        isManual: true,
+        consent: false,
+        idType: "",
+        idNumber: "",
+        visitorName: "",
+        address: ""
+    });
+}
+
+function openVisitorModal(plateNumber, vehicleType, purpose, logId, isAutoDetected, pendingId, extraInfo) {
 
     const modal = document.getElementById("visitorInfoModal");
     const plateInput = document.getElementById("visitorPlateInput");
     const typeSelect = document.getElementById("visitorVehicleTypeInput");
     const purposeInput = document.getElementById("visitorPurposeInput");
     const logIdInput = document.getElementById("visitorLogId");
+    const pendingIdInput = document.getElementById("visitorPendingId");
+    const isAutoInput = document.getElementById("visitorIsAutoDetected");
     const badge = document.getElementById("visitorModalBadge");
     const errBox = document.getElementById("visitorFormError");
+
+    const consentCb = document.getElementById("visitorConsentCheckbox");
+    const fillBox = document.getElementById("visitorIdFillBox");
+    const idTypeSelect = document.getElementById("visitorIdTypeInput");
+    const idNumberInput = document.getElementById("visitorIdNumberInput");
+    const nameInput = document.getElementById("visitorNameInput");
+    const addressInput = document.getElementById("visitorAddressInput");
+
+    extraInfo = extraInfo || {};
 
     if (!modal) return;
 
@@ -5116,19 +5518,21 @@ function openVisitorModal(plateNumber, vehicleType, purpose, logId, isAutoDetect
     if (logIdInput) {
         logIdInput.value = logId ? String(logId) : "0";
     }
+    if (pendingIdInput) {
+        pendingIdInput.value = pendingId ? String(pendingId) : "";
+    }
+    if (isAutoInput) {
+        isAutoInput.value = isAutoDetected ? "1" : "0";
+    }
     if (plateInput) {
         plateInput.value = (plateNumber || "").toUpperCase();
     }
     if (typeSelect) {
-        const vtLower = (vehicleType || "").toLowerCase();
-        const normalizedType =
-            vtLower === "motorcycle"
-                ? "Motorcycle"
-                : (vtLower === "truck" ? "Truck" : "Car");
-        typeSelect.value = normalizedType;
+        typeSelect.value = normalizeVehicleTypeJs(vehicleType);
     }
+    const isReviewHint = Boolean(purpose && purpose.toLowerCase().startsWith("needs review:"));
     if (purposeInput) {
-        const cleanPurp = (purpose && purpose.toLowerCase() !== "visitor entry") ? purpose : "";
+        const cleanPurp = (purpose && purpose.toLowerCase() !== "visitor entry" && !isReviewHint) ? purpose : "";
         if (cleanPurp) {
             let matched = false;
             for (let i = 0; i < purposeInput.options.length; i++) {
@@ -5149,8 +5553,45 @@ function openVisitorModal(plateNumber, vehicleType, purpose, logId, isAutoDetect
         }
     }
     onVisitorPurposeChange();
+
+    // ID Consent & Info fields
+    const hasConsent = Boolean(
+        extraInfo.consent ||
+        extraInfo.idType ||
+        extraInfo.idNumber ||
+        (extraInfo.visitorName && extraInfo.visitorName.toLowerCase() !== "visitor")
+    );
+    if (consentCb) {
+        consentCb.checked = hasConsent;
+    }
+    if (fillBox) {
+        fillBox.style.display = hasConsent ? "block" : "none";
+    }
+    if (idTypeSelect) {
+        idTypeSelect.value = extraInfo.idType || "";
+    }
+    if (idNumberInput) {
+        idNumberInput.value = extraInfo.idNumber || "";
+    }
+    if (nameInput) {
+        nameInput.value = (extraInfo.visitorName && extraInfo.visitorName.toLowerCase() !== "visitor")
+            ? extraInfo.visitorName
+            : "";
+    }
+    if (addressInput) {
+        addressInput.value = (extraInfo.address && extraInfo.address !== "-")
+            ? extraInfo.address
+            : "";
+    }
+
     if (badge) {
-        badge.textContent = isAutoDetected ? "New Visitor Detected" : "Visitor Entry";
+        if (extraInfo.isManual) {
+            badge.textContent = "Manual Visitor Entry";
+        } else {
+            badge.textContent = isReviewHint
+                ? "Verify Plate Reading"
+                : (isAutoDetected ? "New Visitor Detected" : "Visitor Entry");
+        }
     }
 
     modal.classList.add("active");
@@ -5171,15 +5612,109 @@ function openVisitorModalFromRow(rowEl) {
     const plate = rowEl.getAttribute("data-plate") || "";
     const vType = rowEl.getAttribute("data-vehicle-type") || "Car";
     const purpose = rowEl.getAttribute("data-purpose") || "";
+    const vName = rowEl.getAttribute("data-visitor-name") || "";
+    const vAddr = rowEl.getAttribute("data-address") || "";
+    const vIdType = rowEl.getAttribute("data-id-type") || "";
+    const vIdNum = rowEl.getAttribute("data-id-number") || "";
+    const hasConsent = Boolean(vIdType || vIdNum || (vName && vName.toLowerCase() !== "visitor"));
 
-    openVisitorModal(plate, vType, purpose, logId, false);
+    openVisitorModal(plate, vType, purpose, logId, false, "", {
+        consent: hasConsent,
+        idType: vIdType,
+        idNumber: vIdNum,
+        visitorName: vName,
+        address: vAddr
+    });
 }
 
-function closeVisitorModal() {
+function closeVisitorModal(wasSaved) {
 
     const modal = document.getElementById("visitorInfoModal");
-    if (modal) {
-        modal.classList.remove("active");
+    if (!modal || !modal.classList.contains("active")) return;
+
+    const logIdInput = document.getElementById("visitorLogId");
+    const pendingIdInput = document.getElementById("visitorPendingId");
+    const isAutoInput = document.getElementById("visitorIsAutoDetected");
+    const plateInput = document.getElementById("visitorPlateInput");
+
+    const logId = logIdInput ? parseInt(logIdInput.value || "0", 10) : 0;
+    const pendingId = pendingIdInput ? pendingIdInput.value.trim() : "";
+    const isAuto = isAutoInput && isAutoInput.value === "1";
+    const plateVal = plateInput ? plateInput.value.trim().toUpperCase() : "";
+
+    const consentCb = document.getElementById("visitorConsentCheckbox");
+    const fillBox = document.getElementById("visitorIdFillBox");
+    const idTypeSelect = document.getElementById("visitorIdTypeInput");
+    const idNumberInput = document.getElementById("visitorIdNumberInput");
+    const nameInput = document.getElementById("visitorNameInput");
+    const addressInput = document.getElementById("visitorAddressInput");
+
+    if (consentCb) consentCb.checked = false;
+    if (fillBox) fillBox.style.display = "none";
+    if (idTypeSelect) idTypeSelect.value = "";
+    if (idNumberInput) idNumberInput.value = "";
+    if (nameInput) nameInput.value = "";
+    if (addressInput) addressInput.value = "";
+
+    if (logIdInput) logIdInput.value = "0";
+    if (pendingIdInput) pendingIdInput.value = "";
+    if (isAutoInput) isAutoInput.value = "0";
+
+    modal.classList.remove("active");
+
+    // If the guard cancelled/dismissed an auto-detected visitor form without saving,
+    // discard the pending detection so the plate number is NEVER stored in the database.
+    if (!wasSaved && (pendingId !== "" || (isAuto && logId > 0))) {
+        const cancelData = new FormData();
+        cancelData.append("action", "cancel_visitor_info");
+        cancelData.append("pending_id", pendingId);
+        cancelData.append("plate_number", plateVal);
+        cancelData.append("log_id", String(logId));
+        cancelData.append("is_auto_detected", isAuto ? "1" : "0");
+
+        fetch(window.location.pathname, {
+            method: "POST",
+            body: cancelData
+        }).catch(function () {});
+
+        if (isAuto && logId > 0) {
+            const visStack = document.getElementById("visitorActivityStack");
+            if (visStack) {
+                const rowEl = visStack.querySelector('.vehicle-item[data-log-id="' + logId + '"]');
+                if (rowEl) rowEl.remove();
+                if (visStack.querySelectorAll(".vehicle-item").length === 0 && !visStack.querySelector(".empty-activity")) {
+                    const emptyDiv = document.createElement("div");
+                    emptyDiv.className = "empty-activity";
+                    emptyDiv.id = "visitorEmptyMsg";
+                    emptyDiv.textContent = "No visitor vehicle captured today.";
+                    visStack.appendChild(emptyDiv);
+                }
+            }
+        }
+
+        const toastBox = document.getElementById("visitorToastContainer");
+        if (toastBox && plateVal) {
+            const toasts = toastBox.querySelectorAll(".visitor-toast");
+            toasts.forEach(function (t) {
+                if (t.textContent && t.textContent.toUpperCase().indexOf(plateVal) !== -1) {
+                    t.remove();
+                }
+            });
+        }
+    }
+
+    if (pendingVisitorModalQueue.length > 0) {
+        const nextPv = pendingVisitorModalQueue.shift();
+        setTimeout(function () {
+            openVisitorModal(
+                nextPv.plate_number || "",
+                nextPv.vehicle_type || "Car",
+                nextPv.purpose || "",
+                0,
+                true,
+                nextPv.pending_id || ""
+            );
+        }, 150);
     }
 }
 
@@ -5264,6 +5799,37 @@ function setQuickPurpose(purposeText) {
     }
 }
 
+/* Time shown on an activity row: "In 6:34 AM" on IN rows, "Out 6:35 AM" on OUT rows. */
+function activityTimesHtml(isOut, timeLabel) {
+    const label = isOut ? "Out" : "In";
+    const time = String(timeLabel || "").trim() || "—";
+    return '<div class="activity-times" title="Time ' + label + ': ' + escapeHtmlText(time) + '">' +
+        '<span class="activity-time"><b>' + label + '</b> <span class="time-value">' + escapeHtmlText(time) + '</span></span>' +
+        '</div>';
+}
+
+/* Update a row's time in place when the row is refreshed (e.g. IN turns into OUT). */
+function updateActivityTimes(rowEl, logData, isOut) {
+    if (!rowEl) return;
+    const badgesBox = rowEl.querySelector(".vehicle-badges");
+    if (!badgesBox) return;
+
+    const newTime = String((isOut ? logData.time_out_label : logData.time_in_label) || "").trim();
+    const box = rowEl.querySelector(".activity-times");
+    const shownLabel = box ? ((box.querySelector("b") || {}).textContent || "") : "";
+    const sameDirection = shownLabel === (isOut ? "Out" : "In");
+
+    // Nothing new to show for the same direction: keep the time already displayed
+    if (box && sameDirection && !newTime) return;
+
+    const html = activityTimesHtml(isOut, newTime);
+    if (box) {
+        box.outerHTML = html;
+    } else {
+        badgesBox.insertAdjacentHTML("beforeend", html);
+    }
+}
+
 function stackVehicleItem(logData) {
 
     if (!logData || !logData.plate_number) return;
@@ -5285,8 +5851,7 @@ function stackVehicleItem(logData) {
     const logId = parseInt(logData.id || "0", 10);
     const plate = String(logData.plate_number || "").trim().toUpperCase();
     const rawType = String(logData.vehicle_type || "").trim();
-    const rtLower = rawType.toLowerCase();
-    const vType = rtLower === "motorcycle" ? "Motorcycle" : (rtLower === "truck" ? "Truck" : "Car");
+    const vType = normalizeVehicleTypeJs(rawType);
     const purpose = String(logData.purpose || "").trim();
     const direction = String(logData.direction || "IN").trim().toUpperCase();
 
@@ -5317,13 +5882,19 @@ function stackVehicleItem(logData) {
         existingItem.setAttribute("data-vehicle-type", vType);
         existingItem.setAttribute("data-purpose", purpose);
         existingItem.setAttribute("data-direction", direction);
+        if (logData.visitor_name) existingItem.setAttribute("data-visitor-name", logData.visitor_name);
+        if (logData.address_to_visit) existingItem.setAttribute("data-address", logData.address_to_visit);
+        if (logData.id_type) existingItem.setAttribute("data-id-type", logData.id_type);
+        if (logData.id_number) existingItem.setAttribute("data-id-number", logData.id_number);
 
         // Update entire row color based on IN vs OUT
         existingItem.classList.remove("row-in", "row-out");
         existingItem.classList.add(isOut ? "row-out" : "row-in");
 
         const plateSpan = existingItem.querySelector(".plate-text");
-        if (plateSpan) plateSpan.textContent = plate;
+        if (plateSpan) {
+            plateSpan.innerHTML = '<a href="vehicle_photo.php?plate=' + encodeURIComponent(plate) + (logId > 0 ? '&ids=' + logId : '') + '" class="secsys-plate-link" data-plate="' + escapeHtmlText(plate) + '" data-ids="' + (logId > 0 ? logId : '') + '" onclick="return window.secsysOpenPlateCaptureModal ? window.secsysOpenPlateCaptureModal(event, this) : true;" title="Click to view YOLOv10 captured license plate &amp; vehicle image">' + escapeHtmlText(plate) + '</a>';
+        }
 
         const subContainer = existingItem.querySelector(".vehicle-direction");
         if (subContainer) {
@@ -5388,6 +5959,7 @@ function stackVehicleItem(logData) {
                 window.VisitorDurationAlarm.updateInlineTimerBadges();
             }
         }
+        updateActivityTimes(existingItem, logData, isOut);
         return;
     }
 
@@ -5406,6 +5978,10 @@ function stackVehicleItem(logData) {
     if (isVisitor) {
         itemDiv.setAttribute("data-vehicle-type", vType);
         itemDiv.setAttribute("data-purpose", purpose);
+        if (logData.visitor_name) itemDiv.setAttribute("data-visitor-name", logData.visitor_name);
+        if (logData.address_to_visit) itemDiv.setAttribute("data-address", logData.address_to_visit);
+        if (logData.id_type) itemDiv.setAttribute("data-id-type", logData.id_type);
+        if (logData.id_number) itemDiv.setAttribute("data-id-number", logData.id_number);
 
         let pillHtml = "";
         let timerHtml = "";
@@ -5427,9 +6003,11 @@ function stackVehicleItem(logData) {
                 : '<span class="purpose-pill needs-info">Input Info</span>';
         }
 
+        const clickablePlateLink = '<a href="vehicle_photo.php?plate=' + encodeURIComponent(plate) + (logId > 0 ? '&ids=' + logId : '') + '" class="secsys-plate-link" data-plate="' + escapeHtmlText(plate) + '" data-ids="' + (logId > 0 ? logId : '') + '" onclick="return window.secsysOpenPlateCaptureModal ? window.secsysOpenPlateCaptureModal(event, this) : true;" title="Click to view YOLOv10 captured license plate &amp; vehicle image">' + escapeHtmlText(plate) + '</a>';
+
         itemDiv.innerHTML =
             '<div class="vehicle-info">' +
-                '<div class="vehicle-plate"><span class="plate-text">' + escapeHtmlText(plate) + '</span></div>' +
+                '<div class="vehicle-plate"><span class="plate-text">' + clickablePlateLink + '</span></div>' +
                 '<div class="vehicle-direction">' +
                     '<span class="type-text">' + escapeHtmlText(vType) + '</span> ' +
                     (isOut ? '<span class="dir-badge dir-badge-out">🔴 OUT</span>' : '<span class="dir-badge dir-badge-in">🟢 IN</span>') +
@@ -5438,19 +6016,21 @@ function stackVehicleItem(logData) {
             '<div class="vehicle-badges">' +
                 timerHtml +
                 pillHtml +
-                '<div class="captured">Captured</div>' +
+                activityTimesHtml(isOut, isOut ? logData.time_out_label : logData.time_in_label) +
             '</div>';
     } else {
+        const clickablePlateLink = '<a href="vehicle_photo.php?plate=' + encodeURIComponent(plate) + (logId > 0 ? '&ids=' + logId : '') + '" class="secsys-plate-link" data-plate="' + escapeHtmlText(plate) + '" data-ids="' + (logId > 0 ? logId : '') + '" onclick="return window.secsysOpenPlateCaptureModal ? window.secsysOpenPlateCaptureModal(event, this) : true;" title="Click to view YOLOv10 captured license plate &amp; vehicle image">' + escapeHtmlText(plate) + '</a>';
+
         itemDiv.innerHTML =
             '<div class="vehicle-info">' +
-                '<div class="vehicle-plate"><span class="plate-text">' + escapeHtmlText(plate) + '</span></div>' +
+                '<div class="vehicle-plate"><span class="plate-text">' + clickablePlateLink + '</span></div>' +
                 '<div class="vehicle-direction">' +
                     ((rawType && rawType.toLowerCase() !== "unknown") ? '<span class="type-text">' + escapeHtmlText(rawType) + '</span> ' : '') +
                     (isOut ? '<span class="dir-badge dir-badge-out">🔴 OUT</span>' : '<span class="dir-badge dir-badge-in">🟢 IN</span>') +
                 '</div>' +
             '</div>' +
             '<div class="vehicle-badges">' +
-                '<div class="captured">Captured</div>' +
+                activityTimesHtml(isOut, isOut ? logData.time_out_label : logData.time_in_label) +
             '</div>';
     }
 
@@ -5474,6 +6054,7 @@ async function saveVisitorInfo(e) {
     const typeSelect = document.getElementById("visitorVehicleTypeInput");
     const purposeInput = document.getElementById("visitorPurposeInput");
     const logIdInput = document.getElementById("visitorLogId");
+    const pendingIdInput = document.getElementById("visitorPendingId");
     const errBox = document.getElementById("visitorFormError");
     const saveBtn = document.getElementById("btnSaveVisitorInfo");
 
@@ -5481,9 +6062,23 @@ async function saveVisitorInfo(e) {
     const vType = (typeSelect ? typeSelect.value : "Car");
     const purpose = (purposeInput ? purposeInput.value.trim() : "");
     const logId = (logIdInput ? parseInt(logIdInput.value || "0", 10) : 0);
+    const pendingId = (pendingIdInput ? pendingIdInput.value.trim() : "");
+    const wasNewArrival = (logId <= 0);
     const customPurposeEl = document.getElementById("visitorCustomPurposeInput");
     const customPurpose = customPurposeEl ? customPurposeEl.value.trim() : "";
     const customMins = purpose === "__CUSTOM__" ? getCustomDurationMinutesFromModal() : 0;
+
+    const consentCb = document.getElementById("visitorConsentCheckbox");
+    const idTypeSelect = document.getElementById("visitorIdTypeInput");
+    const idNumberInput = document.getElementById("visitorIdNumberInput");
+    const nameInput = document.getElementById("visitorNameInput");
+    const addressInput = document.getElementById("visitorAddressInput");
+
+    const consentChecked = Boolean(consentCb && consentCb.checked);
+    const idType = (idTypeSelect ? idTypeSelect.value.trim() : "");
+    const idNumber = (idNumberInput ? idNumberInput.value.trim() : "");
+    const visitorName = (nameInput ? nameInput.value.trim() : "");
+    const addressToVisit = (addressInput ? addressInput.value.trim() : "");
 
     if (!plate || !purpose) {
         if (errBox) {
@@ -5491,6 +6086,33 @@ async function saveVisitorInfo(e) {
             errBox.style.display = "block";
         }
         return;
+    }
+
+    if (consentChecked) {
+        if (!idType) {
+            if (errBox) {
+                errBox.textContent = "Please select an ID Type for the visitor.";
+                errBox.style.display = "block";
+            }
+            if (idTypeSelect) idTypeSelect.focus();
+            return;
+        }
+        if (!idNumber) {
+            if (errBox) {
+                errBox.textContent = "Please enter the ID Number.";
+                errBox.style.display = "block";
+            }
+            if (idNumberInput) idNumberInput.focus();
+            return;
+        }
+        if (!visitorName) {
+            if (errBox) {
+                errBox.textContent = "Please enter the visitor's Name.";
+                errBox.style.display = "block";
+            }
+            if (nameInput) nameInput.focus();
+            return;
+        }
     }
 
     if (purpose === "__CUSTOM__" && customMins <= 0) {
@@ -5517,6 +6139,14 @@ async function saveVisitorInfo(e) {
             formData.append("custom_purpose", customPurpose);
         }
         formData.append("log_id", String(logId));
+        formData.append("pending_id", pendingId);
+        formData.append("visitor_consent", consentChecked ? "1" : "0");
+        if (consentChecked) {
+            formData.append("id_type", idType);
+            formData.append("id_number", idNumber);
+            formData.append("visitor_name", visitorName);
+            formData.append("address_to_visit", addressToVisit);
+        }
 
         const res = await fetch(window.location.pathname, {
             method: "POST",
@@ -5539,20 +6169,50 @@ async function saveVisitorInfo(e) {
                 promptedVisitorLogIds.add(resolvedId);
             }
 
+            const finalPlate = savedLog.plate_number || data.plate_number || plate;
+            const finalType = savedLog.vehicle_type || data.vehicle_type || vType;
+            const finalPurpose = savedLog.purpose || data.purpose || purpose;
+            const finalDir = savedLog.direction || data.direction || "IN";
+            const finalName = savedLog.visitor_name || (consentChecked ? visitorName : "Visitor");
+            const finalAddr = savedLog.address_to_visit || (consentChecked ? addressToVisit : "-");
+            const finalIdType = savedLog.id_type || (consentChecked ? idType : "");
+            const finalIdNum = savedLog.id_number || (consentChecked ? idNumber : "");
+
             stackVehicleItem({
                 id: resolvedId,
-                plate_number: savedLog.plate_number || data.plate_number || plate,
-                vehicle_type: savedLog.vehicle_type || data.vehicle_type || vType,
+                plate_number: finalPlate,
+                vehicle_type: finalType,
                 vehicle_category: "Visitor",
-                purpose: savedLog.purpose || data.purpose || purpose,
-                direction: savedLog.direction || data.direction || "IN"
+                purpose: finalPurpose,
+                direction: finalDir,
+                visitor_name: finalName,
+                address_to_visit: finalAddr,
+                id_type: finalIdType,
+                id_number: finalIdNum,
+                time_in_label: savedLog.time_in_label || "",
+                time_out_label: savedLog.time_out_label || ""
             });
+
+            const visTotalEl = document.getElementById("totalVisitorsCount");
+            if (visTotalEl && typeof data.total_visitors !== "undefined") {
+                visTotalEl.textContent = String(data.total_visitors);
+            }
+
+            if (wasNewArrival) {
+                const nameSnippet = (finalName && finalName.toLowerCase() !== "visitor") ? " (" + finalName + ")" : "";
+                addNotification(
+                    "IN",
+                    "🟢 Vehicle Entered: " + finalPlate + nameSnippet,
+                    "Visitor • " + finalType + (finalPurpose ? " • " + finalPurpose : "") + " (Entrance Cam)",
+                    savedLog
+                );
+            }
 
             if (window.VisitorDurationAlarm) {
                 window.VisitorDurationAlarm.ingestSnapshot(data, true);
             }
 
-            closeVisitorModal();
+            closeVisitorModal(true);
             pollLiveCaptures();
         }
     } catch (err) {
@@ -5587,14 +6247,77 @@ async function pollLiveCaptures() {
             handleOverstayReminders(data.overdue_visitors || [], data.due_soon_visitors || []);
         }
 
-        // Update total counts smoothly
+        // Update total counts smoothly with animation
         const visTotalEl = document.getElementById("totalVisitorsCount");
         const regTotalEl = document.getElementById("totalRegisteredCount");
         if (visTotalEl && typeof data.total_visitors !== "undefined") {
-            visTotalEl.textContent = String(data.total_visitors);
+            const nextVis = String(data.total_visitors);
+            if (visTotalEl.textContent.trim() !== nextVis) {
+                visTotalEl.textContent = nextVis;
+                visTotalEl.classList.remove("stat-number-updated");
+                void visTotalEl.offsetWidth; // Force CSS animation reflow
+                visTotalEl.classList.add("stat-number-updated");
+            }
         }
         if (regTotalEl && typeof data.total_registered !== "undefined") {
-            regTotalEl.textContent = String(data.total_registered);
+            const nextReg = String(data.total_registered);
+            if (regTotalEl.textContent.trim() !== nextReg) {
+                regTotalEl.textContent = nextReg;
+                regTotalEl.classList.remove("stat-number-updated");
+                void regTotalEl.offsetWidth; // Force CSS animation reflow
+                regTotalEl.classList.add("stat-number-updated");
+            }
+        }
+
+        // Live update vehicleChart without browser reload
+        if (typeof vehicleChart !== "undefined" && vehicleChart && data.chart && Array.isArray(data.chart.data)) {
+            let chartChanged = false;
+            data.chart.data.forEach((series, idx) => {
+                if (vehicleChart.data.datasets[idx]) {
+                    const oldStr = JSON.stringify(vehicleChart.data.datasets[idx].data);
+                    const newStr = JSON.stringify(series);
+                    if (oldStr !== newStr) {
+                        vehicleChart.data.datasets[idx].data = series;
+                        chartChanged = true;
+                    }
+                }
+            });
+            if (chartChanged) {
+                vehicleChart.update("none");
+            }
+        }
+
+        // Process pending visitor arrivals (awaiting guard form confirmation before DB insert)
+        if (Array.isArray(data.pending_visitors) && data.pending_visitors.length > 0) {
+            for (let p = 0; p < data.pending_visitors.length; p++) {
+                const pv = data.pending_visitors[p];
+                const pvId = String(pv.pending_id || "");
+                if (!pvId || handledPendingVisitorIds.has(pvId)) {
+                    continue;
+                }
+                handledPendingVisitorIds.add(pvId);
+
+                showVisitorArrivalNotification(
+                    pv.plate_number || "",
+                    pv.vehicle_type || "Car",
+                    pv.purpose || ""
+                );
+
+                const modal = document.getElementById("visitorInfoModal");
+                const modalOpen = modal && modal.classList.contains("active");
+                if (!modalOpen) {
+                    openVisitorModal(
+                        pv.plate_number || "",
+                        pv.vehicle_type || "Car",
+                        pv.purpose || "",
+                        0,
+                        true,
+                        pvId
+                    );
+                } else {
+                    pendingVisitorModalQueue.push(pv);
+                }
+            }
         }
 
         if (Array.isArray(data.new_logs) && data.new_logs.length > 0) {
@@ -5648,20 +6371,26 @@ async function pollLiveCaptures() {
                             item.purpose || ""
                         );
                     } else {
-                        // Arriving visitor: Show Arrival toast & open the entry information form
-                        showVisitorArrivalNotification(
-                            item.plate_number || "",
-                            item.vehicle_type || "Car",
-                            item.purpose || ""
-                        );
-                        if (!modalOpen) {
-                            openVisitorModal(
+                        const hasConfirmedPurpose = itemPurpose !== ""
+                            && itemPurpose.toLowerCase() !== "visitor entry"
+                            && !itemPurpose.toLowerCase().startsWith("needs review:");
+                        // Arriving visitor without confirmed info: Show Arrival toast & open the entry information form
+                        if (!hasConfirmedPurpose) {
+                            showVisitorArrivalNotification(
                                 item.plate_number || "",
                                 item.vehicle_type || "Car",
-                                item.purpose || "",
-                                id,
-                                true
+                                item.purpose || ""
                             );
+                            if (!modalOpen) {
+                                openVisitorModal(
+                                    item.plate_number || "",
+                                    item.vehicle_type || "Car",
+                                    item.purpose || "",
+                                    id,
+                                    true,
+                                    ""
+                                );
+                            }
                         }
                     }
                 }
@@ -5681,9 +6410,16 @@ setInterval(pollLiveCaptures, 1500);
    DUAL CAMERA (ENTRANCE & EXIT) CONTROLLER
 ========================================================= */
 
-const DEFAULT_ENTRANCE_URL = "http://127.0.0.1:5000/video/entrance";
-const DEFAULT_EXIT_URL = "http://127.0.0.1:5000/video/exit";
-const API_BASE_URL = "http://127.0.0.1:5000";
+const LOCAL_HOST = (window.location && window.location.hostname) ? window.location.hostname : "localhost";
+const DEFAULT_ENTRANCE_URL = "http://" + LOCAL_HOST + ":5000/video/entrance";
+const DEFAULT_EXIT_URL = "http://" + LOCAL_HOST + ":5000/video/exit";
+const API_BASE_URL = "http://" + LOCAL_HOST + ":5000";
+
+/* A camera address saved as localhost / 127.0.0.1 only works on the server PC.
+   Point it at the address this page was opened with, so it works on any device. */
+function followPageHost(url) {
+    return String(url || "").replace(/^(https?:\/\/)(localhost|127\.0\.0\.1)(:5000)/i, "$1" + LOCAL_HOST + "$3");
+}
 
 
 /* =========================================================
@@ -6069,9 +6805,122 @@ function handleOverstayReminders(overdueList, dueSoonList) {
 }
 
 
+/* =========================================================
+   ADMIN-ADDED CAMERAS
+   Cameras the Administrator adds on superadmin_dashboard.php are
+   appended to the guard grid and kept in sync by polling.
+========================================================= */
+let guardExtraCameras = <?php echo json_encode($guardExtraCameras, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_SLASHES); ?>;
+let guardExtraCamerasSig = null;
+const EXTRA_CAMERA_POLL_MS = 10000;
+
+function camEscape(str) {
+    return String(str === undefined || str === null ? "" : str)
+        .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+function getCamUrl(camKey) {
+    const extra = guardExtraCameras.find(c => c.id === camKey);
+    if (extra) {
+        return extra.url;
+    }
+    const defaultUrl = camKey === "entrance" ? DEFAULT_ENTRANCE_URL : DEFAULT_EXIT_URL;
+    return followPageHost(localStorage.getItem("tapo_" + camKey + "_url") || defaultUrl);
+}
+
+function buildGuardExtraCameraCard(cam) {
+    const k = cam.id; // validated server-side: cam_[a-z0-9]+
+    let badge;
+    if (cam.direction === "IN") {
+        badge = '<span class="camera-tag dir-badge-in" style="font-size:11px; padding:3px 10px; font-weight:800;">🟢 IN' + (cam.model ? ' · ' + camEscape(cam.model) : '') + '</span>';
+    } else if (cam.direction === "OUT") {
+        badge = '<span class="camera-tag dir-badge-out" style="font-size:11px; padding:3px 10px; font-weight:800;">🔴 OUT' + (cam.model ? ' · ' + camEscape(cam.model) : '') + '</span>';
+    } else {
+        badge = '<span class="camera-tag dir-badge-monitor" style="font-size:11px; padding:3px 10px; font-weight:800;">🔵 MONITOR' + (cam.model ? ' · ' + camEscape(cam.model) : '') + '</span>';
+    }
+
+    return '' +
+        '<div class="camera-card camera-card-extra" id="card_' + k + '" data-cam-id="' + k + '">' +
+            '<div class="camera-card-header">' +
+                '<div class="camera-title">' +
+                    '<span class="camera-name" title="' + camEscape(cam.name) + '">' + camEscape(cam.name) + '</span>' +
+                    badge +
+                '</div>' +
+                '<button type="button" class="btn-cam-setup" onclick="reloadCamStream(\'' + k + '\')" title="Reconnect stream">🔄 Reconnect</button>' +
+            '</div>' +
+            '<div class="camera-screen">' +
+                '<img id="' + k + 'CamFeed" alt="' + camEscape(cam.name) + ' Stream"' +
+                    ' onload="onCamStreamLoad(\'' + k + '\')" onerror="onCamStreamError(\'' + k + '\')">' +
+                '<div class="camera-offline" id="' + k + 'CamOffline" style="display:none;">' +
+                    '<div class="camera-offline-icon">📹</div>' +
+                    '<div class="camera-offline-title">' + camEscape(cam.name) + ' Offline</div>' +
+                    '<div class="camera-offline-sub">Camera stream is not reachable. Ask the Administrator to check this camera\'s stream URL.</div>' +
+                    '<div class="camera-offline-actions">' +
+                        '<button type="button" class="btn-offline-retry" onclick="reloadCamStream(\'' + k + '\')">🔄 Reconnect</button>' +
+                    '</div>' +
+                '</div>' +
+                '<div class="camera-status">' +
+                    '<span class="status-dot offline" id="' + k + 'Dot"></span>' +
+                    '<span id="' + k + 'StatusText">Connecting...</span>' +
+                '</div>' +
+            '</div>' +
+        '</div>';
+}
+
+/* Re-renders only when the admin's list actually changed, so live
+   streams of unchanged cameras are never interrupted. */
+function renderGuardExtraCameras(list) {
+    const grid = document.getElementById("cameraGrid");
+    if (!grid) return;
+
+    const sig = JSON.stringify(list || []);
+    if (sig === guardExtraCamerasSig) return;
+    guardExtraCamerasSig = sig;
+    guardExtraCameras = list || [];
+
+    const wantedIds = new Set(guardExtraCameras.map(c => c.id));
+    grid.querySelectorAll(".camera-card-extra").forEach(card => {
+        const id = card.getAttribute("data-cam-id");
+        const cam = guardExtraCameras.find(c => c.id === id);
+        const img = document.getElementById(id + "CamFeed");
+        // Remove deleted cards, and cards whose details changed (rebuilt below)
+        if (!wantedIds.has(id) || !img || card.getAttribute("data-sig") !== JSON.stringify(cam)) {
+            if (img) img.src = ""; // close the MJPEG connection
+            card.remove();
+        }
+    });
+
+    guardExtraCameras.forEach(cam => {
+        let card = document.getElementById("card_" + cam.id);
+        if (!card) {
+            grid.insertAdjacentHTML("beforeend", buildGuardExtraCameraCard(cam));
+            card = document.getElementById("card_" + cam.id);
+            card.setAttribute("data-sig", JSON.stringify(cam));
+            const img = document.getElementById(cam.id + "CamFeed");
+            if (img) img.src = cam.url;
+        } else {
+            grid.appendChild(card); // keep the admin's order
+        }
+    });
+}
+
+async function pollGuardExtraCameras() {
+    try {
+        const res = await fetch("guard_dashboard.php?action=extra_cameras", { cache: "no-store" });
+        const data = await res.json();
+        if (data && data.success && Array.isArray(data.cameras)) {
+            renderGuardExtraCameras(data.cameras);
+        }
+    } catch (e) {
+        // Keep current cards if the request fails
+    }
+}
+
 function initTapoCameras() {
-    const entranceUrl = localStorage.getItem("tapo_entrance_url") || DEFAULT_ENTRANCE_URL;
-    const exitUrl = localStorage.getItem("tapo_exit_url") || DEFAULT_EXIT_URL;
+    // Saved localhost / 127.0.0.1 addresses follow the address this page was opened with
+    const entranceUrl = followPageHost(localStorage.getItem("tapo_entrance_url") || DEFAULT_ENTRANCE_URL);
+    const exitUrl = followPageHost(localStorage.getItem("tapo_exit_url") || DEFAULT_EXIT_URL);
 
     const entranceImg = document.getElementById("entranceCamFeed");
     const exitImg = document.getElementById("exitCamFeed");
@@ -6082,6 +6931,9 @@ function initTapoCameras() {
     if (exitImg) {
         exitImg.src = exitUrl;
     }
+
+    renderGuardExtraCameras(guardExtraCameras);
+    setInterval(pollGuardExtraCameras, EXTRA_CAMERA_POLL_MS);
 
     checkDetectionServerStatus();
     setInterval(checkDetectionServerStatus, 5000);
@@ -6119,7 +6971,8 @@ function onCamStreamError(camKey) {
     if (dot) {
         dot.className = "status-dot offline";
     }
-    if (text) {
+    const offCard = document.getElementById(camKey === "entrance" ? "cardEntranceCam" : (camKey === "exit" ? "cardExitCam" : ""));
+    if (text && !(offCard && offCard.dataset.cameraOff === "1")) {
         text.innerText = "Offline";
         text.style.color = "#ef4444";
     }
@@ -6132,6 +6985,10 @@ function reloadCamStream(camKey) {
     const text = document.getElementById(camKey + "StatusText");
 
     if (!img) return;
+
+    // A camera turned off in Camera Setup keeps its "Turned Off" screen
+    const card = document.getElementById(camKey === "entrance" ? "cardEntranceCam" : (camKey === "exit" ? "cardExitCam" : ""));
+    if (card && card.dataset.cameraOff === "1") return;
 
     if (offlineDiv) {
         offlineDiv.style.display = "none";
@@ -6146,8 +7003,7 @@ function reloadCamStream(camKey) {
         text.style.color = "#f59e0b";
     }
 
-    const defaultUrl = camKey === "entrance" ? DEFAULT_ENTRANCE_URL : DEFAULT_EXIT_URL;
-    const savedUrl = localStorage.getItem("tapo_" + camKey + "_url") || defaultUrl;
+    const savedUrl = getCamUrl(camKey);
     const cacheBuster = (savedUrl.indexOf("?") === -1 ? "?" : "&") + "t=" + Date.now();
     img.src = savedUrl + cacheBuster;
 }
@@ -6156,6 +7012,9 @@ function updateCameraModeControls() {
     const single = document.getElementById("cfgCameraMode").value === "single";
     document.getElementById("singleDirectionControls").hidden = !single;
     document.getElementById("separateExitSettings").hidden = single;
+    // With one shared camera, that camera is always on
+    const entranceEnabledRow = document.getElementById("entranceEnabledRow");
+    if (entranceEnabledRow) entranceEnabledRow.hidden = single;
     document.getElementById("settingsEntranceTitle").textContent = single ? "Shared Camera" : "Entrance Camera";
     document.getElementById("settingsEntranceDirection").textContent = "Direction: " + (single ? document.getElementById("cfgSingleDirection").value : "IN");
 }
@@ -6194,6 +7053,7 @@ async function openTapoModal(targetCam) {
             document.getElementById("cfgCameraMode").value = data.camera_mode || "dual";
             document.getElementById("cfgSingleDirection").value = data.single_direction || "IN";
             document.getElementById("cfgExitEnabled").checked = data.separate_exit_enabled !== false;
+            document.getElementById("cfgEntranceEnabled").checked = !(data.cameras.entrance && data.cameras.entrance.enabled === false);
             updateCameraModeControls();
             if (data.cameras.entrance && inputEntranceSrc) {
                 inputEntranceSrc.value = data.cameras.entrance.source || "";
@@ -6233,6 +7093,14 @@ function closeTapoModal() {
     }
 }
 
+/* Preset camera address: keeps the username/password already typed in the
+   field (credentials are never stored in the code) and only sets the camera IP. */
+function presetRtspUrl(currentValue, ip) {
+    const m = String(currentValue || "").match(/^rtsp:\/\/([^@\s\/]+)@/i);
+    const login = m ? m[1] : "USERNAME:PASSWORD";
+    return "rtsp://" + login + "@" + ip + ":554/stream2";
+}
+
 function applyPresetDualTapo() {
     document.getElementById("cfgCameraMode").value = "dual";
     updateCameraModeControls();
@@ -6241,8 +7109,8 @@ function applyPresetDualTapo() {
     const entUrl = document.getElementById("cfgEntranceUrl");
     const exitUrl = document.getElementById("cfgExitUrl");
 
-    if (entSrc) entSrc.value = "rtsp://Jhetlogs:123456789ten@192.168.1.18:554/stream2";
-    if (exitSrc) exitSrc.value = "rtsp://Jhetlogs:123456789ten@192.168.1.19:554/stream2";
+    if (entSrc) entSrc.value = presetRtspUrl(entSrc.value, "192.168.1.18");
+    if (exitSrc) exitSrc.value = presetRtspUrl(exitSrc.value, "192.168.1.19");
     if (entUrl) entUrl.value = DEFAULT_ENTRANCE_URL;
     if (exitUrl) exitUrl.value = DEFAULT_EXIT_URL;
 }
@@ -6255,8 +7123,8 @@ function applyPresetTapoAndWebcam() {
     const entUrl = document.getElementById("cfgEntranceUrl");
     const exitUrl = document.getElementById("cfgExitUrl");
 
-    if (entSrc) entSrc.value = "rtsp://Jhetlogs:123456789ten@192.168.1.18:554/stream2";
-    if (exitSrc) exitSrc.value = "rtsp://Jhetlogs:123456789ten@192.168.1.19:554/stream2";
+    if (entSrc) entSrc.value = presetRtspUrl(entSrc.value, "192.168.1.18");
+    if (exitSrc) exitSrc.value = presetRtspUrl(exitSrc.value, "192.168.1.19");
     if (entUrl) entUrl.value = DEFAULT_ENTRANCE_URL;
     if (exitUrl) exitUrl.value = DEFAULT_EXIT_URL;
 }
@@ -6291,6 +7159,18 @@ async function saveTapoSettings() {
     const entZoomVal = document.getElementById("cfgEntranceZoom") ? parseFloat(document.getElementById("cfgEntranceZoom").value) : 1.35;
     const exitZoomVal = document.getElementById("cfgExitZoom") ? parseFloat(document.getElementById("cfgExitZoom").value) : 1.35;
 
+    const isDual = document.getElementById("cfgCameraMode").value === "dual";
+    // One shared camera is always on; with two cameras either one can be turned off
+    const entranceEnabled = isDual ? document.getElementById("cfgEntranceEnabled").checked : true;
+    const exitEnabled = document.getElementById("cfgExitEnabled").checked;
+    if (isDual && !entranceEnabled && !exitEnabled) {
+        const error = document.getElementById("cameraSettingsError");
+        error.textContent = "At least one camera must stay on. Turn one back on, or switch to one camera.";
+        error.hidden = false;
+        return;
+    }
+
+    let saved = null;
     try {
         const res = await fetch(API_BASE_URL + "/api/cameras", {
             method: "POST",
@@ -6299,7 +7179,8 @@ async function saveTapoSettings() {
                 camera_mode: document.getElementById("cfgCameraMode").value,
                 single_direction: document.getElementById("cfgSingleDirection").value,
                 entrance_source: entSrcVal,
-                ...(document.getElementById("cfgCameraMode").value === "dual" ? { exit_source: exitSrcVal, exit_zoom: exitZoomVal, exit_enabled: document.getElementById("cfgExitEnabled").checked } : {}),
+                entrance_enabled: entranceEnabled,
+                ...(isDual ? { exit_source: exitSrcVal, exit_zoom: exitZoomVal, exit_enabled: exitEnabled } : {}),
                 entrance_zoom: entZoomVal
             })
         });
@@ -6308,6 +7189,7 @@ async function saveTapoSettings() {
         localStorage.setItem("tapo_entrance_url", entranceUrlVal);
         localStorage.setItem("tapo_exit_url", exitUrlVal);
         updateCameraPanelTitles(data.camera_mode, data.single_direction);
+        saved = data;
     } catch (e) {
         const error = document.getElementById("cameraSettingsError");
         error.textContent = "Could not save camera settings: " + e.message;
@@ -6317,8 +7199,65 @@ async function saveTapoSettings() {
 
     closeTapoModal();
 
-    reloadCamStream("entrance");
-    reloadCamStream("exit");
+    applyCameraPanelVisibility(saved.camera_mode, saved.cameras, true);
+}
+
+/* Both camera panels always stay on the dashboard. A camera turned off in
+   Camera Setup keeps its panel, showing a "Turned Off" screen (and stops
+   streaming); turning it back on reconnects the live feed. */
+function applyCameraPanelVisibility(mode, cameras, reloadVisible) {
+    const cams = cameras || {};
+    const single = mode === "single";
+    ["entrance", "exit"].forEach(function (camKey) {
+        const isOff = !single && !!(cams[camKey] && cams[camKey].enabled === false);
+        const wasOff = setCameraPanelOff(camKey, isOff);
+        if (!isOff && (wasOff || reloadVisible)) {
+            reloadCamStream(camKey);
+        }
+    });
+}
+
+/* Switch one panel between its normal view and the "Turned Off" screen.
+   Returns whether the panel was showing "Turned Off" before. */
+function setCameraPanelOff(camKey, isOff) {
+    const card = document.getElementById(camKey === "entrance" ? "cardEntranceCam" : "cardExitCam");
+    const img = document.getElementById(camKey + "CamFeed");
+    const offlineDiv = document.getElementById(camKey + "CamOffline");
+    const dot = document.getElementById(camKey + "Dot");
+    const text = document.getElementById(camKey + "StatusText");
+    if (!card) return false;
+    const wasOff = card.dataset.cameraOff === "1";
+    if (isOff === wasOff) return wasOff;
+
+    const title = offlineDiv ? offlineDiv.querySelector(".camera-offline-title") : null;
+    const sub = offlineDiv ? offlineDiv.querySelector(".camera-offline-sub") : null;
+    const retry = offlineDiv ? offlineDiv.querySelector(".btn-offline-retry") : null;
+    const label = camKey === "entrance" ? "Entrance Cam" : "Exit Cam";
+
+    if (isOff) {
+        card.dataset.cameraOff = "1";
+        if (title && !title.dataset.original) title.dataset.original = title.textContent;
+        if (sub && !sub.dataset.original) sub.dataset.original = sub.textContent;
+        if (img) {
+            img.removeAttribute("src");          // close the MJPEG connection
+            img.style.display = "none";
+        }
+        if (offlineDiv) offlineDiv.style.display = "flex";
+        if (title) title.textContent = label + " Turned Off";
+        if (sub) sub.textContent = "This camera is turned off in Camera Setup. Turn it back on there to use it.";
+        if (retry) retry.style.display = "none";
+        if (dot) dot.className = "status-dot offline";
+        if (text) {
+            text.innerText = "Turned off";
+            text.style.color = "#64748b";
+        }
+    } else {
+        delete card.dataset.cameraOff;
+        if (title && title.dataset.original) title.textContent = title.dataset.original;
+        if (sub && sub.dataset.original) sub.textContent = sub.dataset.original;
+        if (retry) retry.style.display = "";
+    }
+    return wasOff;
 }
 
 async function checkDetectionServerStatus() {
@@ -6327,6 +7266,7 @@ async function checkDetectionServerStatus() {
         const data = await res.json();
         if (data.success && data.cameras) {
             updateCameraPanelTitles(data.camera_mode, data.single_direction);
+            applyCameraPanelVisibility(data.camera_mode, data.cameras, false);
             const ent = data.cameras.entrance;
             const ex = data.cameras.exit;
 
@@ -6364,6 +7304,15 @@ window.addEventListener("click", function(e) {
     }
 });
 
+document.addEventListener("keydown", function(e) {
+    if (e.key === "Escape") {
+        const visitorModal = document.getElementById("visitorInfoModal");
+        if (visitorModal && visitorModal.classList.contains("active")) {
+            closeVisitorModal(false);
+        }
+    }
+});
+
 document.addEventListener("DOMContentLoaded", function() { initTapoCameras(); loadStoredNotifications(); pollLiveCaptures(); });
 
 </script>
@@ -6374,7 +7323,8 @@ document.addEventListener("DOMContentLoaded", function() { initTapoCameras(); lo
 
 <!-- Live auto-refresh (no full page reload) -->
 <script>window.AUTO_REFRESH_SECONDS = 5;</script>
-<script src="assets/js/auto_refresh.js"></script>
+<script src="assets/js/dual_clock.js?v=<?php echo (int)@filemtime(__DIR__ . '/assets/js/dual_clock.js'); ?>"></script>
+<script src="assets/js/auto_refresh.js?v=<?php echo (int)@filemtime(__DIR__ . '/assets/js/auto_refresh.js'); ?>"></script>
 
 
 
@@ -6418,6 +7368,7 @@ document.addEventListener("DOMContentLoaded", function() { initTapoCameras(); lo
 
 </aside>
 
+<?php echo secsysYoloCaptureModalAssetsHtml(); ?>
 </body>
 
 </html>

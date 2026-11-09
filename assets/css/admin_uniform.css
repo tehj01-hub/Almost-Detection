@@ -1,0 +1,150 @@
+/* =========================================================
+   ADMIN UNIFORM UI
+   ---------------------------------------------------------
+   Makes every Administrator page use the same look as the
+   Security Guard dashboard (guard_dashboard.php):
+     - light grey page, white sidebar (already shared)
+     - full-width header bar: 82px, bottom border, 25px title,
+       grey 14px date / description line
+     - white cards with #dedede border, 19px corners, soft shadow
+   Loaded by: superadmin_dashboard, logs, registered, visitor,
+   security_guard, security_information, report, backup, profile.
+   Load AFTER the page's own <style> (and before ui_scale.css).
+   Pop-up windows (.modal / .modal-overlay) are not touched.
+========================================================= */
+
+body {
+    background: #f7f7f7 !important;
+    font-family: Arial, Helvetica, sans-serif;
+    color: #111;
+}
+
+
+/* ---------------------------------------------------------
+   PAGE HEADER BAR (same as the guard dashboard)
+--------------------------------------------------------- */
+
+.main {
+    padding-top: 0 !important;
+    /* the header's full-width bottom line (below) is clipped here, so it
+       can never cause sideways scrolling whatever padding a page uses */
+    overflow-x: clip;
+}
+
+.main > .header,
+.main > .page-header {
+    position: relative;
+    min-height: 82px;
+    border-bottom: none !important;
+    margin: 0 0 21px !important;
+    padding: 12px 0 !important;
+    width: auto !important;
+    max-width: none !important;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 12px;
+    box-sizing: border-box;
+    background: transparent;
+}
+
+/* Full-width bottom line like the guard dashboard's header bar
+   (drawn edge to edge, works with any page side padding) */
+.main > .header::after,
+.main > .page-header::after {
+    content: "";
+    position: absolute;
+    left: -100vw;
+    right: -100vw;
+    bottom: 0;
+    border-bottom: 1px solid #e4e4e4;
+    pointer-events: none;
+}
+
+/* Headers whose title and date are direct children (not wrapped in a div,
+   e.g. logs.php, visitor.php, security_guard.php): stack them on the left
+   like the guard dashboard instead of pushing the date to the far right. */
+.main > .header:has(> h1),
+.main > .page-header:has(> h1) {
+    flex-direction: column;
+    align-items: flex-start;
+    justify-content: center;
+    gap: 0;
+}
+
+.main > .header h1,
+.main > .page-header h1,
+.main > .page-header .page-title {
+    font-size: 25px !important;
+    font-weight: 500 !important;
+    line-height: 1.1 !important;
+    color: #111 !important;
+    margin: 0 !important;
+}
+
+.main > .header p,
+.main > .page-header p,
+.main > .page-header .page-date {
+    font-size: 14px !important;
+    color: #666 !important;
+    margin-top: 3px !important;
+    margin-bottom: 0 !important;
+}
+
+
+/* ---------------------------------------------------------
+   CARDS (same as the guard dashboard's cards)
+--------------------------------------------------------- */
+
+.main :is(
+    .table-card,
+    .card,
+    .section-card,
+    .stat-card,
+    .summary-card,
+    .filter-card,
+    .total-card,
+    .chart-container,
+    .camera-card,
+    .period-filter,
+    .search-filter-bar
+):not(.modal *):not(.modal-overlay *):not(.camera-card-add) {
+    background: #ffffff;
+    border: 1px solid #dedede !important;
+    border-radius: 19px !important;
+    box-shadow: 0 2px 5px rgba(0, 0, 0, 0.13) !important;
+}
+
+/* The search bar of logs.php is a plain row of controls, not a card */
+.main .search-filter-bar:not(.modal *) {
+    background: transparent;
+    border: none !important;
+    box-shadow: none !important;
+}
+
+
+/* ---------------------------------------------------------
+   SMALL SCREENS: pages shrink their side padding below 800px
+--------------------------------------------------------- */
+
+@media (max-width: 800px) {
+
+    .main {
+        padding-top: 16px !important;
+    }
+
+    .main > .header,
+    .main > .page-header {
+        margin: 0 0 16px !important;
+        padding: 0 0 12px !important;
+        min-height: 0;
+    }
+
+    /* the sidebar shrinks on small screens; keep the line inside the content */
+    .main > .header::after,
+    .main > .page-header::after {
+        left: 0;
+        right: 0;
+    }
+}

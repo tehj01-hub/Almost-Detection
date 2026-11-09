@@ -81,6 +81,7 @@ class GPTVisionReader:
         self.enabled = True
         self.client: Optional[Any] = None
         self.last_quota_error_time = 0.0
+        self.last_timeout_error_time = 0.0
         self._last_config_mtime = 0.0
 
         # Load from config file if available
@@ -133,7 +134,7 @@ class GPTVisionReader:
 
         if self.api_key and self.api_key != "YOUR_OPENAI_API_KEY_HERE":
             try:
-                self.client = OpenAI(api_key=self.api_key, timeout=self.timeout)
+                self.client = OpenAI(api_key=self.api_key, timeout=self.timeout, max_retries=0)
                 print(f"[GPTVision] Ready! Model: {self.model} (Timeout: {self.timeout}s)")
             except Exception as e:
                 print(f"[GPTVision] Error initializing client: {e}")
@@ -150,6 +151,8 @@ class GPTVisionReader:
             return False
         # If OpenAI quota/credits were recently exhausted, temporarily back off to eliminate network lag
         if (time.time() - self.last_quota_error_time) < 300.0:
+            return False
+        if (time.time() - self.last_timeout_error_time) < 60.0:
             return False
         return True
 
@@ -242,11 +245,13 @@ class GPTVisionReader:
         except Exception as e:
             # Handle rate limits, timeouts, or network interruptions gracefully
             err_str = str(e)
-            if "quota" in err_str.lower() or "billing" in err_str.lower() or "429" in err_str or "credit_balance" in err_str:
+            err_lower = err_str.lower()
+            if "quota" in err_lower or "billing" in err_lower or "429" in err_str or "credit_balance" in err_lower:
                 self.last_quota_error_time = time.time()
                 print(f"[GPTVision] Quota/credits exhausted: Pausing API calls for 5m to avoid detection delays. ({err_str[:60]}...)")
-            elif "timeout" in err_str.lower():
-                print(f"[GPTVision] Timeout after {self.timeout}s")
+            elif "timed out" in err_lower or "timeout" in err_lower or "connection" in err_lower:
+                self.last_timeout_error_time = time.time()
+                print(f"[GPTVision] Timeout after {self.timeout}s; pausing cloud fallback for 60s.")
             else:
                 print(f"[GPTVision] Inference note: {err_str[:80]}")
             return "", 0.0

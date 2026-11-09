@@ -4,7 +4,7 @@ import time
 
 
 class PlateTracker:
-    def __init__(self, minimum_votes=3, window_size=8, minimum_share=0.6, expiry_seconds=8, fast_accept_confidence=0.70):
+    def __init__(self, minimum_votes=3, window_size=8, minimum_share=0.6, expiry_seconds=8, fast_accept_confidence=0.80):
         self.fast_accept_confidence = fast_accept_confidence
         self.minimum_votes = minimum_votes
         self.window_size = window_size
@@ -117,3 +117,19 @@ class PlateTracker:
         for track in self.tracks:
             if (track['channel'], track['direction'], track.get('winner')) == (channel, direction, plate):
                 track['emitted'] = False
+
+    def clear_plate(self, plate, exclude_channel=None, exclude_direction=None):
+        """Reset presence and emitted track state for a plate on other channels/directions after a state transition."""
+        if not plate:
+            return
+        for key in list(self.present_plates.keys()):
+            ch, d, p = key
+            if p == plate and (ch != exclude_channel or d != exclude_direction):
+                del self.present_plates[key]
+        self.tracks = [
+            t for t in self.tracks
+            if not (
+                t.get('winner') == plate
+                and (t.get('channel') != exclude_channel or t.get('direction') != exclude_direction)
+            )
+        ]

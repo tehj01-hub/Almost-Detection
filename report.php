@@ -23,18 +23,7 @@ use Dompdf\Options;
 /* =========================================================
    DATABASE CONNECTION
 ========================================================= */
-$conn = new mysqli(
-    "localhost:3307",
-    "root",
-    "",
-    "security_system"
-);
-
-if ($conn->connect_error) {
-    die("Database Connection Failed: " . $conn->connect_error);
-}
-
-$conn->set_charset("utf8mb4");
+$conn = secsysConnectDb();
 secsysEnsureSchema($conn);
 $systemName = secsysGetSystemName($conn);
 $systemIcon = secsysGetSystemIcon($conn);
@@ -230,12 +219,27 @@ if ($resGuards) {
     }
 }
 
+// Administrators (username => full name), so each admin's actions show
+// with their own name, e.g. "Administrator P (adminp)"
+$adminUsernames = [];
+$resAdmins = $conn->query("SELECT username, full_name FROM users WHERE role = 'Administrator'");
+if ($resAdmins) {
+    while ($adm = $resAdmins->fetch_assoc()) {
+        $adminUsernames[strtolower(trim((string)$adm['username']))] = trim((string)($adm['full_name'] ?? ''));
+    }
+}
+
 if (!function_exists('resolveActorLabel')) {
     function resolveActorLabel($actorRaw, $guardMap, $usernameToGuardId)
     {
+        global $adminUsernames;
+
         $actor = trim((string)$actorRaw);
         if ($actor === '') {
             return 'Security Guard (On Duty)';
+        }
+        if (strtoupper($actor) === 'SYSTEM') {
+            return 'System (Automatic)';
         }
         if (isset($guardMap[$actor])) {
             return $guardMap[$actor]['full_name'] . ' (' . $actor . ')';
@@ -245,10 +249,64 @@ if (!function_exists('resolveActorLabel')) {
             $gid = $usernameToGuardId[$lower];
             return $guardMap[$gid]['full_name'] . ' (' . $gid . ')';
         }
-        if ($lower === 'admin' || $lower === 'administrator') {
+        if (isset($adminUsernames[$lower]) && $adminUsernames[$lower] !== '') {
+            return $adminUsernames[$lower] . ' (' . $actor . ')';
+        }
+        if ($lower === 'admin' || $lower === 'administrator' || isset($adminUsernames[$lower])) {
             return 'Administrator (' . $actor . ')';
         }
         return $actor;
+    }
+}
+
+if (!function_exists('reportAuditModule')) {
+    /**
+     * Name of the module (sidebar page) an activity log entry comes from,
+     * using the same wording as the navigation menu.
+     */
+    function reportAuditModule($activityType, $description)
+    {
+        $type = strtolower(trim((string)$activityType));
+        $desc = strtolower((string)$description);
+
+        switch ($type) {
+            case 'login':
+            case 'logout':
+                return 'Login & Logout';                 // login.php / logout.php
+            case 'co-duty login':
+                return 'Duty Roster';                    // guard_select_partner.php
+            case 'visitor duration extended':
+            case 'visitor marked exited':
+                return 'Visitor Monitoring';             // visitor timers on the guard dashboard
+            case 'daily reset':
+                return 'System (Auto-Archive)';          // automatic midnight archive
+            case 'profile update':
+            case 'password change':
+                return 'Profile';                        // profile.php
+            case 'password reset':
+                return 'Forgot Password';                // forgot_password.php (login page)
+            case 'system settings update':
+                return 'System Settings';                // profile.php
+            case 'camera settings':
+                return 'Dashboard Cameras';              // superadmin_dashboard.php
+            case 'archive':
+            case 'unarchive':
+                if (strpos($desc, 'visitor vehicle log') !== false) {
+                    return 'Visitor Logs';               // visitor_logs.php
+                }
+                if (strpos($desc, 'registered vehicle log') !== false) {
+                    return 'Registered Logs';            // registered_logs.php
+                }
+                return 'Logs';                           // logs.php
+        }
+
+        if (strpos($type, 'database') === 0) {
+            return 'Backup & Retrieve';                  // backup.php (backup, restore, delete, cleanup)
+        }
+        if (strpos($type, 'guard') === 0) {
+            return 'Security Guard';                     // security_guard.php
+        }
+        return 'General';
     }
 }
 
@@ -348,6 +406,14 @@ foreach ($guardActivityThisPeriod as $act) {
     $resolvedGid = isset($periodGuards[$actorRaw]) ? $actorRaw : ($usernameToGuardId[strtolower($actorRaw)] ?? '');
     if ($resolvedGid !== '' && isset($periodGuards[$resolvedGid])) {
         $periodGuards[$resolvedGid]['activity_count']++;
+        // Kept for the "Audit Actions" popup (click the count to see each action)
+        $periodGuards[$resolvedGid]['actions'][] = [
+            'time'        => !empty($act['date_created']) ? date('M d, Y h:i A', strtotime($act['date_created'])) : '-',
+            'sort'        => (string)($act['date_created'] ?? ''),
+            'event'       => (string)($act['activity_type'] ?? 'Activity'),
+            'module'      => reportAuditModule($act['activity_type'] ?? '', $act['activity_description'] ?? ''),
+            'description' => (string)($act['activity_description'] ?? ''),
+        ];
         $periodGuards[$resolvedGid]['was_active'] = true;
         if (stripos($act['activity_type'], 'Login') !== false) {
             $periodGuards[$resolvedGid]['duty_sessions'] = max(1, $periodGuards[$resolvedGid]['duty_sessions']);
@@ -364,19 +430,50 @@ foreach ($guardActivityThisPeriod as $act) {
    + SESSIONS WITH INSIDE / OUTSIDE STATUS & TIME RANGE
 ========================================================= */
 if (!function_exists('buildReportSessions')) {
-function buildReportSessions($result, $guardMap, $usernameToGuardId, $dutyPairs)
+function buildReportSessions($resultOrRows, $guardMap, $usernameToGuardId, $dutyPairs, array $ownerMap = [], array $visitorMap = [])
 {
     $sessions = [];
     $openSessions = [];
 
-    while ($row = $result->fetch_assoc()) {
+    $rowsList = [];
+    if (is_array($resultOrRows)) {
+        $rowsList = $resultOrRows;
+    } elseif ($resultOrRows) {
+        while ($r = $resultOrRows->fetch_assoc()) {
+            $rowsList[] = $r;
+        }
+    }
+
+    foreach ($rowsList as $row) {
         $plate = strtoupper(trim($row['plate_number'] ?? ''));
+        $plateKey = secsysNormalizePlateKey($plate);
+        if ($plateKey === '') {
+            $plateKey = $plate !== '' ? $plate : 'UNKNOWN';
+        }
         $direction = strtoupper(trim($row['direction'] ?? 'IN'));
         $category = ucfirst(strtolower(trim($row['vehicle_category'] ?? 'Registered')));
         $vehicleType = !empty($row['vehicle_type']) ? $row['vehicle_type'] : 'Car';
         $dateCreated = $row['date_created'] ?? null;
         $archivedAt = $row['archived_at'] ?? null;
         $archivedByRaw = trim($row['archived_by'] ?? '');
+
+        $rowName = trim((string)($row['visitor_name'] ?? ($row['owner_name'] ?? ($row['name'] ?? ''))));
+        $rowPurpose = trim((string)($row['purpose'] ?? ''));
+        if ($category === 'Registered') {
+            if ($rowName === '' && isset($ownerMap[$plateKey])) {
+                $rowName = $ownerMap[$plateKey];
+            }
+            if ($rowPurpose === '') {
+                $rowPurpose = 'Homeowner / Resident';
+            }
+        } else {
+            if ($rowName === '' && isset($visitorMap[$plateKey]['name'])) {
+                $rowName = $visitorMap[$plateKey]['name'];
+            }
+            if ($rowPurpose === '' && isset($visitorMap[$plateKey]['purpose'])) {
+                $rowPurpose = $visitorMap[$plateKey]['purpose'];
+            }
+        }
 
         // If archived_by was not recorded on older archive rows, infer from duty pair active around archived_at
         if ($archivedByRaw === '' && $archivedAt) {
@@ -399,7 +496,8 @@ function buildReportSessions($result, $guardMap, $usernameToGuardId, $dutyPairs)
                 'plate_number' => $plate,
                 'vehicle_type' => $vehicleType,
                 'category'     => $category,
-                'purpose'      => $row['purpose'] ?? '',
+                'name'         => $rowName,
+                'purpose'      => $rowPurpose,
                 'time_in'      => $dateCreated,
                 'time_out'     => null,
                 'status'       => 'Inside',
@@ -408,13 +506,19 @@ function buildReportSessions($result, $guardMap, $usernameToGuardId, $dutyPairs)
                 'actor_label'  => $actorLabel,
             ];
             $sessions[] = $session;
-            $openSessions[$plate][] = count($sessions) - 1;
+            $openSessions[$plateKey][] = count($sessions) - 1;
         } elseif ($direction === 'OUT') {
             $matched = false;
-            if (isset($openSessions[$plate]) && count($openSessions[$plate]) > 0) {
-                $idx = array_shift($openSessions[$plate]);
+            if (isset($openSessions[$plateKey]) && count($openSessions[$plateKey]) > 0) {
+                $idx = array_shift($openSessions[$plateKey]);
                 $sessions[$idx]['time_out'] = $dateCreated;
                 $sessions[$idx]['status'] = 'Outside';
+                if ($sessions[$idx]['name'] === '' && $rowName !== '') {
+                    $sessions[$idx]['name'] = $rowName;
+                }
+                if ($sessions[$idx]['purpose'] === '' && $rowPurpose !== '') {
+                    $sessions[$idx]['purpose'] = $rowPurpose;
+                }
                 if ($archivedAt && (!$sessions[$idx]['archived_at'] || strtotime($archivedAt) > strtotime($sessions[$idx]['archived_at']))) {
                     $sessions[$idx]['archived_at'] = $archivedAt;
                 }
@@ -431,7 +535,8 @@ function buildReportSessions($result, $guardMap, $usernameToGuardId, $dutyPairs)
                     'plate_number' => $plate,
                     'vehicle_type' => $vehicleType,
                     'category'     => $category,
-                    'purpose'      => $row['purpose'] ?? '',
+                    'name'         => $rowName,
+                    'purpose'      => $rowPurpose,
                     'time_in'      => null,
                     'time_out'     => $dateCreated,
                     'status'       => 'Outside',
@@ -447,6 +552,32 @@ function buildReportSessions($result, $guardMap, $usernameToGuardId, $dutyPairs)
 }
 }
 
+// Preload owner_name & visitor_name lookup maps by normalized plate key
+$reportOwnerByPlate = [];
+$resReportOwners = @$conn->query("SELECT plate_number, owner_name FROM registered_vehicles");
+if ($resReportOwners) {
+    while ($ro = $resReportOwners->fetch_assoc()) {
+        $pk = secsysNormalizePlateKey((string)($ro['plate_number'] ?? ''));
+        if ($pk !== '' && !empty($ro['owner_name'])) {
+            $reportOwnerByPlate[$pk] = trim((string)$ro['owner_name']);
+        }
+    }
+}
+
+$reportVisitorByPlate = [];
+$resReportVisitors = @$conn->query("SELECT plate_number, visitor_name, purpose FROM visitor_vehicles ORDER BY id ASC");
+if ($resReportVisitors) {
+    while ($rv = $resReportVisitors->fetch_assoc()) {
+        $pk = secsysNormalizePlateKey((string)($rv['plate_number'] ?? ''));
+        if ($pk !== '') {
+            $reportVisitorByPlate[$pk] = [
+                'name'    => trim((string)($rv['visitor_name'] ?? '')),
+                'purpose' => trim((string)($rv['purpose'] ?? '')),
+            ];
+        }
+    }
+}
+
 // Fetch archived vehicle logs within the selected period (by DATE(archived_at) or DATE(date_created))
 $stmtArchLogs = $conn->prepare("
     SELECT *
@@ -454,14 +585,17 @@ $stmtArchLogs = $conn->prepare("
     WHERE (DATE(archived_at) BETWEEN ? AND ? OR DATE(date_created) BETWEEN ? AND ?)
     ORDER BY date_created ASC
 ");
-$archivedSessions = [];
+$archivedRawRows = [];
 if ($stmtArchLogs) {
     $stmtArchLogs->bind_param("ssss", $periodStart, $periodEnd, $periodStart, $periodEnd);
     $stmtArchLogs->execute();
     $resArchLogs = $stmtArchLogs->get_result();
-    $archivedSessions = buildReportSessions($resArchLogs, $guardMap, $usernameToGuardId, $dutyPairsThisPeriod);
+    while ($arRow = $resArchLogs->fetch_assoc()) {
+        $archivedRawRows[] = $arRow;
+    }
     $stmtArchLogs->close();
 }
+$archivedSessions = buildReportSessions($archivedRawRows, $guardMap, $usernameToGuardId, $dutyPairsThisPeriod, $reportOwnerByPlate, $reportVisitorByPlate);
 
 // Count archived records per guard
 foreach ($archivedSessions as $as) {
@@ -498,24 +632,70 @@ $stmtCurrLogs = $conn->prepare("
     WHERE DATE(date_created) BETWEEN ? AND ?
     ORDER BY date_created ASC
 ");
-$currentPeriodSessions = [];
+$currentRawRows = [];
 if ($stmtCurrLogs) {
     $stmtCurrLogs->bind_param("ss", $periodStart, $periodEnd);
     $stmtCurrLogs->execute();
     $resCurrLogs = $stmtCurrLogs->get_result();
-    $currentPeriodSessions = buildReportSessions($resCurrLogs, $guardMap, $usernameToGuardId, $dutyPairsThisPeriod);
+    while ($crRow = $resCurrLogs->fetch_assoc()) {
+        $currentRawRows[] = $crRow;
+    }
     $stmtCurrLogs->close();
 }
+$currentPeriodSessions = buildReportSessions($currentRawRows, $guardMap, $usernameToGuardId, $dutyPairsThisPeriod, $reportOwnerByPlate, $reportVisitorByPlate);
+
+// Build deduplicated, chronologically paired vehicle movement sessions for the selected day/period (by movement date_created)
+$periodMovementDedup = [];
+$periodMovementRows  = [];
+foreach ($archivedRawRows as $arRow) {
+    $dt = trim((string)($arRow['date_created'] ?? ''));
+    $dOnly = $dt !== '' ? substr($dt, 0, 10) : '';
+    if ($dOnly !== '' && ($dOnly < $periodStart || $dOnly > $periodEnd)) {
+        // Row was created on a previous date and only auto-archived during this period; skip for daily vehicle movement summary
+        continue;
+    }
+    $pKey = secsysNormalizePlateKey((string)($arRow['plate_number'] ?? ''));
+    $dir  = strtoupper(trim((string)($arRow['direction'] ?? 'IN')));
+    $dk   = $pKey . '|' . $dir . '|' . $dt;
+    if (!isset($periodMovementDedup[$dk])) {
+        $periodMovementDedup[$dk] = true;
+        $periodMovementRows[] = $arRow;
+    }
+}
+foreach ($currentRawRows as $crRow) {
+    $dt   = trim((string)($crRow['date_created'] ?? ''));
+    $pKey = secsysNormalizePlateKey((string)($crRow['plate_number'] ?? ''));
+    $dir  = strtoupper(trim((string)($crRow['direction'] ?? 'IN')));
+    $dk   = $pKey . '|' . $dir . '|' . $dt;
+    if (!isset($periodMovementDedup[$dk])) {
+        $periodMovementDedup[$dk] = true;
+        $periodMovementRows[] = $crRow;
+    }
+}
+usort($periodMovementRows, function ($a, $b) {
+    $cmp = strcmp((string)($a['date_created'] ?? ''), (string)($b['date_created'] ?? ''));
+    if ($cmp !== 0) {
+        return $cmp;
+    }
+    return ((int)($a['id'] ?? 0)) <=> ((int)($b['id'] ?? 0));
+});
+$periodVehicleSessionsRaw = !empty($periodMovementRows)
+    ? buildReportSessions($periodMovementRows, $guardMap, $usernameToGuardId, $dutyPairsThisPeriod, $reportOwnerByPlate, $reportVisitorByPlate)
+    : array_merge($archivedSessions, $currentPeriodSessions);
 
 // Combine or filter archived sessions based on search, status (Inside/Outside), category, and time range (time_from - time_to)
 $filterReportSessions = function ($sessions) use ($searchQuery, $statusFilter, $categoryFilter, $timeFrom, $timeTo, $sortBy, $sortDir) {
     if ($searchQuery !== '') {
-        $q = strtolower($searchQuery);
-        $sessions = array_values(array_filter($sessions, function ($s) use ($q) {
-            return stripos($s['plate_number'], $q) !== false
-                || stripos($s['actor_label'], $q) !== false
-                || stripos($s['vehicle_type'], $q) !== false
-                || stripos($s['category'], $q) !== false;
+        $sessions = array_values(array_filter($sessions, function ($s) use ($searchQuery) {
+            return secsysMatchesPlateSearch(
+                $searchQuery,
+                (string)($s['plate_number'] ?? ''),
+                (string)($s['name'] ?? ''),
+                (string)($s['purpose'] ?? ''),
+                (string)($s['actor_label'] ?? ''),
+                (string)($s['vehicle_type'] ?? ''),
+                (string)($s['category'] ?? '')
+            );
         }));
     }
 
@@ -559,7 +739,7 @@ $filterReportSessions = function ($sessions) use ($searchQuery, $statusFilter, $
 };
 
 $filteredArchivedSessions = $filterReportSessions($archivedSessions);
-$allCombinedSessions      = $filterReportSessions(array_merge($archivedSessions, $currentPeriodSessions));
+$allCombinedSessions      = $filterReportSessions($periodVehicleSessionsRaw);
 
 $insideCount  = 0;
 $outsideCount = 0;
@@ -570,6 +750,10 @@ foreach ($allCombinedSessions as $cs) {
         $outsideCount++;
     }
 }
+
+$vehicleDaySummary   = secsysBuildVehicleSummary($allCombinedSessions);
+$perPlateReportStats = $vehicleDaySummary['per_plate_map'] ?? $vehicleDaySummary['per_plate'];
+$perPlateReportRows  = array_values($vehicleDaySummary['per_plate']);
 
 /* =========================================================
    3. AUDIT TRAIL FOR DEEP REPORT
@@ -584,7 +768,7 @@ foreach ($guardActivityThisPeriod as $ga) {
         'timestamp'   => $ga['date_created'] ?? null,
         'actor'       => $actorLabel,
         'event_type'  => $ga['activity_type'] ?: 'Activity',
-        'module'      => stripos($ga['activity_type'], 'Archive') !== false ? 'Archive Management' : 'Guard Authentication',
+        'module'      => reportAuditModule($ga['activity_type'] ?? '', $ga['activity_description'] ?? ''),
         'description' => $ga['activity_description'],
     ];
 }
@@ -672,10 +856,24 @@ if ($stmtRegArchAudit) {
 
 // Filter & sort audit trail newest first
 if ($auditType !== '' && strtolower($auditType) !== 'all') {
-    $atLower = strtolower($auditType);
-    $auditTrail = array_values(array_filter($auditTrail, function ($item) use ($atLower) {
-        return stripos($item['event_type'], $atLower) !== false || stripos($item['module'], $atLower) !== false;
-    }));
+    if (strpos($auditType, 'module:') === 0) {
+        // "By Module" options: exact module name
+        $wantModule = substr($auditType, strlen('module:'));
+        $auditTrail = array_values(array_filter($auditTrail, function ($item) use ($wantModule) {
+            return strcasecmp($item['module'], $wantModule) === 0;
+        }));
+    } else {
+        // Event options match the event type only, so "Login" does not also
+        // pick up logouts through the "Login & Logout" module name.
+        $atLower = strtolower($auditType);
+        $auditTrail = array_values(array_filter($auditTrail, function ($item) use ($atLower) {
+            if (stripos($item['event_type'], $atLower) !== false) {
+                return true;
+            }
+            // The automatic midnight reset is an archive operation too
+            return $atLower === 'archive' && strcasecmp($item['event_type'], 'Daily Reset') === 0;
+        }));
+    }
 }
 
 if ($searchQuery !== '') {
@@ -708,7 +906,7 @@ if (isset($_GET['download']) && $_GET['download'] === 'pdf') {
     <html>
     <head>
         <meta charset="UTF-8">
-        <title>Administrator Deep Report | <?php echo e($systemName); ?></title>
+        <title>Administrator Report | <?php echo e($systemName); ?></title>
         <style>
             @page { margin: 28px 32px; }
             body { font-family: Arial, Helvetica, sans-serif; font-size: 10px; color: #111; }
@@ -731,14 +929,48 @@ if (isset($_GET['download']) && $_GET['download'] === 'pdf') {
             <tr>
                 <td>
                     <div class="system-title">L. Surveillance</div>
-                    <div class="system-sub">Lessandra Subdivision Security System &bull; Administrator Deep Report</div>
+                    <div class="system-sub">Lessandra Subdivision Security System &bull; Administrator Report</div>
                 </td>
                 <td>
                     <div class="report-title">Security, Archive &amp; Audit Trail Report</div>
                     <div class="report-period">Basis: ' . ucfirst($report_basis) . ' &bull; Period: ' . e($periodStr) . ' &bull; Generated: ' . e($generatedAt) . '</div>
+                    <div class="report-period">Prepared by: ' . e(secsysCurrentAdminLabel()) . ' &bull; Administrator</div>
                 </td>
             </tr>
         </table>
+
+        <div class="section-heading">Summary of Vehicles for ' . e($periodDisplayLabel) . '</div>
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>Vehicle Type</th>
+                    <th>Registered</th>
+                    <th>Visitor</th>
+                    <th>Entered (IN)</th>
+                    <th>Exited (OUT)</th>
+                    <th>Total</th>
+                </tr>
+            </thead>
+            <tbody>';
+
+    foreach ($vehicleDaySummary['by_type'] as $vtRow) {
+        $pdfHtml .= '<tr>
+            <td><strong>' . e($vtRow['label']) . '</strong></td>
+            <td>' . (int)$vtRow['registered'] . '</td>
+            <td>' . (int)$vtRow['visitor'] . '</td>
+            <td class="badge-in">' . (int)$vtRow['in_count'] . '</td>
+            <td class="badge-out">' . (int)$vtRow['out_count'] . '</td>
+            <td><strong>' . (int)$vtRow['sessions'] . '</strong></td>
+        </tr>';
+    }
+    $pdfHtml .= '<tr style="background:#eef4fc; font-weight:bold;">
+        <td>TOTAL</td>
+        <td>' . (int)$vehicleDaySummary['registered']['sessions'] . '</td>
+        <td>' . (int)$vehicleDaySummary['visitor']['sessions'] . '</td>
+        <td class="badge-in">' . (int)$vehicleDaySummary['total_in'] . '</td>
+        <td class="badge-out">' . (int)$vehicleDaySummary['total_out'] . '</td>
+        <td>' . (int)$vehicleDaySummary['total_sessions'] . '</td>
+    </tr></tbody></table>
 
         <div class="section-heading">1. Security Guards Active on ' . e($periodDisplayLabel) . ' (' . count($activePeriodGuardsList) . ')</div>
         <table class="data-table">
@@ -785,6 +1017,7 @@ if (isset($_GET['download']) && $_GET['download'] === 'pdf') {
                     <th>Category</th>
                     <th>Time In</th>
                     <th>Time Out</th>
+                    <th>Entries / Exits</th>
                     <th>Status</th>
                     <th>Date Archived</th>
                 </tr>
@@ -792,12 +1025,15 @@ if (isset($_GET['download']) && $_GET['download'] === 'pdf') {
             <tbody>';
 
     if (empty($allCombinedSessions)) {
-        $pdfHtml .= '<tr><td colspan="9" style="text-align:center;">No vehicle logs or archived records matching criteria.</td></tr>';
+        $pdfHtml .= '<tr><td colspan="10" style="text-align:center;">No vehicle logs or archived records matching criteria.</td></tr>';
     } else {
         $idx = 1;
         foreach ($allCombinedSessions as $row) {
             $stClass = ($row['status'] === 'Inside') ? 'badge-in' : 'badge-out';
             $archDateStr = !empty($row['archived_at']) ? formatDateTime($row['archived_at']) : 'Active Log';
+            $pKey = strtoupper(trim((string)($row['plate_number'] ?? '')));
+            $pIn  = (int)($perPlateReportStats[$pKey]['in_count'] ?? (!empty($row['time_in']) ? 1 : 0));
+            $pOut = (int)($perPlateReportStats[$pKey]['out_count'] ?? (!empty($row['time_out']) ? 1 : 0));
             $pdfHtml .= '<tr>
                 <td>' . $idx++ . '</td>
                 <td>' . e($row['actor_label']) . '</td>
@@ -806,6 +1042,7 @@ if (isset($_GET['download']) && $_GET['download'] === 'pdf') {
                 <td>' . e($row['category']) . '</td>
                 <td>' . e(formatTime($row['time_in'])) . '</td>
                 <td>' . e(formatTime($row['time_out'])) . '</td>
+                <td><strong>' . $pIn . ' IN / ' . $pOut . ' OUT</strong></td>
                 <td class="' . $stClass . '">' . e($row['status']) . '</td>
                 <td>' . e($archDateStr) . '</td>
             </tr>';
@@ -814,7 +1051,7 @@ if (isset($_GET['download']) && $_GET['download'] === 'pdf') {
 
     $pdfHtml .= '</tbody></table>
 
-        <div class="section-heading">3. Audit Trail for Deep Report (' . count($auditTrail) . ' events)</div>
+        <div class="section-heading">3. Audit Trail for Report (' . count($auditTrail) . ' events)</div>
         <table class="data-table">
             <thead>
                 <tr>
@@ -822,7 +1059,7 @@ if (isset($_GET['download']) && $_GET['download'] === 'pdf') {
                     <th style="width:140px;">Security Guard / Actor</th>
                     <th style="width:95px;">Event Type</th>
                     <th style="width:95px;">Module</th>
-                    <th>Deep Report Description</th>
+                    <th>Report Description</th>
                 </tr>
             </thead>
             <tbody>';
@@ -844,6 +1081,13 @@ if (isset($_GET['download']) && $_GET['download'] === 'pdf') {
     $pdfHtml .= '</tbody></table>
     </body>
     </html>';
+
+    // CSV option: same rows as the PDF
+    require_once __DIR__ . '/app/print_report.php';
+    if (secsysWantsCsvDownload()) {
+        secsysStreamCsvFromHtml($pdfHtml, "Security_Report_" . $report_basis . "_" . $periodStart);
+        exit();
+    }
 
     $dompdf->loadHtml($pdfHtml);
     $dompdf->setPaper('A4', 'landscape');
@@ -894,7 +1138,7 @@ if (!function_exists('reportUrl')) {
 }
 ?>
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" class="ui-scale-fixed">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -1247,6 +1491,61 @@ tbody tr:hover { background: #fbfdff; }
 }
 
 /* =========================================================
+   VEHICLE SUMMARY GRID & ENTRY/EXIT PILLS
+========================================================= */
+.vehicle-summary-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(180px, 1fr));
+    gap: 12px;
+    margin-bottom: 16px;
+}
+.vehicle-summary-box {
+    background: #f8fbff;
+    border: 1px solid #dbe7f7;
+    border-radius: 14px;
+    padding: 13px 15px;
+    text-align: left;
+}
+.vehicle-summary-box-label {
+    font-size: 11px;
+    font-weight: 700;
+    color: #475569;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+}
+.vehicle-summary-box-val {
+    font-size: 20px;
+    font-weight: 700;
+    color: #0f172a;
+    margin-top: 5px;
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+.vehicle-summary-box-sub {
+    font-size: 11.5px;
+    color: #64748b;
+    margin-top: 4px;
+    line-height: 1.35;
+}
+.secsys-io-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    background: #f8fafc;
+    border: 1px solid #cbd5e1;
+    border-radius: 999px;
+    padding: 2px 8px;
+    font-size: 11px;
+    font-weight: 700;
+    white-space: nowrap;
+}
+.secsys-io-in { color: #15803d; }
+.secsys-io-sep { color: #94a3b8; }
+.secsys-io-out { color: #1d4ed8; }
+
+/* =========================================================
    PAGINATION
 ========================================================= */
 .pagination {
@@ -1273,6 +1572,9 @@ tbody tr:hover { background: #fbfdff; }
 .pagination a:hover { background: #f0f4fa; border-color: #2f80ed; }
 .pagination .active { background: #2f80ed; border-color: #2f80ed; color: white; font-weight: bold; }
 
+@media (max-width: 1100px) {
+    .vehicle-summary-grid { grid-template-columns: repeat(2, 1fr); }
+}
 @media (max-width: 1000px) {
     .summary-grid { grid-template-columns: repeat(2, 1fr); }
 }
@@ -1291,6 +1593,11 @@ tbody tr:hover { background: #fbfdff; }
     .section-card, .summary-card { box-shadow: none !important; border: 1px solid #ccc !important; }
 }
 </style>
+<!-- Same look as the Security Guard dashboard for every Administrator page -->
+<link rel="stylesheet" href="assets/css/admin_uniform.css?v=<?php echo (int)@filemtime(__DIR__ . '/assets/css/admin_uniform.css'); ?>">
+<!-- Enlarges the page 25% on laptops/desktops for easier reading (loaded after the page styles) -->
+<link rel="stylesheet" href="assets/css/ui_scale.css?v=<?php echo (int)@filemtime(__DIR__ . '/assets/css/ui_scale.css'); ?>">
+
 </head>
 <body>
 
@@ -1308,7 +1615,7 @@ tbody tr:hover { background: #fbfdff; }
         </div>
         <div class="logo-text">
             <div class="logo-title"><?php echo e($systemName); ?></div>
-            <div class="logo-subtitle">Administrator</div>
+            <div class="logo-subtitle"><?php echo secsysAdminSidebarSubtitleHtml(); ?></div>
         </div>
     </div>
 
@@ -1341,6 +1648,10 @@ tbody tr:hover { background: #fbfdff; }
             <span class="nav-icon">📈</span>
             <span>Report</span>
         </a>
+        <a href="backup.php">
+            <span class="nav-icon">💾</span>
+            <span>Backup &amp; Retrieve</span>
+        </a>
         <a href="profile.php">
             <span class="nav-icon">⚙️</span>
             <span>Profile</span>
@@ -1363,24 +1674,27 @@ tbody tr:hover { background: #fbfdff; }
                 Security Guards, Archived Vehicle Data &amp; Comprehensive Audit Trail
                 &bull; <strong><?php echo e($periodDisplayLabel); ?></strong>
             </p>
+            <p class="prepared-by" style="margin-top:4px;">
+                Prepared by: <strong><?php echo e(secsysCurrentAdminLabel()); ?></strong> &bull; Administrator
+            </p>
         </div>
 
         <div class="header-actions">
-            <a href="<?php echo e(reportUrl(['download' => 'pdf'])); ?>" class="btn btn-primary">
-                📥 Download Deep Report PDF
+            <a href="<?php echo e(reportUrl(['download' => 'pdf'])); ?>" class="btn btn-primary" data-download-choice title="Download the report as PDF or CSV">
+                📥 Download Report ▾
             </a>
             <button type="button" class="btn btn-outline" onclick="window.print()">
-                🖨️ Print Deep Report
+                🖨️ Print Report
             </button>
         </div>
     </div>
 
     <!-- SUMMARY STAT CARDS -->
-    <div class="summary-grid">
+    <div class="summary-grid" id="liveReportSummary" data-live>
         <div class="summary-card">
             <div class="summary-label">Active Guards (<?php echo $report_basis === 'monthly' ? 'Monthly' : 'Daily'; ?>)</div>
             <div class="summary-value"><?php echo count($activePeriodGuardsList); ?></div>
-            <div class="summary-sub"><?php echo count($dutyPairsThisPeriod); ?> duty pairing session(s)</div>
+            <!-- <div class="summary-sub"><?php echo count($dutyPairsThisPeriod); ?> duty pairing session(s)</div> -->
         </div>
 
         <div class="summary-card">
@@ -1492,10 +1806,111 @@ tbody tr:hover { background: #fbfdff; }
         </form>
     </div>
 
+    <!-- PLATE SEARCH ENTRY & EXIT COUNTER BANNER -->
+    <div id="liveReportPlateSearch" data-live>
+        <?php if ($searchQuery !== ''): ?>
+            <?php echo secsysRenderPlateSearchSummaryHtml(
+                $searchQuery,
+                $allCombinedSessions,
+                $periodDisplayLabel,
+                $conn,
+                $periodStart,
+                $periodEnd,
+                $categoryFilter !== '' ? $categoryFilter : null
+            ); ?>
+        <?php endif; ?>
+    </div>
+
+    <!-- =====================================================
+         NEW SECTION: SUMMARY OF VEHICLES FOR THAT DAY / PERIOD
+    ====================================================== -->
+    <section class="section-card" id="liveReportVehicleSummary" data-live>
+        <div class="section-top">
+            <div>
+                <div class="section-title">
+                    <span>&#128663; Summary of Vehicles for <?php echo e($periodDisplayLabel); ?></span>
+                    <span class="badge-pill"><?php echo (int)$vehicleDaySummary['total_sessions']; ?> Total</span>
+                </div>
+                <div class="section-subtitle">
+                    Summary of Registered and Visitor vehicles for <?php echo e($periodDisplayLabel); ?>
+                </div>
+            </div>
+        </div>
+
+        <div class="vehicle-summary-grid">
+            <div class="vehicle-summary-box">
+                <div class="vehicle-summary-box-label">Total Vehicles</div>
+                <div class="vehicle-summary-box-val" style="color:#1478e8;">
+                    <?php echo (int)$vehicleDaySummary['total_sessions']; ?>
+                </div>
+            </div>
+
+            <div class="vehicle-summary-box">
+                <div class="vehicle-summary-box-label">Registered Vehicles</div>
+                <div class="vehicle-summary-box-val">
+                    <?php echo (int)$vehicleDaySummary['registered']['sessions']; ?>
+                </div>
+            </div>
+
+            <div class="vehicle-summary-box">
+                <div class="vehicle-summary-box-label">Visitor Vehicles</div>
+                <div class="vehicle-summary-box-val">
+                    <?php echo (int)$vehicleDaySummary['visitor']['sessions']; ?>
+                </div>
+            </div>
+
+            <div class="vehicle-summary-box">
+                <div class="vehicle-summary-box-label">Entered / Exited</div>
+                <div class="vehicle-summary-box-val">
+                    <span style="color:#15803d;"><?php echo (int)$vehicleDaySummary['total_in']; ?> IN</span>
+                    <span style="color:#94a3b8; font-weight:400;">/</span>
+                    <span style="color:#1d4ed8;"><?php echo (int)$vehicleDaySummary['total_out']; ?> OUT</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="table-wrapper">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Vehicle Type</th>
+                        <th>Registered</th>
+                        <th>Visitor</th>
+                        <th>Entered (IN)</th>
+                        <th>Exited (OUT)</th>
+                        <th>Total</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php foreach ($vehicleDaySummary['by_type'] as $vt): ?>
+                        <tr>
+                            <td style="font-weight:700; color:#1e293b;">
+                                <?php echo e(($vt['icon'] ?? '🚗') . ' ' . $vt['label']); ?>
+                            </td>
+                            <td><?php echo (int)$vt['registered']; ?></td>
+                            <td><?php echo (int)$vt['visitor']; ?></td>
+                            <td style="color:#16733b; font-weight:700;"><?php echo (int)$vt['in_count']; ?></td>
+                            <td style="color:#245b9e; font-weight:700;"><?php echo (int)$vt['out_count']; ?></td>
+                            <td><strong><?php echo (int)$vt['sessions']; ?></strong></td>
+                        </tr>
+                    <?php endforeach; ?>
+                    <tr style="background:#f1f5f9; font-weight:700;">
+                        <td style="color:#0f172a;">TOTAL</td>
+                        <td><?php echo (int)$vehicleDaySummary['registered']['sessions']; ?></td>
+                        <td><?php echo (int)$vehicleDaySummary['visitor']['sessions']; ?></td>
+                        <td style="color:#16733b;"><?php echo (int)$vehicleDaySummary['total_in']; ?></td>
+                        <td style="color:#245b9e;"><?php echo (int)$vehicleDaySummary['total_out']; ?></td>
+                        <td style="color:#1478e8;"><?php echo (int)$vehicleDaySummary['total_sessions']; ?></td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </section>
+
     <!-- =====================================================
          SECTION 1: SECURITY GUARDS ACTIVE ON PERIOD
     ====================================================== -->
-    <section class="section-card">
+    <section class="section-card" id="liveReportSection1" data-live>
         <div class="section-top">
             <div>
                 <div class="section-title">
@@ -1548,7 +1963,24 @@ tbody tr:hover { background: #fbfdff; }
                                 <td>
                                     <span class="badge-pill"><?php echo (int)$wg['archived_count']; ?> record(s)</span>
                                 </td>
-                                <td><?php echo (int)$wg['activity_count']; ?> event(s)</td>
+                                <td>
+                                    <?php
+                                        $guardActions = $wg['actions'] ?? [];
+                                        usort($guardActions, function ($a, $b) { return strcmp($b['sort'], $a['sort']); });
+                                        foreach ($guardActions as &$ga) { unset($ga['sort']); }
+                                        unset($ga);
+                                    ?>
+                                    <?php if (!empty($guardActions)): ?>
+                                        <button type="button" class="audit-actions-link"
+                                            title="View the actions made by <?php echo e($wg['full_name']); ?>"
+                                            data-guard="<?php echo e($wg['full_name'] . ' (' . $wg['guard_id'] . ')'); ?>"
+                                            data-actions="<?php echo e(json_encode($guardActions, JSON_UNESCAPED_UNICODE)); ?>">
+                                            <?php echo (int)$wg['activity_count']; ?> event(s) &rsaquo;
+                                        </button>
+                                    <?php else: ?>
+                                        <?php echo (int)$wg['activity_count']; ?> event(s)
+                                    <?php endif; ?>
+                                </td>
                                 <td style="color:#64748b; font-size:12px;"><?php echo e(formatDateTime($wg['last_seen'])); ?></td>
                             </tr>
                         <?php endforeach; ?>
@@ -1561,7 +1993,7 @@ tbody tr:hover { background: #fbfdff; }
     <!-- =====================================================
          SECTION 2: DATA THEY ARCHIVE (WITH INSIDE/OUTSIDE & HOUR RANGE)
     ====================================================== -->
-    <section class="section-card">
+    <section class="section-card" id="liveReportSection2" data-live>
         <div class="section-top">
             <div>
                 <div class="section-title">
@@ -1595,6 +2027,7 @@ tbody tr:hover { background: #fbfdff; }
                         <th>Log Date</th>
                         <th>Time In</th>
                         <th>Time Out</th>
+                        <th>Entries / Exits</th>
                         <th>Status (DB)</th>
                         <th>Date Archived</th>
                     </tr>
@@ -1602,7 +2035,7 @@ tbody tr:hover { background: #fbfdff; }
                 <tbody>
                     <?php if (empty($pagedArchRows)): ?>
                         <tr>
-                            <td colspan="10" class="empty-cell">
+                            <td colspan="11" class="empty-cell">
                                 No archived or vehicle log data found matching your selected period, status, or hour range.
                             </td>
                         </tr>
@@ -1612,16 +2045,20 @@ tbody tr:hover { background: #fbfdff; }
                             <?php
                                 $logDt = !empty($ar['time_in']) ? $ar['time_in'] : ($ar['time_out'] ?? $ar['archived_at']);
                                 $isInside = ($ar['status'] ?? '') === 'Inside';
+                                $pKey = strtoupper(trim((string)($ar['plate_number'] ?? '')));
+                                $pIn  = (int)($perPlateReportStats[$pKey]['in_count'] ?? (!empty($ar['time_in']) ? 1 : 0));
+                                $pOut = (int)($perPlateReportStats[$pKey]['out_count'] ?? (!empty($ar['time_out']) ? 1 : 0));
                             ?>
                             <tr>
                                 <td style="color:#777;"><?php echo $rowNum++; ?></td>
                                 <td style="font-weight:600; color:#1e293b;"><?php echo e($ar['actor_label']); ?></td>
-                                <td><span class="plate-tag"><?php echo e($ar['plate_number']); ?></span></td>
+                                <td><?php echo secsysClickablePlateHtml($ar['plate_number'], $ar, 'plate-tag'); ?></td>
                                 <td><?php echo e($ar['vehicle_type']); ?></td>
                                 <td><?php echo e($ar['category']); ?></td>
                                 <td style="color:#555; font-size:12px;"><?php echo e(formatShortDate($logDt)); ?></td>
                                 <td><?php echo e(formatTime($ar['time_in'])); ?></td>
                                 <td><?php echo e(formatTime($ar['time_out'])); ?></td>
+                                <td><?php echo secsysPlateEntryExitPillHtml($pIn, $pOut); ?></td>
                                 <td>
                                     <span class="status-badge <?php echo $isInside ? 'status-inside' : 'status-outside'; ?>">
                                         <?php echo e($ar['status']); ?>
@@ -1659,11 +2096,11 @@ tbody tr:hover { background: #fbfdff; }
     <!-- =====================================================
          SECTION 3: AUDIT TRAIL FOR DEEP REPORT
     ====================================================== -->
-    <section class="section-card">
+    <section class="section-card" id="liveReportSection3" data-live>
         <div class="section-top">
             <div>
                 <div class="section-title">
-                    <span>&#128269; Audit Trail for Deep Report</span>
+                    <span>&#128269; Audit Trail for Report</span>
                     <span class="badge-pill"><?php echo $totalAuditRows; ?> Event(s)</span>
                 </div>
                 <div class="section-subtitle">
@@ -1687,6 +2124,11 @@ tbody tr:hover { background: #fbfdff; }
                         <option value="Logout" <?php echo $auditType === 'Logout' ? 'selected' : ''; ?>>Logouts</option>
                         <option value="Duty" <?php echo $auditType === 'Duty' ? 'selected' : ''; ?>>Duty Shifts</option>
                         <option value="Archive" <?php echo $auditType === 'Archive' ? 'selected' : ''; ?>>Archive Operations</option>
+                        <optgroup label="By Module">
+                            <?php foreach (['Login & Logout', 'Forgot Password', 'Duty Roster', 'Visitor Monitoring', 'Logs', 'Visitor Logs', 'Registered Logs', 'Registered Vehicles', 'Security Guard', 'Dashboard Cameras', 'Profile', 'System Settings', 'Backup & Retrieve', 'System (Auto-Archive)'] as $moduleOption): ?>
+                                <option value="<?php echo e('module:' . $moduleOption); ?>" <?php echo $auditType === 'module:' . $moduleOption ? 'selected' : ''; ?>><?php echo e($moduleOption); ?></option>
+                            <?php endforeach; ?>
+                        </optgroup>
                     </select>
                 </div>
             </form>
@@ -1700,7 +2142,7 @@ tbody tr:hover { background: #fbfdff; }
                         <th style="width:210px;">Security Guard / Actor</th>
                         <th style="width:140px;">Event Type</th>
                         <th style="width:150px;">Module</th>
-                        <th>Deep Audit Description</th>
+                        <th>Audit Description</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -1784,6 +2226,451 @@ function setReportBasis(basis) {
     if (form) form.submit();
 }
 </script>
+
+<script>window.AUTO_REFRESH_SECONDS = 5;</script>
+<!-- =====================================================
+     AUDIT ACTIONS POPUP (click a guard's "event(s)" count)
+====================================================== -->
+<style>
+.audit-actions-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    border: 1px solid #bfdbfe;
+    background: #eff6ff;
+    color: #1d4ed8;
+    font-weight: 700;
+    font-size: 12px;
+    padding: 4px 11px;
+    border-radius: 999px;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background 0.15s ease, border-color 0.15s ease, transform 0.12s ease;
+}
+.audit-actions-link:hover,
+.audit-actions-link:focus {
+    background: #dbeafe;
+    border-color: #93c5fd;
+    transform: translateY(-1px);
+    outline: none;
+}
+
+.audit-modal-backdrop {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    width: calc(100vw / var(--ui-scale, 1));
+    height: calc(100vh / var(--ui-scale, 1));
+    z-index: 9500;
+    background: rgba(15, 23, 42, 0.55);
+    backdrop-filter: blur(3px);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+    box-sizing: border-box;
+}
+.audit-modal-backdrop.open {
+    display: flex;
+}
+
+.audit-modal {
+    background: #ffffff;
+    border: 1px solid #dbe3ef;
+    border-radius: 18px;
+    width: 920px;
+    max-width: min(920px, calc(94vw / var(--ui-scale, 1)));
+    max-height: calc(86vh / var(--ui-scale, 1));
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 24px 60px rgba(15, 23, 42, 0.28);
+    overflow: hidden;
+    animation: auditModalIn 0.18s ease-out;
+}
+@keyframes auditModalIn {
+    from { opacity: 0; transform: translateY(-10px) scale(0.98); }
+    to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+.audit-modal-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 14px;
+    padding: 16px 22px;
+    background: linear-gradient(180deg, #f8fbff 0%, #ffffff 100%);
+    border-bottom: 1px solid #e2e8f0;
+    flex-shrink: 0;
+}
+.audit-modal-head-left {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    min-width: 0;
+}
+.audit-modal-icon {
+    width: 40px;
+    height: 40px;
+    border-radius: 12px;
+    background: #eff6ff;
+    border: 1px solid #bfdbfe;
+    color: #1d4ed8;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 19px;
+    flex-shrink: 0;
+}
+.audit-modal-title-row {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+.audit-modal-title {
+    font-size: 17px;
+    font-weight: 700;
+    color: #0f172a;
+    line-height: 1.25;
+}
+.audit-modal-guard-pill {
+    display: inline-flex;
+    align-items: center;
+    background: #eff6ff;
+    color: #1d4ed8;
+    border: 1px solid #bfdbfe;
+    font-size: 12px;
+    font-weight: 700;
+    padding: 2px 10px;
+    border-radius: 999px;
+}
+.audit-modal-sub {
+    font-size: 12.5px;
+    color: #64748b;
+    margin-top: 3px;
+}
+.audit-modal-close {
+    border: 1px solid #e2e8f0;
+    background: #f8fafc;
+    color: #475569;
+    width: 34px;
+    height: 34px;
+    border-radius: 10px;
+    font-size: 20px;
+    line-height: 1;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    transition: all 0.15s ease;
+}
+.audit-modal-close:hover,
+.audit-modal-close:focus {
+    background: #fee2e2;
+    border-color: #fecaca;
+    color: #b91c1c;
+    outline: none;
+}
+
+.audit-modal-body {
+    overflow-y: auto;
+    overflow-x: auto;
+    padding: 0;
+    flex: 1;
+    background: #ffffff;
+}
+.audit-modal .audit-modal-table {
+    zoom: 1 !important;
+    width: 100% !important;
+    border-collapse: separate;
+    border-spacing: 0;
+    font-size: 13px;
+    text-align: left;
+}
+.audit-modal .audit-modal-table thead th {
+    position: sticky;
+    top: 0;
+    z-index: 3;
+    background: #f8fafc;
+    text-align: left;
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.45px;
+    color: #475569;
+    padding: 11px 14px;
+    border-bottom: 2px solid #e2e8f0;
+    white-space: nowrap;
+}
+.audit-modal .audit-modal-table thead th.col-num {
+    width: 46px;
+    text-align: center;
+    padding-left: 18px;
+}
+.audit-modal .audit-modal-table tbody td {
+    padding: 11px 14px;
+    border-bottom: 1px solid #f1f5f9;
+    color: #1e293b;
+    vertical-align: middle;
+    text-align: left;
+    line-height: 1.45;
+}
+.audit-modal .audit-modal-table tbody tr:nth-child(even) {
+    background: #fcfdff;
+}
+.audit-modal .audit-modal-table tbody tr:hover {
+    background: #f1f7ff;
+}
+.audit-modal .audit-modal-table tbody td.col-num {
+    text-align: center;
+    color: #94a3b8;
+    font-weight: 600;
+    font-size: 12px;
+    padding-left: 18px;
+}
+.audit-modal .audit-modal-table tbody td.col-time {
+    white-space: nowrap;
+    color: #475569;
+    font-size: 12.5px;
+    font-weight: 500;
+}
+.audit-modal .audit-modal-table tbody td.col-desc {
+    color: #1e293b;
+    overflow-wrap: anywhere;
+    padding-right: 20px;
+}
+.audit-event-badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-size: 11.5px;
+    font-weight: 700;
+    white-space: nowrap;
+    border: 1px solid #cbd5e1;
+    background: #f1f5f9;
+    color: #0f172a;
+}
+.audit-event-badge.ev-login {
+    background: #dcfce7;
+    color: #15803d;
+    border-color: #86efac;
+}
+.audit-event-badge.ev-logout {
+    background: #f1f5f9;
+    color: #475569;
+    border-color: #cbd5e1;
+}
+.audit-event-badge.ev-archive {
+    background: #eff6ff;
+    color: #1d4ed8;
+    border-color: #bfdbfe;
+}
+.audit-event-badge.ev-visitor {
+    background: #fef3c7;
+    color: #b45309;
+    border-color: #fde68a;
+}
+.audit-module-tag {
+    display: inline-block;
+    font-size: 12px;
+    font-weight: 600;
+    color: #334155;
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+    border-radius: 6px;
+    padding: 2px 8px;
+    white-space: nowrap;
+}
+
+.audit-modal-foot {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 12px 22px;
+    background: #f8fafc;
+    border-top: 1px solid #e2e8f0;
+    flex-shrink: 0;
+}
+.audit-modal-foot-note {
+    font-size: 12px;
+    color: #64748b;
+}
+.audit-modal-foot-btn {
+    height: 34px;
+    padding: 0 18px;
+    border-radius: 17px;
+    border: 1px solid #cbd5e1;
+    background: #ffffff;
+    color: #1e293b;
+    font-size: 12.5px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.15s ease, border-color 0.15s ease;
+}
+.audit-modal-foot-btn:hover {
+    background: #f1f5f9;
+    border-color: #94a3b8;
+}
+
+@media print {
+    .audit-modal-backdrop { display: none !important; }
+}
+</style>
+
+<div class="audit-modal-backdrop" id="auditActionsModal" role="dialog" aria-modal="true" aria-labelledby="auditActionsTitle">
+    <div class="audit-modal">
+        <div class="audit-modal-head">
+            <div class="audit-modal-head-left">
+                <div class="audit-modal-icon" aria-hidden="true">&#128737;</div>
+                <div>
+                    <div class="audit-modal-title-row">
+                        <span class="audit-modal-title" id="auditActionsTitle">Audit Actions</span>
+                        <span class="audit-modal-guard-pill" id="auditActionsGuardPill"></span>
+                    </div>
+                    <div class="audit-modal-sub" id="auditActionsSub"></div>
+                </div>
+            </div>
+            <button type="button" class="audit-modal-close" data-audit-close aria-label="Close">&times;</button>
+        </div>
+        <div class="audit-modal-body">
+            <table class="audit-modal-table">
+                <thead>
+                    <tr>
+                        <th class="col-num">#</th>
+                        <th style="width:165px;">Date &amp; Time</th>
+                        <th style="width:165px;">Event Type</th>
+                        <th style="width:155px;">Module</th>
+                        <th>Description</th>
+                    </tr>
+                </thead>
+                <tbody id="auditActionsRows"></tbody>
+            </table>
+        </div>
+        <div class="audit-modal-foot">
+            <div class="audit-modal-foot-note" id="auditActionsFootNote"></div>
+            <button type="button" class="audit-modal-foot-btn" data-audit-close>Close</button>
+        </div>
+    </div>
+</div>
+
+<script>
+(function () {
+    const modal = document.getElementById("auditActionsModal");
+    if (!modal) return;
+
+    function esc(text) {
+        const div = document.createElement("div");
+        div.textContent = String(text == null ? "" : text);
+        return div.innerHTML;
+    }
+
+    function eventBadgeClass(eventText) {
+        const ev = String(eventText || "").toLowerCase();
+        if (ev.indexOf("login") !== -1) return "ev-login";
+        if (ev.indexOf("logout") !== -1) return "ev-logout";
+        if (ev.indexOf("archive") !== -1 || ev.indexOf("reset") !== -1) return "ev-archive";
+        if (ev.indexOf("visitor") !== -1) return "ev-visitor";
+        return "";
+    }
+
+    function open(button) {
+        let actions = [];
+        try { actions = JSON.parse(button.getAttribute("data-actions") || "[]"); } catch (e) { actions = []; }
+        const guardLabel = button.getAttribute("data-guard") || "Security Guard";
+        const pillEl = document.getElementById("auditActionsGuardPill");
+        if (pillEl) {
+            pillEl.textContent = guardLabel;
+            pillEl.style.display = guardLabel ? "inline-flex" : "none";
+        }
+        document.getElementById("auditActionsSub").textContent =
+            actions.length + " recorded action(s) during " + <?php echo json_encode($periodDisplayLabel); ?> + " • Newest first";
+        const footNote = document.getElementById("auditActionsFootNote");
+        if (footNote) {
+            footNote.textContent = "Showing " + actions.length + " audit event(s) for " + guardLabel;
+        }
+        document.getElementById("auditActionsRows").innerHTML = actions.length
+            ? actions.map(function (a, idx) {
+                const badgeCls = eventBadgeClass(a.event);
+                return "<tr>" +
+                    "<td class=\"col-num\">" + (idx + 1) + "</td>" +
+                    "<td class=\"col-time\">" + esc(a.time) + "</td>" +
+                    "<td><span class=\"audit-event-badge " + badgeCls + "\">" + esc(a.event) + "</span></td>" +
+                    "<td><span class=\"audit-module-tag\">" + esc(a.module) + "</span></td>" +
+                    "<td class=\"col-desc\">" + esc(a.description) + "</td>" +
+                "</tr>";
+            }).join("")
+            : "<tr><td colspan=\"5\" style=\"text-align:center; padding:28px 16px; color:#64748b;\">No actions recorded for this period.</td></tr>";
+        modal.classList.add("open");
+        document.body.style.overflow = "hidden";
+        const closeBtn = modal.querySelector("[data-audit-close]");
+        if (closeBtn) closeBtn.focus();
+    }
+
+    function close() {
+        modal.classList.remove("open");
+        document.body.style.overflow = "";
+    }
+
+    // Delegated, so it keeps working after the section auto-refreshes
+    document.addEventListener("click", function (e) {
+        const button = e.target.closest(".audit-actions-link");
+        if (button) { open(button); return; }
+        if (e.target === modal || e.target.closest("[data-audit-close]")) close();
+    });
+    document.addEventListener("keydown", function (e) {
+        if (e.key === "Escape" && modal.classList.contains("open")) close();
+    });
+
+    // Live plate/guard search without losing input focus
+    const reportSearchForm = document.getElementById("reportFilterForm");
+    const reportSearchInput = reportSearchForm ? reportSearchForm.querySelector('input[name="search"]') : null;
+    if (reportSearchForm && reportSearchInput) {
+        let searchTimer = null;
+        let activeCtrl = null;
+        reportSearchInput.addEventListener("input", function () {
+            clearTimeout(searchTimer);
+            searchTimer = setTimeout(function () {
+                const fd = new FormData(reportSearchForm);
+                const params = new URLSearchParams();
+                fd.forEach(function (val, key) {
+                    if (String(val).trim() !== "") {
+                        params.set(key, String(val));
+                    }
+                });
+                const url = "report.php" + (params.toString() ? "?" + params.toString() : "");
+                if (window.history && window.history.replaceState) {
+                    window.history.replaceState(null, "", url);
+                }
+                if (activeCtrl) {
+                    activeCtrl.abort();
+                }
+                activeCtrl = new AbortController();
+                fetch(url, { credentials: "same-origin", cache: "no-store", signal: activeCtrl.signal })
+                    .then(function (r) { return r.text(); })
+                    .then(function (html) {
+                        const doc = new DOMParser().parseFromString(html, "text/html");
+                        ["liveReportSummary", "liveReportPlateSearch", "liveReportVehicleSummary", "liveReportSection1", "liveReportSection2", "liveReportSection3"].forEach(function (id) {
+                            const cur = document.getElementById(id);
+                            const next = doc.getElementById(id);
+                            if (cur && next) {
+                                cur.innerHTML = next.innerHTML;
+                            }
+                        });
+                    })
+                    .catch(function () {});
+            }, 300);
+        });
+    }
+})();
+</script>
+
+<script src="assets/js/download_format.js?v=<?php echo (int)@filemtime(__DIR__ . '/assets/js/download_format.js'); ?>"></script>
+<script src="assets/js/auto_refresh.js?v=<?php echo (int)@filemtime(__DIR__ . '/assets/js/auto_refresh.js'); ?>"></script>
 
 </body>
 </html>

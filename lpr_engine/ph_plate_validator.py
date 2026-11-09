@@ -48,6 +48,10 @@ class PhilippinePlateValidator:
         "lto_motorcycle_1": (r"^[0-9]{3}[A-Z]{3}$", "Motorcycle (123 ABC)"),
         "lto_motorcycle_2": (r"^[A-Z]{2}[0-9]{4,5}$", "Motorcycle (AB 12345)"),
         "numeric_suffix_6": (r"^[0-9]{5}[A-Z]$", "Five digits + one letter (12345A)"),
+        "numeric_prefix_6": (r"^[0-9]{4}[A-Z]{2}$", "Four digits + two letters (1234AB)"),
+        "numeric_identifier_11": (r"^[0-9]{11}$", "Numeric identifier (1234-1234567)"),
+        "numeric_identifier": (r"^[0-9]{8,20}$", "Long numeric vehicle identifier"),
+        "alphanumeric": (r"^[A-Z0-9]{5,7}$", "Alphanumeric plate with an unfamiliar layout"),
     }
 
     def __init__(
@@ -75,6 +79,8 @@ class PhilippinePlateValidator:
 
     def format_for_display(self, text: str) -> str:
         clean = normalize_plate_alnum(text)
+        if len(clean) == 11 and clean.isdigit():
+            return f"{clean[:4]}-{clean[4:]}"
         if len(clean) == 7 and clean[:3].isalpha() and clean[3:].isdigit():
             return f"{clean[:3]} {clean[3:]}"
         if len(clean) == 6 and clean[:3].isalpha() and clean[3:].isdigit():
@@ -93,7 +99,7 @@ class PhilippinePlateValidator:
         raw = normalize_plate_alnum(decoded.raw_text)
 
         # 1. Noise Rejection
-        if len(raw) < 4 or len(raw) > 10 or raw in NON_PLATE_WORDS or len(set(raw)) <= 1:
+        if len(raw) < 4 or len(raw) > 20 or raw in NON_PLATE_WORDS or len(set(raw)) <= 1:
             return ValidationDecision(
                 action="REJECT_NOISE",
                 confirmed_plate=raw,

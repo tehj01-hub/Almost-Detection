@@ -3,8 +3,64 @@ import hashlib
 import re
 
 
+def find_open_vehicle_visit(cursor, normalized, for_update=False):
+    """Return the active open 'IN' visit {'id', 'vehicle_log_id'} for normalized plate, or None."""
+    if not normalized:
+        return None
+    lock_clause = " FOR UPDATE" if for_update else ""
+    cursor.execute(f"""
+        SELECT vld.id AS id, vl.id AS vehicle_log_id
+        FROM vehicle_logs vl
+        LEFT JOIN vehicle_log_dates vld ON vld.vehicle_log_id = vl.id
+        WHERE UPPER(REGEXP_REPLACE(vl.plate_number, '[^a-zA-Z0-9]', '')) = %s
+          AND vl.direction = 'IN'
+          AND vl.date_out IS NULL
+          AND (
+              vld.id IS NULL
+              OR (vld.status = 'IN' AND vld.time_in IS NOT NULL AND vld.time_out IS NULL)
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM vehicle_logs vl_out
+              WHERE UPPER(REGEXP_REPLACE(vl_out.plate_number, '[^a-zA-Z0-9]', '')) = %s
+                AND vl_out.direction = 'OUT'
+                AND vl_out.id > vl.id
+          )
+        ORDER BY vl.id DESC, vld.id DESC
+        LIMIT 1{lock_clause}
+    """, (normalized, normalized))
+    row = cursor.fetchone()
+    if row is not None:
+        if isinstance(row, tuple):
+            return {'id': row[0], 'vehicle_log_id': row[1]}
+        return row
+
+    cursor.execute(f"""
+        SELECT vld.id AS id, vld.vehicle_log_id AS vehicle_log_id
+        FROM vehicle_log_dates vld
+        WHERE UPPER(REGEXP_REPLACE(vld.plate_number, '[^a-zA-Z0-9]', '')) = %s
+          AND vld.vehicle_log_id IS NULL
+          AND vld.status = 'IN'
+          AND vld.time_in IS NOT NULL
+          AND vld.time_out IS NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM vehicle_log_dates vld_out
+              WHERE UPPER(REGEXP_REPLACE(vld_out.plate_number, '[^a-zA-Z0-9]', '')) = %s
+                AND vld_out.status = 'OUT'
+                AND vld_out.id > vld.id
+          )
+        ORDER BY vld.id DESC
+        LIMIT 1{lock_clause}
+    """, (normalized, normalized))
+    row = cursor.fetchone()
+    if row is not None:
+        if isinstance(row, tuple):
+            return {'id': row[0], 'vehicle_log_id': row[1]}
+        return row
+    return None
+
+
 def record_vehicle_visit(connection, plate_number, db_info, direction='AUTO'):
-    """Return the committed direction and IDs; raise on failure without partial writes."""
+    """Return the committed direction and IDs, or None if state forbids direction; raise on failure without partial writes."""
     if direction not in ('AUTO', 'IN', 'OUT'):
         raise ValueError('Invalid visit direction')
     plate = db_info.get('official_plate') or plate_number
@@ -21,13 +77,13 @@ def record_vehicle_visit(connection, plate_number, db_info, direction='AUTO'):
         if not locked:
             raise RuntimeError('Vehicle visit is being updated; retry')
         connection.start_transaction()
-        cursor.execute("""
-            SELECT id, vehicle_log_id FROM vehicle_log_dates
-            WHERE UPPER(REGEXP_REPLACE(plate_number, '[^a-zA-Z0-9]', '')) = %s
-              AND status = 'IN' AND time_in IS NOT NULL AND time_out IS NULL
-            ORDER BY id DESC LIMIT 1 FOR UPDATE
-        """, (normalized,))
-        visit = cursor.fetchone()
+        visit = find_open_vehicle_visit(cursor, normalized, for_update=True)
+        if direction == 'IN' and visit is not None:
+            connection.rollback()
+            return None
+        if direction == 'OUT' and visit is None:
+            connection.rollback()
+            return None
         resolved = ('OUT' if visit else 'IN') if direction == 'AUTO' else direction
         category = db_info.get('category', 'Visitor')
         vehicle_type = db_info.get('vehicle_type') or 'Car'
@@ -69,20 +125,27 @@ def record_vehicle_visit(connection, plate_number, db_info, direction='AUTO'):
         log_id = cursor.lastrowid
         if resolved == 'OUT' and visit:
             visit_id = visit['id']
+            if visit_id is not None:
+                cursor.execute("""
+                    UPDATE vehicle_log_dates SET date_out=CURDATE(), time_out=NOW(), status='OUT'
+                    WHERE id=%s
+                       OR (UPPER(REGEXP_REPLACE(plate_number, '[^a-zA-Z0-9]', '')) = %s
+                           AND status = 'IN' AND time_out IS NULL)
+                """, (visit_id, normalized))
+            else:
+                cursor.execute("""
+                    INSERT INTO vehicle_log_dates
+                        (vehicle_log_id, plate_number, vehicle_category, vehicle_type,
+                         purpose, date_out, time_out, status)
+                    VALUES (%s, %s, %s, %s, %s, CURDATE(), NOW(), 'OUT')
+                """, (log_id, plate, category, vehicle_type, purpose))
+                visit_id = cursor.lastrowid
             cursor.execute("""
-                UPDATE vehicle_log_dates SET date_out=CURDATE(), time_out=NOW(), status='OUT'
+                UPDATE vehicle_logs SET date_out=CURDATE()
                 WHERE id=%s
-            """, (visit_id,))
-            cursor.execute('UPDATE vehicle_logs SET date_out=CURDATE() WHERE id=%s',
-                           (visit['vehicle_log_id'],))
-        elif resolved == 'OUT':
-            cursor.execute("""
-                INSERT INTO vehicle_log_dates
-                    (vehicle_log_id, plate_number, vehicle_category, vehicle_type,
-                     purpose, date_out, time_out, status)
-                VALUES (%s, %s, %s, %s, %s, CURDATE(), NOW(), 'OUT')
-            """, (log_id, plate, category, vehicle_type, purpose))
-            visit_id = cursor.lastrowid
+                   OR (UPPER(REGEXP_REPLACE(plate_number, '[^a-zA-Z0-9]', '')) = %s
+                       AND direction = 'IN' AND date_out IS NULL)
+            """, (visit['vehicle_log_id'], normalized))
         else:
             cursor.execute("""
                 INSERT INTO vehicle_log_dates

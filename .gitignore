@@ -34,6 +34,12 @@ __pycache__/
 *.engine
 *.zip
 
+# Database backups (contain accounts, password hashes and personal data)
+/backups/
+
+# Personal documents that are not part of the system
+*.pptx
+
 # Runtime uploads, training output, and experiments
 /uploads/
 /runs/

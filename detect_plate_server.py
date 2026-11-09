@@ -22,11 +22,23 @@ import os
 # Keep video decoding and parallel OCR from each claiming all CPU cores.
 for _thread_limit in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS'):
     os.environ.setdefault(_thread_limit, '2')
+# PyTorch (YOLO/EasyOCR) and Paddle share one 4 GB GPU: make Paddle allocate VRAM
+# on demand instead of reserving a big block up front.
+os.environ.setdefault('FLAGS_allocator_strategy', 'auto_growth')
+os.environ.setdefault('FLAGS_fraction_of_gpu_memory_to_use', '0.25')
+os.environ.setdefault("OPENCV_LOG_LEVEL", "OFF")
 import cv2
 cv2.setNumThreads(2)
 from app.vehicle_visit_logger import record_vehicle_visit
+from app.pending_visitor_queue import (
+    enqueue_pending_visitor,
+    has_open_visitor_visit,
+    is_visitor_pending_or_suppressed,
+    clear_pending_visitor_for_plate,
+)
 from lpr_engine.plate_tracker import PlateTracker
 from lpr_engine.capture_store import save_plate_capture
+from app.vehicle_capture import VehicleCapturer
 import time
 import threading
 import os
@@ -64,6 +76,35 @@ else:
     torch.set_num_threads(2)
     print("[INFO] CUDA GPU not detected by PyTorch. Running on CPU multi-threading.")
 
+# Ensure bundled yolov10 package takes priority over site-packages ultralytics
+_yolov10_pkg_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "yolov10")
+if os.path.isdir(_yolov10_pkg_dir) and _yolov10_pkg_dir not in sys.path:
+    sys.path.insert(0, _yolov10_pkg_dir)
+
+# Provide lightweight dill._dill._load_type fallback if checkpoint requires dill offline
+try:
+    import dill  # noqa: F401
+except ImportError:
+    import builtins as _builtins
+    import types as _types
+    _dill_mod = _types.ModuleType("dill")
+    _dill_sub = _types.ModuleType("dill._dill")
+    _TYPE_MAP = {
+        "ClassType": type,
+        "ObjectType": object,
+        "NoneType": type(None),
+    }
+    def _load_type(name):
+        if name in _TYPE_MAP:
+            return _TYPE_MAP[name]
+        if hasattr(_builtins, name):
+            return getattr(_builtins, name)
+        return getattr(_types, name)
+    _dill_sub._load_type = _load_type
+    _dill_mod._dill = _dill_sub
+    sys.modules.setdefault("dill", _dill_mod)
+    sys.modules.setdefault("dill._dill", _dill_sub)
+
 # Allowlist YOLOv10 weights loading in PyTorch 2.6+
 import torch.serialization
 try:
@@ -92,8 +133,34 @@ os.environ["PADDLEX_HOME"] = paddle_cache
 os.environ["USERPROFILE"] = paddle_cache
 os.environ["HOME"] = paddle_cache
 
-# OpenVINO Intel GPU acceleration (Targets Intel UHD Graphics iGPU)
+# OpenVINO GPU acceleration (Targets NVIDIA GeForce GTX dGPU / GPU via OpenCL with kernel cache)
 os.environ["OPENVINO_DEVICE"] = "GPU"
+OPENVINO_CACHE_DIR = os.path.join(BASE_DIR, ".openvino_cache")
+os.makedirs(OPENVINO_CACHE_DIR, exist_ok=True)
+
+OV_GPU_AVAILABLE = False
+OV_GPU_NAME = ""
+if not USE_CUDA:
+    try:
+        import openvino as _ov
+        _OrigOVCore = _ov.Core
+
+        def _CachedOVCore(*args, **kwargs):
+            c = _OrigOVCore(*args, **kwargs)
+            try:
+                c.set_property({"CACHE_DIR": OPENVINO_CACHE_DIR})
+            except Exception:
+                pass
+            return c
+
+        _ov.Core = _CachedOVCore
+        _probe_core = _ov.Core()
+        if "GPU" in _probe_core.available_devices:
+            OV_GPU_AVAILABLE = True
+            OV_GPU_NAME = str(_probe_core.get_property("GPU", "FULL_DEVICE_NAME")).strip() or "OpenVINO GPU"
+            print(f"[INFO] *** GPU ACCELERATION ACTIVE (OpenVINO) *** -> Device: {OV_GPU_NAME}")
+    except Exception:
+        OV_GPU_AVAILABLE = False
 
 # =========================================================
 #  CONFIGURATION & PATHS
@@ -101,19 +168,24 @@ os.environ["OPENVINO_DEVICE"] = "GPU"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# YOLOv10 model weights path (prefer OpenVINO model for Intel UHD Graphics acceleration)
+# YOLOv10 model weights path (prefer native CUDA GPU when available, else OpenVINO GPU, else CPU .pt)
+PYTORCH_MODEL_PATH = os.path.join(BASE_DIR, "weights", "best.pt")
 OPENVINO_MODEL_PATH = os.path.join(BASE_DIR, "weights", "best_openvino_model")
-MODEL_PATH = OPENVINO_MODEL_PATH if os.path.exists(OPENVINO_MODEL_PATH) else os.path.join(BASE_DIR, "weights", "best.pt")
+USE_INTEL_GPU = (not USE_CUDA) and OV_GPU_AVAILABLE and os.path.exists(OPENVINO_MODEL_PATH)
+MODEL_PATH = PYTORCH_MODEL_PATH if (USE_CUDA and os.path.exists(PYTORCH_MODEL_PATH)) else (
+    OPENVINO_MODEL_PATH if os.path.exists(OPENVINO_MODEL_PATH) else PYTORCH_MODEL_PATH
+)
 FALLBACK_MODEL_PATH = os.path.join(BASE_DIR, "yolov10", "weights", "yolov10s.pt")
-USE_INTEL_GPU = os.path.exists(OPENVINO_MODEL_PATH)
-ANY_GPU_ACTIVE = USE_CUDA or USE_INTEL_GPU
+# General YOLOv10 (COCO) model used to photograph the vehicle after its plate is read
+VEHICLE_MODEL_PATH = os.path.join(BASE_DIR, "weights", "yolov10n_vehicle.pt")
+ANY_GPU_ACTIVE = USE_CUDA or USE_INTEL_GPU or OV_GPU_AVAILABLE
 
 # Camera configuration JSON file
 CONFIG_FILE = os.path.join(BASE_DIR, "camera_config.json")
 
-# Default RTSP URLs for Tapo C500 cameras
-DEFAULT_ENTRANCE_RTSP_URL = "rtsp://Jhetlogs:123456789ten@192.168.1.40:554/stream2"
-DEFAULT_EXIT_RTSP_URL = "rtsp://Jhetlogs:123456789ten@192.168.1.23:554/stream1"
+# Default camera sources (Local USB webcams 0 and 1, or RTSP URLs)
+DEFAULT_ENTRANCE_RTSP_URL = os.environ.get("ENTRANCE_SOURCE", "0")
+DEFAULT_EXIT_RTSP_URL = os.environ.get("EXIT_SOURCE", "1")
 DEFAULT_RTSP_URL = DEFAULT_ENTRANCE_RTSP_URL
 
 # Detection settings (Dynamically tuned for GPU / Intel UHD with CPU fallback)
@@ -129,16 +201,21 @@ PLATE_COOLDOWN_SECONDS = 30                  # 30-second cooldown prevents spam 
 FLIP_CAMERA_180 = False
 AUTO_CHECK_UPSIDE_DOWN = False
 
+# Optional GPU (D3D11VA) H.264 decoding. OFF by default: with the pip opencv-python
+# build on this laptop FFmpeg's D3D11 init fails and silently falls back to CPU
+# (1080p CPU decode is only ~7 ms/frame anyway). Set SECSYS_HW_DECODE=1 to try it.
+USE_HW_VIDEO_DECODE = os.environ.get("SECSYS_HW_DECODE", "0") == "1"
+
 # OCR settings
 OCR_LANGUAGES = ['en']
 
 # Database settings (matches PHP config)
 DB_CONFIG = {
-    'host': 'localhost',
-    'port': 3307,
-    'user': 'root',
-    'password': '',
-    'database': 'security_system'
+    'host': os.environ.get('SECSYS_DB_HOST', '127.0.0.1'),
+    'port': int(os.environ.get('SECSYS_DB_PORT', '3306')),
+    'user': os.environ.get('SECSYS_DB_USER', 'root'),
+    'password': os.environ.get('SECSYS_DB_PASS', ''),
+    'database': os.environ.get('SECSYS_DB_NAME', 'security_system')
 }
 
 # Flask server
@@ -156,16 +233,53 @@ DEFAULT_CAMERA_CONFIG = {
         "source": DEFAULT_ENTRANCE_RTSP_URL,
         "direction": "IN",
         "flip_180": False,
-        "zoom_factor": 1.35
+        "zoom_factor": 1.35,
+        "enabled": True
     },
     "exit": {
         "name": "Exit Cam",
         "source": DEFAULT_EXIT_RTSP_URL,
         "direction": "OUT",
         "flip_180": False,
-        "zoom_factor": 1.35
-    }
+        "zoom_factor": 1.35,
+        "enabled": DEFAULT_ENTRANCE_RTSP_URL.strip() != DEFAULT_EXIT_RTSP_URL.strip()
+    },
+    "camera_mode": "single" if DEFAULT_ENTRANCE_RTSP_URL.strip() == DEFAULT_EXIT_RTSP_URL.strip() else "dual",
+    "single_direction": "AUTO"
 }
+
+
+def _sanitize_loaded_camera_config(cfg):
+    """Ensure persisted startup config does not crash when both channels point to the same camera."""
+    for key in ("entrance", "exit"):
+        if key not in cfg or not isinstance(cfg[key], dict):
+            cfg[key] = DEFAULT_CAMERA_CONFIG[key].copy()
+        else:
+            for field, default_val in DEFAULT_CAMERA_CONFIG[key].items():
+                cfg[key].setdefault(field, default_val)
+
+    cfg.setdefault("camera_mode", DEFAULT_CAMERA_CONFIG["camera_mode"])
+    cfg.setdefault("single_direction", DEFAULT_CAMERA_CONFIG["single_direction"])
+    if cfg["single_direction"] not in ("AUTO", "IN", "OUT"):
+        cfg["single_direction"] = "AUTO"
+
+    ent_src = str(cfg["entrance"].get("source", "")).strip()
+    exit_src = str(cfg["exit"].get("source", "")).strip()
+    if (
+        cfg.get("camera_mode") == "dual"
+        and cfg["entrance"].get("enabled", True)
+        and cfg["exit"].get("enabled", True)
+        and ent_src
+        and ent_src == exit_src
+    ):
+        print(
+            f"[WARNING] Entrance and Exit share the same camera source ({ent_src}). "
+            f"Switching startup camera_mode to 'single' ({cfg['single_direction']})."
+        )
+        cfg["camera_mode"] = "single"
+        save_camera_config(cfg)
+
+    return cfg
 
 
 def load_camera_config():
@@ -174,15 +288,13 @@ def load_camera_config():
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
-                for key in ["entrance", "exit"]:
-                    if key not in cfg:
-                        cfg[key] = DEFAULT_CAMERA_CONFIG[key].copy()
-                return cfg
+                return _sanitize_loaded_camera_config(cfg)
         except Exception as e:
             print(f"[WARNING] Failed to read {CONFIG_FILE}: {e}")
 
-    save_camera_config(DEFAULT_CAMERA_CONFIG)
-    return DEFAULT_CAMERA_CONFIG.copy()
+    default_cfg = json.loads(json.dumps(DEFAULT_CAMERA_CONFIG))
+    save_camera_config(default_cfg)
+    return default_cfg
 
 
 def save_camera_config(cfg):
@@ -203,25 +315,25 @@ def save_camera_config(cfg):
 def load_model():
     """Load the YOLOv10 model (OpenVINO for Intel UHD iGPU, or PyTorch .pt fallback)."""
     yolov10_dir = os.path.join(BASE_DIR, "yolov10")
-    if yolov10_dir not in sys.path:
+    if os.path.isdir(yolov10_dir):
+        if yolov10_dir in sys.path:
+            sys.path.remove(yolov10_dir)
         sys.path.insert(0, yolov10_dir)
+
+        loaded_ultra = sys.modules.get("ultralytics")
+        if loaded_ultra is not None and not hasattr(loaded_ultra, "YOLOv10"):
+            for mod_name in [k for k in list(sys.modules.keys()) if k == "ultralytics" or k.startswith("ultralytics.")]:
+                sys.modules.pop(mod_name, None)
 
     from ultralytics import YOLOv10
 
-    # 1. Prefer OpenVINO model for Intel UHD Graphics acceleration
-    if os.path.exists(OPENVINO_MODEL_PATH):
-        print(f"[INFO] *** INTEL UHD GPU ACCELERATION ACTIVE (OpenVINO) ***")
+    # 1. Prefer OpenVINO model on GPU (e.g. NVIDIA GeForce GTX 1650 Ti) when native CUDA PyTorch is not active
+    if USE_INTEL_GPU and os.path.exists(OPENVINO_MODEL_PATH):
+        gpu_label = OV_GPU_NAME or "OpenVINO GPU"
+        print(f"[INFO] *** GPU ACCELERATION ACTIVE (OpenVINO) -> {gpu_label} ***")
         print(f"[INFO] Loading YOLOv10 OpenVINO model from: {OPENVINO_MODEL_PATH}")
-        try:
-            import openvino as ov
-            core = ov.Core()
-            devs = core.available_devices
-            gpu_name = core.get_property('GPU', 'FULL_DEVICE_NAME') if 'GPU' in devs else 'Intel UHD Graphics'
-            print(f"[INFO] Target Device: {gpu_name} (OpenVINO Device: GPU)")
-        except Exception:
-            print("[INFO] Target Device: Intel UHD Graphics (OpenVINO Device: GPU)")
         model = YOLOv10(OPENVINO_MODEL_PATH, task="detect")
-        print("[INFO] YOLOv10 OpenVINO model loaded successfully on Intel UHD Graphics!")
+        print(f"[INFO] YOLOv10 OpenVINO model loaded successfully on {gpu_label}!")
         return model
 
     # 2. PyTorch .pt model fallback
@@ -241,6 +353,12 @@ def load_model():
         try:
             model.to(DEVICE)
             print(f"[INFO] YOLOv10 model successfully moved to GPU: {torch.cuda.get_device_name(0)}")
+            # Warm-up: let cuDNN pick kernels now so the first live frame doesn't stall the feed.
+            _t0 = time.time()
+            _dummy = np.zeros((IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.uint8)
+            for _ in range(2):
+                model.predict(source=_dummy, imgsz=IMAGE_SIZE, device=DEVICE, half=True, verbose=False)
+            print(f"[INFO] YOLOv10 GPU warm-up done (FP16) in {time.time() - _t0:.1f}s")
         except Exception as e:
             print(f"[WARNING] Could not transfer YOLOv10 to GPU: {e}")
     print("[INFO] YOLOv10 model loaded successfully!")
@@ -258,28 +376,57 @@ def load_ocr():
     2. PaddleOCR (PP-OCRv6 high-precision text recognition)
     3. LPRNet (Specialized deep CNN license plate character reader)
     """
-    print(f"[INFO] Initializing OCR Ensemble (GPU: {USE_CUDA}, Target Device: {DEVICE})...")
+    active_gpu_desc = torch.cuda.get_device_name(0) if USE_CUDA else (OV_GPU_NAME if OV_GPU_AVAILABLE else DEVICE)
+    print(f"[INFO] Initializing OCR Ensemble (GPU Accelerated: {ANY_GPU_ACTIVE}, Target Device: {active_gpu_desc})...")
 
-    # 1. EasyOCR
+    # 1. EasyOCR (FP32 unquantized when GPU/OpenVINO GTX acceleration is active)
     easy_reader = None
     try:
         import easyocr
         easy_weights_dir = os.path.join(BASE_DIR, "weights", "easyocr")
-        print(f"[INFO] Loading EasyOCR (GPU: {USE_CUDA}, storage: {easy_weights_dir})...")
-        easy_reader = easyocr.Reader(OCR_LANGUAGES, gpu=USE_CUDA, model_storage_directory=easy_weights_dir)
-        print(f"[INFO] EasyOCR loaded successfully (Accelerated: {USE_CUDA})!")
+        easy_user_net_dir = os.path.join(easy_weights_dir, "user_network")
+        os.makedirs(easy_user_net_dir, exist_ok=True)
+        print(f"[INFO] Loading EasyOCR (GPU: {ANY_GPU_ACTIVE}, storage: {easy_weights_dir})...")
+        easy_reader = easyocr.Reader(
+            OCR_LANGUAGES,
+            gpu=USE_CUDA,
+            quantize=not ANY_GPU_ACTIVE,
+            model_storage_directory=easy_weights_dir,
+            user_network_directory=easy_user_net_dir,
+        )
+        if OV_GPU_AVAILABLE and not USE_CUDA:
+            from lpr_engine.gpu_char_extractor import GPUCharacterExtractor
+            if GPUCharacterExtractor().accelerate_easyocr_reader(easy_reader):
+                print(f"[INFO] EasyOCR CRAFT + VGG compiled onto {OV_GPU_NAME} (FP32 OpenVINO GPU)!")
+        print(f"[INFO] EasyOCR loaded successfully (Accelerated: {ANY_GPU_ACTIVE})!")
     except Exception as e:
         print(f"[WARNING] EasyOCR failed to load: {e}")
 
     # 2. Recognition-only Paddle model: YOLO has already located the plate.
     paddle_reader = None
     try:
-        from paddleocr import TextRecognition
         model_dir = os.path.join(BASE_DIR, '.paddle_cache', '.paddlex', 'official_models', 'PP-OCRv6_medium_rec')
-        paddle_reader = TextRecognition(
-            model_name='PP-OCRv6_medium_rec', model_dir=model_dir if os.path.isdir(model_dir) else None,
-            device='gpu:0' if USE_CUDA else 'cpu', cpu_threads=2, enable_mkldnn=False)
-        paddle_reader.plate_recognition_only = True
+        # Only ask Paddle for the GPU when the installed paddlepaddle build has CUDA;
+        # the CPU wheel raises on device='gpu:0' and PaddleOCR would drop out entirely.
+        paddle_gpu = False
+        if USE_CUDA:
+            try:
+                import paddle
+                paddle_gpu = bool(paddle.device.is_compiled_with_cuda())
+            except Exception:
+                paddle_gpu = False
+            if not paddle_gpu:
+                print('[INFO] paddlepaddle is a CPU build -> PaddleOCR runs on CPU (YOLO/EasyOCR/LPRNet use the NVIDIA GPU).')
+        try:
+            from paddleocr import TextRecognition
+            paddle_reader = TextRecognition(
+                model_name='PP-OCRv6_medium_rec', model_dir=model_dir if os.path.isdir(model_dir) else None,
+                device='gpu:0' if paddle_gpu else 'cpu', cpu_threads=2, enable_mkldnn=False)
+            paddle_reader.plate_recognition_only = True
+        except ImportError:
+            from lpr_engine.paddle_rec_runner import LocalPPOCRv6Recognizer
+            paddle_reader = LocalPPOCRv6Recognizer(
+                model_dir=model_dir, use_gpu=paddle_gpu, cpu_threads=2)
         print('[INFO] PaddleOCR plate recognition model loaded (no redundant text detector).')
     except Exception as e:
         print(f'[WARNING] PaddleOCR failed to load: {e}')
@@ -338,14 +485,26 @@ def load_ocr():
 # =========================================================
 
 def get_db_connection():
-    """Create a MySQL database connection."""
+    """Create a MySQL database connection (tries 3306 then 3307 automatically)."""
     try:
         import mysql.connector
-        conn = mysql.connector.connect(**DB_CONFIG)
-        return conn
     except Exception as e:
         print(f"[WARNING] Database connection failed: {e}")
         return None
+
+    env_port = os.environ.get('SECSYS_DB_PORT')
+    ports = [int(env_port)] if env_port else [DB_CONFIG['port']] + [p for p in (3306, 3307) if p != DB_CONFIG['port']]
+    last_err = None
+    for port in ports:
+        try:
+            cfg = dict(DB_CONFIG, port=port, connection_timeout=3)
+            conn = mysql.connector.connect(**cfg)
+            DB_CONFIG['port'] = port
+            return conn
+        except Exception as e:
+            last_err = e
+    print(f"[WARNING] Database connection failed: {last_err}")
+    return None
 
 
 def check_plate_in_database(plate_number):
@@ -375,7 +534,7 @@ def check_plate_in_database(plate_number):
         # 1. Exact match in registered_vehicles WHERE status = 'Active'
         cursor.execute(
             "SELECT id, plate_number, vehicle_type FROM registered_vehicles "
-            "WHERE REPLACE(UPPER(plate_number), ' ', '') = %s "
+            "WHERE UPPER(REGEXP_REPLACE(plate_number, '[^a-zA-Z0-9]', '')) = %s "
             "AND status = 'Active' LIMIT 1",
             (norm,)
         )
@@ -391,7 +550,7 @@ def check_plate_in_database(plate_number):
         # Check visitor_vehicles only to retain previous metadata (vehicle_type, purpose, visitor_vehicle_id)
         cursor.execute(
             "SELECT id, plate_number, vehicle_type, purpose FROM visitor_vehicles "
-            "WHERE REPLACE(UPPER(plate_number), ' ', '') = %s "
+            "WHERE UPPER(REGEXP_REPLACE(plate_number, '[^a-zA-Z0-9]', '')) = %s "
             "ORDER BY id DESC LIMIT 1",
             (norm,)
         )
@@ -422,6 +581,9 @@ def log_vehicle_detection(plate_number, db_info, direction='IN'):
         return False
     try:
         result = record_vehicle_visit(conn, plate_number, db_info, direction)
+        if not result:
+            return None
+        invalidate_plate_state_cache(plate_number)
         print(f"[DB] Logged detection ({result['direction']}): {plate_number} (id={result['log_id']})")
         return result
     except Exception as e:
@@ -429,6 +591,78 @@ def log_vehicle_detection(plate_number, db_info, direction='IN'):
         return False
     finally:
         conn.close()
+
+
+_PLATE_INSIDE_CACHE = {}
+_PLATE_INSIDE_CACHE_TTL = 1.0
+
+
+def invalidate_plate_state_cache(plate_number=None):
+    """Invalidate cached inside/outside state for a plate (or all plates)."""
+    if not plate_number:
+        _PLATE_INSIDE_CACHE.clear()
+        return
+    norm = re.sub(r'[^A-Z0-9]', '', str(plate_number).upper())
+    _PLATE_INSIDE_CACHE.pop(norm, None)
+    for k in list(_PLATE_INSIDE_CACHE.keys()):
+        if plates_are_similar(norm, k):
+            _PLATE_INSIDE_CACHE.pop(k, None)
+
+
+def is_plate_currently_inside(plate_number, use_cache=True):
+    """
+    Return True if the vehicle currently has an open 'IN' visit in the database,
+    False if it is currently Outside, or None if database check is unavailable.
+    """
+    norm = re.sub(r'[^A-Z0-9]', '', str(plate_number or '').upper())
+    if not norm:
+        return False
+    now_ts = time.monotonic()
+    if use_cache:
+        cached = _PLATE_INSIDE_CACHE.get(norm)
+        if cached is not None and (now_ts - cached[1]) <= _PLATE_INSIDE_CACHE_TTL:
+            return cached[0]
+    conn = get_db_connection()
+    if not conn:
+        return None
+    try:
+        inside = bool(has_open_visitor_visit(conn, norm))
+        _PLATE_INSIDE_CACHE[norm] = (inside, now_ts)
+        return inside
+    except Exception:
+        return None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def should_scan_plate_on_direction(plate_number, direction, use_cache=True):
+    """
+    Enforce directional scan rules:
+      - Entrance ('IN'): Do NOT scan if vehicle is already Inside (or already pending visitor confirmation).
+      - Exit ('OUT'): Do NOT scan if vehicle is currently Outside (no active open 'IN' visit).
+      - Shared ('AUTO'): Always allow scan so direction is inferred from open visit state.
+    """
+    if direction not in ('IN', 'OUT'):
+        return True
+    norm = re.sub(r'[^A-Z0-9]', '', str(plate_number or '').upper())
+    if not norm:
+        return False
+    if direction == 'IN':
+        if is_visitor_pending_or_suppressed(norm, cooldown_seconds=PLATE_COOLDOWN_SECONDS):
+            return False
+        inside = is_plate_currently_inside(norm, use_cache=use_cache)
+        if inside is True:
+            return False
+        return True
+    if direction == 'OUT':
+        inside = is_plate_currently_inside(norm, use_cache=use_cache)
+        if inside is False:
+            return False
+        return True
+    return True
 
 
 # =========================================================
@@ -480,6 +714,8 @@ PATTERNS = [
     ('motorcycle_6', 6, [0, 1], [2, 3, 4, 5], lambda s: f"{s[0:2]} {s[2:6]}"),
     ('motorcycle_alt', 6, [3, 4, 5], [0, 1, 2], lambda s: f"{s[0:3]} {s[3:6]}"),
     ('numeric_suffix_6', 6, [5], [0, 1, 2, 3, 4], lambda s: s),
+    ('numeric_prefix_6', 6, [4, 5], [0, 1, 2, 3], lambda s: f"{s[:4]} {s[4:]}"),
+    ('numeric_identifier_11', 11, [], list(range(11)), lambda s: f"{s[:4]}-{s[4:]}"),
 ]
 
 _REG_CACHE = {'timestamp': 0.0, 'data': {}}
@@ -529,7 +765,7 @@ def normalize_plate(plate_text):
 def is_valid_plate(plate_text):
     """Validate extracted text from bounding box."""
     plate = normalize_plate(plate_text)
-    if len(plate) not in (5, 6, 7):
+    if not (5 <= len(plate) <= 7 or (plate.isdigit() and 8 <= len(plate) <= 20)):
         return False
     if plate in NON_PLATE_WORDS:
         return False
@@ -539,44 +775,22 @@ def is_valid_plate(plate_text):
 
 
 def score_and_fix(candidate, pattern_spec):
-    """Score a candidate string against a Philippine plate syntax pattern with positional correction."""
+    """Match a plate syntax pattern without changing OCR characters."""
     name, length, let_indices, dig_indices, formatter = pattern_spec
     if len(candidate) != length:
         return None, 999
 
-    chars = list(candidate)
-    corrections = 0
-
-    for idx in let_indices:
-        c = chars[idx]
-        if c.isdigit():
-            if c in DIGIT_TO_LETTER:
-                chars[idx] = DIGIT_TO_LETTER[c]
-                corrections += 1
-            else:
-                return None, 999
-        elif not c.isalpha():
-            return None, 999
-
-    for idx in dig_indices:
-        c = chars[idx]
-        if c.isalpha():
-            if c in LETTER_TO_DIGIT:
-                chars[idx] = LETTER_TO_DIGIT[c]
-                corrections += 1
-            else:
-                return None, 999
-        elif not c.isdigit():
-            return None, 999
-
-    result = ''.join(chars)
-    return result, corrections
+    if any(not candidate[idx].isalpha() for idx in let_indices):
+        return None, 999
+    if any(not candidate[idx].isdigit() for idx in dig_indices):
+        return None, 999
+    return candidate, 0
 
 
 def extract_exact_ph_plate_details(raw_string, registered_plates=None):
     """
-    Extract the exact Philippine license plate from raw string using sliding windows.
-    Guarantees exact length (6 or 7 characters) and eliminates screw/border noise.
+    Preserve short OCR readings and numeric identifiers up to 20 digits.
+    Extract exact known-format windows only when longer text contains noise.
     """
     if not raw_string:
         return "", "", 0.0, "", 999, False
@@ -585,16 +799,38 @@ def extract_exact_ph_plate_details(raw_string, registered_plates=None):
         registered_plates = get_cached_registered_plates()
 
     cleaned = re.sub(r'[^A-Z0-9]', '', raw_string.upper())
-    for word in NON_PLATE_WORDS:
-        cleaned = cleaned.replace(word, '')
+    if cleaned in NON_PLATE_WORDS:
+        return "", "", 0.0, "", 999, False
+    if not (5 <= len(cleaned) <= 7 or (cleaned.isdigit() and 8 <= len(cleaned) <= 20)):
+        tokens = re.findall(r'[A-Z0-9]+', raw_string.upper())
+        headers = sorted((i for i, token in enumerate(tokens) if token in NON_PLATE_WORDS),
+                         key=lambda i: len(tokens[i]), reverse=True)
+        for index in headers:
+            if len(cleaned) <= 7 or (cleaned.isdigit() and len(cleaned) <= 20):
+                break
+            tokens[index] = ''
+            cleaned = ''.join(tokens)
 
-    if len(cleaned) < 4:
+    if len(cleaned) < 4 or cleaned in NON_PLATE_WORDS:
+        return "", "", 0.0, "", 999, False
+
+    if 5 <= len(cleaned) <= 7 or (cleaned.isdigit() and 8 <= len(cleaned) <= 20):
+        if len(set(cleaned)) <= 1:
+            return "", "", 0.0, "", 999, False
+        for pattern in PATTERNS:
+            exact, _ = score_and_fix(cleaned, pattern)
+            if exact:
+                return pattern[4](cleaned), cleaned, 1.0, pattern[0], 0, cleaned in registered_plates
+        kind = "numeric_identifier" if len(cleaned) > 7 else "alphanumeric"
+        return cleaned, cleaned, 1.0, kind, 0, cleaned in registered_plates
+
+    if cleaned.isdigit():
         return "", "", 0.0, "", 999, False
 
     candidates = []
 
-    # Slide windows of length 6 and 7 across the cleaned string
-    for L in (6, 7):
+    # Longer windows preserve a complete numeric identifier after header noise.
+    for L in (6, 7, 11):
         for start in range(len(cleaned) - L + 1):
             sub = cleaned[start:start + L]
             for pat in PATTERNS:
@@ -619,12 +855,10 @@ def clean_and_select_plate_text(ocr_results):
     """
     Extract the exact Philippine license plate from EasyOCR results.
     Guarantees:
-    1. Exact character count (6 for conduction/legacy, 7 for standard/motorcycle).
+    1. Preserves short plates and numeric identifiers up to 20 digits.
     2. Strips extraneous screw marks, frame borders, timestamps, and banner words.
-    3. Positional character disambiguation:
-       - Letter positions: replaces '0'->'D', '2'->'Z', '8'->'B', '5'->'S', '1'->'I'
-       - Digit positions: replaces 'O'/'D'->'0', 'Z'->'2', 'B'->'8', 'S'->'5', 'I'->'1'
-    4. Automatically correlates with active registered vehicles for flawless recognition.
+    3. Format matching never substitutes one alphanumeric character for another.
+    4. Registration lookup classifies the extracted plate.
     """
     if not ocr_results:
         return "", "", 0.0
@@ -653,9 +887,7 @@ def clean_and_select_plate_text(ocr_results):
         filtered = []
         for tok in tokens:
             clean_tok = re.sub(r'[^A-Z0-9]', '', tok)
-            if clean_tok and clean_tok not in NON_PLATE_WORDS:
-                if len(clean_tok) > 6 and clean_tok.startswith('IND'):
-                    clean_tok = clean_tok[3:]
+            if clean_tok:
                 filtered.append(clean_tok)
                 all_raw_tokens.append(clean_tok)
 
@@ -676,17 +908,17 @@ def clean_and_select_plate_text(ocr_results):
     # Build candidate strings to inspect:
     # 1. Combined single-line (left to right)
     blocks_sorted_x = sorted(blocks, key=lambda b: b['min_x'])
-    combined_horizontal = "".join("".join(b['tokens']) for b in blocks_sorted_x)
+    combined_horizontal = " ".join(b['text'] for b in blocks_sorted_x)
 
     # 2. Combined multi-row (top to bottom, for motorcycle/square plates)
     blocks_sorted_y = sorted(blocks, key=lambda b: b['min_y'])
-    combined_vertical = "".join("".join(b['tokens']) for b in blocks_sorted_y)
+    combined_vertical = " ".join(b['text'] for b in blocks_sorted_y)
 
     # 3. Individual candidate strings
     candidate_strings = [
         combined_horizontal,
         combined_vertical,
-        "".join(all_raw_tokens)
+        " ".join(all_raw_tokens)
     ] + all_raw_tokens
 
     # Remove duplicates while preserving order
@@ -696,7 +928,7 @@ def clean_and_select_plate_text(ocr_results):
         c_clean = re.sub(r'[^A-Z0-9]', '', s.upper())
         if c_clean and c_clean not in seen_strings:
             seen_strings.add(c_clean)
-            unique_candidates.append(c_clean)
+            unique_candidates.append(s)
 
     reg_cache = get_cached_registered_plates()
 
@@ -706,20 +938,20 @@ def clean_and_select_plate_text(ocr_results):
     for cand_str in unique_candidates:
         disp, norm, conf, pat_name, cost, is_reg = extract_exact_ph_plate_details(cand_str, reg_cache)
         if norm:
-            priority = cost - (100 if is_reg else 0)
+            priority = cost
             if priority < best_priority:
                 best_priority = priority
                 best_result = (disp, norm, conf)
-                if is_reg and cost == 0:
-                    break  # Perfect registered match found
 
     if best_result:
         return best_result
 
     # Fallback if no exact Philippine format matched cleanly
     for cand_str in unique_candidates:
-        if 5 <= len(cand_str) <= 7 and cand_str not in NON_PLATE_WORDS and len(set(cand_str)) > 1:
-            return cand_str, cand_str, 0.5
+        clean = normalize_plate(cand_str)
+        if ((5 <= len(clean) <= 7 or (clean.isdigit() and 8 <= len(clean) <= 20))
+                and clean not in NON_PLATE_WORDS and len(set(clean)) > 1):
+            return clean, clean, 0.5
 
     return "", "", 0.0
 
@@ -755,7 +987,10 @@ def plates_are_similar(plate_a, plate_b):
 
 
 def is_plate_recently_logged_in_db(plate, direction='IN', cooldown_seconds=30):
-    """Query MySQL to see if this plate was logged within the cooldown period."""
+    """
+    Query MySQL to see if this plate's most recent log within the cooldown period
+    already matches `direction` (ignoring earlier logs if the vehicle has since transitioned).
+    """
     conn = get_db_connection()
     if not conn:
         return False
@@ -764,20 +999,19 @@ def is_plate_recently_logged_in_db(plate, direction='IN', cooldown_seconds=30):
         norm_target = normalize_plate(plate)
         cursor.execute(
             """
-            SELECT plate_number
+            SELECT plate_number, direction
             FROM vehicle_logs
             WHERE date_created >= NOW() - INTERVAL %s SECOND
-              AND direction = %s
             ORDER BY id DESC
-            LIMIT 25
+            LIMIT 50
             """,
-            (cooldown_seconds, direction)
+            (cooldown_seconds,)
         )
         recent_rows = cursor.fetchall()
         for row in recent_rows:
             logged_plate = normalize_plate(row[0])
             if plates_are_similar(norm_target, logged_plate):
-                return True
+                return str(row[1] or '').upper() == str(direction or '').upper()
 
         return False
     except Exception as e:
@@ -815,6 +1049,13 @@ class CameraChannel:
         self.connected = False
         self.capture_thread = None
         self.reconnect_requested = threading.Event()
+
+        # Capture watchdog: each capture thread has a generation number. If a
+        # thread dies or gets stuck inside the video library, a new thread
+        # (next generation) takes over and the old one exits when it wakes up.
+        self.capture_generation = 0
+        self.last_capture_progress = time.monotonic()
+        self.last_health_check = 0.0
 
         # Frame state (updated by capture thread at camera FPS)
         self.raw_frame = None
@@ -858,7 +1099,13 @@ class CameraChannel:
                 cap = cv2.VideoCapture(idx)
             if cap.isOpened():
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                self._usb_missing_reported = None
                 return cap
+            if getattr(self, '_usb_missing_reported', None) != src_clean:
+                self._usb_missing_reported = src_clean
+                print(f"[WARNING] Camera [{self.name}] no USB camera found at number {idx}. "
+                      f"Plug it in, or set this camera to another source in Camera Setup. "
+                      f"Retrying every 15 seconds...", flush=True)
             return None
 
         # Pre-flight TCP check on RTSP port to prevent 30-second OpenCV freeze on offline camera
@@ -879,28 +1126,56 @@ class CameraChannel:
                 return None
 
         # Try opening RTSP stream
-        cap = cv2.VideoCapture(src_clean, cv2.CAP_FFMPEG, [
-            cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000, cv2.CAP_PROP_READ_TIMEOUT_MSEC, 3000])
-        if cap.isOpened():
-            ret, _ = cap.read()
-            if ret:
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                return cap
-            cap.release()
+        cap = self._open_rtsp(src_clean)
+        if cap is not None:
+            return cap
 
         # If stream1 was requested and failed, auto-fallback to stream2 (H.264 substream)
         if "/stream1" in src_clean:
             fallback_url = src_clean.replace("/stream1", "/stream2")
-            cap2 = cv2.VideoCapture(fallback_url, cv2.CAP_FFMPEG, [
-                cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000, cv2.CAP_PROP_READ_TIMEOUT_MSEC, 3000])
-            if cap2.isOpened():
-                ret, _ = cap2.read()
-                if ret:
-                    print(f"[INFO] Camera [{self.name}] auto-switched to stable substream: {fallback_url}")
-                    cap2.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                    return cap2
-                cap2.release()
+            cap2 = self._open_rtsp(fallback_url)
+            if cap2 is not None:
+                print(f"[INFO] Camera [{self.name}] auto-switched to stable substream: {fallback_url}")
+                return cap2
 
+        return None
+
+    def _open_rtsp(self, url):
+        """Open an RTSP stream (optionally trying D3D11VA hardware decode first,
+        see USE_HW_VIDEO_DECODE), falling back to normal CPU decoding."""
+        base_params = [cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000, cv2.CAP_PROP_READ_TIMEOUT_MSEC, 3000]
+        attempts = []
+        if USE_HW_VIDEO_DECODE and hasattr(cv2, "CAP_PROP_HW_ACCELERATION"):
+            attempts.append(("GPU", base_params + [cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_ANY]))
+        attempts.append(("CPU", base_params))
+
+        for label, params in attempts:
+            cap = None
+            try:
+                cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG, params)
+                if cap.isOpened():
+                    ret, frame = cap.read()
+                    if ret and frame is not None:
+                        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                        hw = 0
+                        if label == "GPU":
+                            try:
+                                hw = int(cap.get(cv2.CAP_PROP_HW_ACCELERATION))
+                            except Exception:
+                                hw = 0
+                        # OpenCV reports the *requested* accel type even if FFmpeg fell back to CPU.
+                        mode = f"hardware decode requested (type {hw}; FFmpeg may fall back to CPU)" if hw > 0 else "CPU software decode"
+                        print(f"[INFO] Camera [{self.name}] stream opened with {mode} at {frame.shape[1]}x{frame.shape[0]}")
+                        return cap
+                if cap is not None:
+                    cap.release()
+            except Exception as e:
+                if cap is not None:
+                    try:
+                        cap.release()
+                    except Exception:
+                        pass
+                print(f"[WARNING] Camera [{self.name}] {label} decode open failed: {e}")
         return None
 
     @staticmethod
@@ -913,99 +1188,183 @@ class CameraChannel:
         return cv2.resize(frame, (max(1, round(width * scale)), max(1, round(height * scale))),
                           interpolation=cv2.INTER_AREA)
 
-    def capture_loop(self):
-        """Continuously drain frames to eliminate network buffer delay and detect motion."""
+    def _read_latest_frame(self, cap):
+        """Read the newest frame. If frames have piled up (the reader fell
+        behind, e.g. right after switching cameras), skip the stale ones
+        without converting them to images, so the picture is live again at
+        once instead of slowly catching up."""
+        if not (hasattr(cap, "grab") and hasattr(cap, "retrieve")):
+            return cap.read()
+        started = time.monotonic()
+        ok = cap.grab()
+        waited = time.monotonic() - started
+        skipped = 0
+        # A frame that was already waiting returns almost instantly; a live
+        # frame has to be waited for (about 33 ms at 30 FPS).
+        while ok and waited < 0.012 and skipped < 60 and self.running:
+            started = time.monotonic()
+            ok = cap.grab()
+            waited = time.monotonic() - started
+            skipped += 1
+        if not ok:
+            return False, None
+        return cap.retrieve()
+
+    def check_capture_health(self):
+        """Watchdog (called from the broadcast loop): restart capture if its
+        thread died, or has been stuck longer than any open/read timeout."""
+        now = time.monotonic()
+        if not self.running or now - self.last_health_check < 2.0:
+            return
+        self.last_health_check = now
+        thread = self.capture_thread
+        dead = thread is None or not thread.is_alive()
+        stuck = (now - self.last_capture_progress) > 18.0
+        if not (dead or stuck):
+            return
+        reason = "stopped unexpectedly" if dead else "stopped responding"
+        print(f"[WATCHDOG] Camera [{self.name}] capture {reason}; starting a fresh connection.", flush=True)
+        self.connected = False
+        self.capture_generation += 1
+        self.last_capture_progress = now
+        self.capture_thread = threading.Thread(
+            target=self.capture_loop,
+            args=(self.capture_generation, True),
+            name=f"Capture-{self.channel_id}-{self.capture_generation}",
+            daemon=True
+        )
+        self.capture_thread.start()
+
+    def capture_loop(self, generation=None, fresh=False):
+        """Continuously drain frames to eliminate network buffer delay and detect motion.
+        Each thread owns the stream it opened (local `cap`); a thread replaced by
+        the watchdog (older generation) exits without touching the new one."""
+        if generation is None:
+            generation = self.capture_generation
         failures = 0
         retry_delay = 1.0
+        cap = None if fresh else self.cap
+
+        def current():
+            return self.running and generation == self.capture_generation
 
         try:
-            while self.running:
-                if self.reconnect_requested.is_set():
-                    self.reconnect_requested.clear()
-                    if self.cap is not None:
-                        self.cap.release()
-                        self.cap = None
-                    self.connected = False
-                if self.cap is None or not self.cap.isOpened():
-                    time.sleep(retry_delay)
-                    if not self.running:
-                        break
-                    self.cap = self._open_capture(self.source)
-                    self.connected = self.cap is not None and self.cap.isOpened()
-                    if not self.connected:
-                        retry_delay = min(5.0, retry_delay + 0.5)
-                    else:
-                        retry_delay = 1.0
-                        print(f"[INFO] Camera [{self.name} - {self.direction}] connected successfully: {self.source}")
-                    continue
-
-                current_source = self.source
-                success, frame = self.cap.read()
-                if not self.running or current_source != self.source or self.reconnect_requested.is_set():
-                    continue
-
-                if not success or frame is None:
-                    failures += 1
-                    if failures >= 15:
+            while current():
+                self.last_capture_progress = time.monotonic()
+                try:
+                    if self.reconnect_requested.is_set():
+                        self.reconnect_requested.clear()
+                        if cap is not None:
+                            cap.release()
+                            cap = None
+                            if self.cap is not None and current():
+                                self.cap = None
                         self.connected = False
-                        print(f"[WARNING] Camera [{self.name}] stream interrupted, reconnecting...")
-                        failures = 0
+                    if cap is None or not cap.isOpened():
+                        time.sleep(retry_delay)
+                        if not current():
+                            break
+                        cap = self._open_capture(self.source)
+                        self.last_capture_progress = time.monotonic()
+                        if not current():
+                            break
+                        self.cap = cap
+                        self.connected = cap is not None and cap.isOpened()
+                        if not self.connected:
+                            # A missing USB camera is retried slowly; network cameras quickly
+                            retry_delay = 15.0 if str(self.source).strip().isdigit() else min(5.0, retry_delay + 0.5)
+                        else:
+                            retry_delay = 1.0
+                            print(f"[INFO] Camera [{self.name} - {self.direction}] connected successfully: {self.source}")
+                        continue
+
+                    current_source = self.source
+                    success, frame = self._read_latest_frame(cap)
+                    if not current() or current_source != self.source or self.reconnect_requested.is_set():
+                        continue
+
+                    if not success or frame is None:
+                        failures += 1
+                        if failures >= 15:
+                            self.connected = False
+                            print(f"[WARNING] Camera [{self.name}] stream interrupted, reconnecting...")
+                            failures = 0
+                            try:
+                                cap.release()
+                            except Exception:
+                                pass
+                            cap = None
+                            if current():
+                                self.cap = None
+                            time.sleep(0.5)
+                        else:
+                            time.sleep(0.01)
+                        continue
+
+                    failures = 0
+                    self.connected = True
+
+                    if self.flip_180 or FLIP_CAMERA_180:
+                        frame = cv2.rotate(frame, cv2.ROTATE_180)
+
+                    # Crop / Zoom into the vehicle lane (narrows wide-angle lens, focuses on car & plate)
+                    if self.zoom_factor > 1.01:
                         try:
-                            self.cap.release()
+                            fh, fw = frame.shape[:2]
+                            cw = int(fw / self.zoom_factor)
+                            ch = int(fh / self.zoom_factor)
+                            cx1 = max(0, (fw - cw) // 2)
+                            cy1 = max(0, (fh - ch) // 2)
+                            frame = frame[cy1:cy1 + ch, cx1:cx1 + cw]
                         except Exception:
                             pass
-                        self.cap = None
-                        time.sleep(0.5)
-                    else:
-                        time.sleep(0.01)
-                    continue
 
-                failures = 0
-                self.connected = True
+                    # Keep detection, OCR crops, and saved captures within a 1080p frame.
+                    frame = self.fit_processing_frame(frame)
 
-                if self.flip_180 or FLIP_CAMERA_180:
-                    frame = cv2.rotate(frame, cv2.ROTATE_180)
-
-                # Crop / Zoom into the vehicle lane (narrows wide-angle lens, focuses on car & plate)
-                if self.zoom_factor > 1.01:
+                    # Quick motion detection on downscaled 160x90 grayscale (< 1ms)
                     try:
-                        fh, fw = frame.shape[:2]
-                        cw = int(fw / self.zoom_factor)
-                        ch = int(fh / self.zoom_factor)
-                        cx1 = max(0, (fw - cw) // 2)
-                        cy1 = max(0, (fh - ch) // 2)
-                        frame = frame[cy1:cy1 + ch, cx1:cx1 + cw]
+                        small = cv2.resize(frame, (160, 90))
+                        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+                        if self.prev_gray_thumb is not None:
+                            diff = cv2.absdiff(self.prev_gray_thumb, gray)
+                            score = float(np.mean(diff))
+                            if score > 2.2:
+                                self.last_motion_time = time.time()
+                                self.has_motion = True
+                            else:
+                                self.has_motion = False
+                        self.prev_gray_thumb = gray
                     except Exception:
                         pass
 
-                # Keep detection, OCR crops, and saved captures within a 1080p frame.
-                frame = self.fit_processing_frame(frame)
-
-                # Quick motion detection on downscaled 160x90 grayscale (< 1ms)
-                try:
-                    small = cv2.resize(frame, (160, 90))
-                    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-                    if self.prev_gray_thumb is not None:
-                        diff = cv2.absdiff(self.prev_gray_thumb, gray)
-                        score = float(np.mean(diff))
-                        if score > 2.2:
-                            self.last_motion_time = time.time()
-                            self.has_motion = True
-                        else:
-                            self.has_motion = False
-                    self.prev_gray_thumb = gray
-                except Exception:
-                    pass
-
-                with self.frame_lock:
-                    self.raw_frame = frame
-                    self.frame_seq += 1
+                    with self.frame_lock:
+                        self.raw_frame = frame
+                        self.frame_seq += 1
+                except Exception as e:
+                    # One bad frame or library error must not end the camera thread
+                    print(f"[WARNING] Camera [{self.name}] capture error ({e}); reconnecting...", flush=True)
+                    self.connected = False
+                    if cap is not None:
+                        try:
+                            cap.release()
+                        except Exception:
+                            pass
+                        cap = None
+                        if current():
+                            self.cap = None
+                    time.sleep(1.0)
         finally:
             # VideoCapture is owned by this thread. Never release it from an HTTP worker.
-            if self.cap is not None:
-                self.cap.release()
+            if cap is not None:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+            if self.cap is cap:
                 self.cap = None
-            self.connected = False
+            if generation == self.capture_generation:
+                self.connected = False
 
     def draw_overlays(self, frame, overlays):
         """Draw bounding boxes and plate labels onto a frame."""
@@ -1055,6 +1414,7 @@ class CameraChannel:
         target_delay = 1.0 / 18.0
 
         while self.running:
+            self.check_capture_health()
             t0 = time.time()
             frame = None
             with self.frame_lock:
@@ -1110,8 +1470,11 @@ class CameraChannel:
     def start(self):
         """Start the background frame capture thread and broadcast encoder."""
         self.running = True
+        self.capture_generation += 1
+        self.last_capture_progress = time.monotonic()
         self.capture_thread = threading.Thread(
             target=self.capture_loop,
+            args=(self.capture_generation,),
             name=f"Capture-{self.channel_id}",
             daemon=True
         )
@@ -1229,12 +1592,14 @@ class PlateDetector:
         h, w = frame.shape[:2]
 
         pred_device = "cpu" if (USE_INTEL_GPU or "openvino" in str(getattr(self.model, "model_path", "")).lower()) else DEVICE
+        use_half = USE_CUDA and str(pred_device).startswith("cuda")  # FP16 on the NVIDIA GPU
 
         results = self.model.predict(
             source=frame,
             imgsz=IMAGE_SIZE,
             conf=DETECTION_CANDIDATE_THRESHOLD,
             device=pred_device,
+            half=use_half,
             verbose=False
         )
 
@@ -1253,6 +1618,7 @@ class PlateDetector:
                 imgsz=IMAGE_SIZE,
                 conf=DETECTION_CANDIDATE_THRESHOLD,
                 device=pred_device,
+                half=use_half,
                 verbose=False
             )
             for result in rot_results:
@@ -1292,6 +1658,14 @@ class PlateDetector:
             if combined_conf < CONFIDENCE_THRESHOLD:
                 continue
 
+            if normalized and is_valid_plate(normalized):
+                if not self._can_scan_plate(normalized, channel_direction):
+                    continue
+            elif channel_direction in ('IN', 'OUT') and callable(
+                getattr(self, 'can_scan_plate', None) or globals().get('should_scan_plate_on_direction')
+            ):
+                continue
+
             if decision == "NEEDS_REVIEW":
                 label = f"[{channel_direction}] REVIEW: {display_text or 'Plate'}"
             elif display_text:
@@ -1322,6 +1696,27 @@ class PlateDetector:
 
         return overlays, plates_found
 
+    def _can_scan_plate(self, plate_number, direction, use_cache=True):
+        """Return True if plate_number is eligible to be scanned on direction ('IN', 'OUT', 'AUTO')."""
+        if direction not in ('IN', 'OUT'):
+            return True
+        checker = getattr(self, 'can_scan_plate', None) or globals().get('should_scan_plate_on_direction')
+        if not callable(checker):
+            return True
+        return bool(checker(plate_number, direction, use_cache=use_cache))
+
+    def _record_direction_cooldown(self, direction, plate, now):
+        """Record cooldown for `direction:plate` and clear opposite-direction cooldown for the same plate."""
+        opposite = 'OUT' if direction == 'IN' else ('IN' if direction == 'OUT' else None)
+        if opposite:
+            for existing_key in list(self.detected_plates.keys()):
+                ex_ch, existing_plate = existing_key.split(":", 1)
+                if ex_ch == opposite and plates_are_similar(plate, existing_plate):
+                    self.detected_plates.pop(existing_key, None)
+        self.detected_plates[f'{direction}:{plate}'] = now
+        cutoff = now - timedelta(minutes=10)
+        self.detected_plates = {k: v for k, v in self.detected_plates.items() if v > cutoff}
+
     def process_frame(self, frame):
         """Run YOLOv10 detection + Triple Ensemble OCR on a single frame (used by /api/detect)."""
         overlays, plates_found = self.detect_plates_on_frame(frame, channel_direction=self.channels['entrance'].direction)
@@ -1344,6 +1739,12 @@ class PlateDetector:
         method = plate_info.get('method', 'OCR')
         review_reason = plate_info.get('review_reason')
 
+        # 0. Enforce Inside/Outside directional scan gate before cooldown or logging:
+        #    - Entrance ('IN'): do NOT scan if already Inside
+        #    - Exit ('OUT'): do NOT scan if already Outside
+        if not self._can_scan_plate(plate, direction, use_cache=False):
+            return False
+
         # 1. Check in-memory cooldown across recent detections on this channel/direction
         for existing_key, last_seen in list(self.detected_plates.items()):
             ex_ch, existing_plate = existing_key.split(":", 1)
@@ -1360,23 +1761,115 @@ class PlateDetector:
 
         # 3. Database lookup: strict registered vs visitor
         db_info = check_plate_in_database(plate)
+        if (plate.isdigit() and len(plate) > 7
+                and not db_info.get('registered_vehicle_id') and not db_info.get('visitor_vehicle_id')):
+            db_info['official_plate'] = plate_info.get('text') or plate
         category = db_info['category']
         vehicle_type = db_info['vehicle_type']
         actual_plate = db_info.get('official_plate') or plate
+
+        if actual_plate != plate and not self._can_scan_plate(actual_plate, direction, use_cache=False):
+            return False
 
         # If decision is flagged as review, attach review reason to purpose
         if decision == 'NEEDS_REVIEW':
             db_info['purpose'] = f"Needs Review: {review_reason or 'Verify plate'}"
 
 
-        # Always log to MySQL so the guard dashboard and live feed reflect every vehicle
+        # Visitor arrivals (IN) wait for guard form confirmation before entering MySQL;
+        # cancelling the Visitor Information Input modal never writes the plate to DB.
+        is_visitor_arrival = False
+        if category == 'Visitor':
+            if direction in ('IN', 'AUTO'):
+                get_db_fn = globals().get('get_db_connection')
+                has_open_fn = globals().get('has_open_visitor_visit')
+                already_inside = False
+                if callable(get_db_fn) and callable(has_open_fn):
+                    conn_chk = get_db_fn()
+                    try:
+                        already_inside = bool(has_open_fn(conn_chk, actual_plate))
+                    finally:
+                        if conn_chk:
+                            conn_chk.close()
+                if direction == 'IN':
+                    if already_inside:
+                        return False
+                    is_visitor_arrival = True
+                else:
+                    is_visitor_arrival = not already_inside
+
+        if is_visitor_arrival:
+            pending_plate = (
+                db_info.get('official_plate')
+                if db_info.get('visitor_vehicle_id')
+                else (plate_info.get('text') or actual_plate)
+            )
+            pending_info = dict(db_info, official_plate=pending_plate)
+            pending_entry = enqueue_pending_visitor(
+                pending_plate,
+                pending_info,
+                channel_name=channel.name,
+                confidence=plate_info.get('confidence', 0.0),
+                cooldown_seconds=PLATE_COOLDOWN_SECONDS,
+            )
+            if not pending_entry:
+                return False
+            direction = 'IN'
+            self._record_direction_cooldown(direction, plate, now)
+            invalidate_fn = globals().get('invalidate_plate_state_cache')
+            if callable(invalidate_fn):
+                invalidate_fn(actual_plate)
+            if pending_entry.get('already_queued') or pending_entry.get('suppressed'):
+                return True
+            # Vehicle photo for this visitor; linked to the log when the guard saves the form
+            pending_id = pending_entry.get('pending_id')
+            vehicle_img_path = self._capture_vehicle(plate_info, pending_id)
+            crop = plate_info.get('_plate_crop')
+            if crop is not None:
+                try:
+                    pending_detection = {
+                        'plate': pending_plate,
+                        'display_text': plate_info.get('text') or pending_plate,
+                        'category': 'Visitor',
+                        'vehicle_type': vehicle_type,
+                        'direction': direction,
+                        'camera': channel.name,
+                        'channel': channel_key,
+                        'confidence': plate_info.get('confidence', 0.0),
+                        'decision': decision,
+                        'method': method,
+                        'review_reason': review_reason,
+                        'needs_review': (decision == 'NEEDS_REVIEW'),
+                        'timestamp': now.strftime('%Y-%m-%d %H:%M:%S'),
+                        'pending_id': pending_id,
+                        'vehicle_image': vehicle_img_path or (f"uploads/vehicle_captures/{pending_id}.jpg" if pending_id else None),
+                    }
+                    save_plate_capture(
+                        os.path.join(BASE_DIR, 'uploads', 'plate_captures'),
+                        crop,
+                        pending_detection,
+                    )
+                except Exception as exc:
+                    print(f"[WARNING] Visitor plate photo save failed: {exc}")
+            print(
+                f"[PENDING-VISITOR] [{channel.name} - IN] {pending_plate} ({method}) | "
+                f"Awaiting guard form confirmation ({plate_info.get('confidence', 0.0):.0%})"
+            )
+            return True
+
+        # Log Registered vehicles and Visitor exits (OUT) immediately to MySQL
         result = log_vehicle_detection(actual_plate, db_info, direction)
         if not result:
             return False
         direction = result['direction']
-        self.detected_plates[f'{direction}:{plate}'] = now
-        cutoff = now - timedelta(minutes=10)
-        self.detected_plates = {k: v for k, v in self.detected_plates.items() if v > cutoff}
+        self._record_direction_cooldown(direction, plate, now)
+        invalidate_fn = globals().get('invalidate_plate_state_cache')
+        if callable(invalidate_fn):
+            invalidate_fn(actual_plate)
+        if direction == 'OUT':
+            clear_pending_fn = globals().get('clear_pending_visitor_for_plate')
+            if callable(clear_pending_fn):
+                clear_pending_fn(actual_plate)
 
         detection = {
             'plate': actual_plate,
@@ -1393,6 +1886,12 @@ class PlateDetector:
             'needs_review': (decision == 'NEEDS_REVIEW'),
             'timestamp': now.strftime('%Y-%m-%d %H:%M:%S')
         }
+
+        if result.get('log_id'):
+            log_id = int(result['log_id'])
+            detection['vehicle_image'] = self._capture_vehicle(
+                plate_info, f"log_{log_id}",
+                on_saved=lambda path, info, log_id=log_id: self._link_vehicle_photo(log_id, path))
 
         crop = plate_info.get('_plate_crop')
         if crop is not None:
@@ -1414,6 +1913,33 @@ class PlateDetector:
             f"{category} | {vehicle_type} | {plate_info.get('confidence', 0.0):.0%}"
         )
         return True
+
+    def _capture_vehicle(self, plate_info, name, on_saved=None):
+        """Queue a YOLOv10 vehicle photo for a successfully read plate."""
+        capturer = getattr(self, 'vehicle_capturer', None)
+        frame = plate_info.get('_frame')
+        if capturer is None or frame is None or not name:
+            return None
+        try:
+            return capturer.submit(frame, plate_info.get('bbox'), str(name), on_saved=on_saved)
+        except Exception as exc:
+            print(f"[VEHICLE] Could not queue vehicle photo: {exc}")
+            return None
+
+    def _link_vehicle_photo(self, log_id, relative_path):
+        """Store the saved vehicle photo on its vehicle log row."""
+        conn = get_db_connection()
+        if not conn:
+            return
+        try:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE vehicle_logs SET vehicle_image = %s WHERE id = %s", (relative_path, log_id))
+            conn.commit()
+            cursor.close()
+        except Exception as exc:
+            print(f"[VEHICLE] Could not link vehicle photo to log {log_id}: {exc}")
+        finally:
+            conn.close()
 
     def inference_loop(self):
         """
@@ -1465,21 +1991,29 @@ class PlateDetector:
                                     ch.last_overlay_time = time.time()
 
                             overlays, plates = self.detect_plates_on_frame(
-                                frame_to_proc, channel_direction=ch.direction, on_boxes=publish_boxes)
+                                frame_to_proc,
+                                channel_direction=ch.direction,
+                                on_boxes=publish_boxes if ch.direction == 'AUTO' else None,
+                            )
 
                             with ch.overlay_lock:
                                 if overlays:
                                     ch.active_overlays = overlays
                                     ch.last_overlay_time = time.time()
-                                elif (time.time() - ch.last_overlay_time) > OVERLAY_TTL_SECONDS:
+                                elif ch.direction in ('IN', 'OUT') or (time.time() - ch.last_overlay_time) > OVERLAY_TTL_SECONDS:
                                     ch.active_overlays = []
 
                             confirmed = self.plate_tracker.observe_frame(
                                 ch_id, ch.direction, plates, visible_boxes=[o['bbox'] for o in overlays],
                                 require_departure=(ch.direction == 'AUTO'))
                             for plate_info in confirmed:
+                                plate_info['_frame'] = frame_to_proc  # for the vehicle photo
                                 if not self.handle_detection(plate_info, ch):
-                                    self.plate_tracker.retry_confirmation(ch_id, ch.direction, plate_info['normalized'])
+                                    if self._can_scan_plate(plate_info['normalized'], ch.direction):
+                                        self.plate_tracker.retry_confirmation(ch_id, ch.direction, plate_info['normalized'])
+                                elif hasattr(self.plate_tracker, 'clear_plate'):
+                                    self.plate_tracker.clear_plate(
+                                        plate_info['normalized'], exclude_channel=ch_id, exclude_direction=ch.direction)
                     except Exception as e:
                         print(f"[WARNING] Inference loop error on {ch_id}: {e}")
 
@@ -1524,8 +2058,21 @@ class PlateDetector:
                                     archived_by = VALUES(archived_by)
                             """, (current_date,))
                             cnt = cursor.rowcount
+                            cursor.execute("""
+                                UPDATE vehicle_log_dates
+                                SET date_out = COALESCE(date_out, DATE(time_in), %s),
+                                    time_out = COALESCE(time_out, NOW()),
+                                    status = 'OUT'
+                                WHERE status = 'IN'
+                                  AND time_out IS NULL
+                                  AND (
+                                      (date_in IS NOT NULL AND date_in < %s)
+                                      OR (time_in IS NOT NULL AND DATE(time_in) < %s)
+                                  )
+                            """, (current_date, current_date, current_date))
                             cursor.execute("DELETE FROM vehicle_logs WHERE DATE(date_created) < %s", (current_date,))
                             conn.commit()
+                            invalidate_plate_state_cache()
                             print(f"[MIDNIGHT-RESET] Successfully reset active logs! Archived {cnt} past log(s).")
                         except Exception as e:
                             print(f"[MIDNIGHT-RESET] Error during auto-archive: {e}")
@@ -1538,8 +2085,10 @@ class PlateDetector:
     def reload_ensemble(self):
         """Hot-reload OCR ensemble and GPTVision modules in-memory without restarting server."""
         try:
+            import lpr_engine.gpu_char_extractor
             import lpr_engine.gpt_vision_reader
             import lpr_engine.quad_ensemble
+            importlib.reload(lpr_engine.gpu_char_extractor)
             importlib.reload(lpr_engine.gpt_vision_reader)
             importlib.reload(lpr_engine.quad_ensemble)
 
@@ -1575,6 +2124,11 @@ class PlateDetector:
         for key in ('entrance', 'exit'):
             if not str(cfg.get(key, {}).get('source', '')).strip():
                 raise ValueError('Camera sources cannot be empty.')
+        if mode == 'single':
+            # The one shared camera is always on
+            cfg['entrance']['enabled'] = True
+        elif not cfg['entrance'].get('enabled', True) and not cfg['exit'].get('enabled', True):
+            raise ValueError('At least one camera must stay on. Turn one back on, or switch to one camera.')
         if (mode == 'dual' and cfg['entrance'].get('enabled', True) and cfg['exit'].get('enabled', True)
                 and cfg['entrance']['source'].strip() == cfg['exit']['source'].strip()):
             raise ValueError('Two-camera mode needs different camera sources. Disable exit until the second camera is configured.')
@@ -1629,6 +2183,13 @@ class PlateDetector:
     def start(self):
         """Start both camera channels, shared AI worker, midnight monitor, and code auto-reloader."""
         self.running = True
+
+        # YOLOv10 vehicle photos (background thread; never slows plate reading)
+        self.vehicle_capturer = VehicleCapturer(
+            VEHICLE_MODEL_PATH,
+            os.path.join(BASE_DIR, 'uploads', 'vehicle_captures'),
+            device=DEVICE if USE_CUDA else 'cpu')
+        self.vehicle_capturer.start()
 
         for ch in set(self.channels.values()):
             if ch.enabled:
@@ -2007,10 +2568,11 @@ def get_status():
         'camera_connected': any_connected,
         'cameras': cam_status,
         'device': {
-            'mode': 'Intel UHD iGPU (OpenVINO)' if USE_INTEL_GPU else ('GPU' if USE_CUDA else 'CPU'),
-            'openvino_gpu': USE_INTEL_GPU,
+            'mode': f'GPU ({OV_GPU_NAME})' if USE_INTEL_GPU else ('GPU (CUDA)' if USE_CUDA else 'CPU'),
+            'openvino_gpu': USE_INTEL_GPU or OV_GPU_AVAILABLE,
             'cuda_available': USE_CUDA,
-            'device_name': 'Intel(R) UHD Graphics (iGPU)' if USE_INTEL_GPU else (torch.cuda.get_device_name(0) if USE_CUDA else 'CPU Multi-threaded'),
+            'ocr_gpu_accelerated': bool(USE_CUDA or OV_GPU_AVAILABLE),
+            'device_name': OV_GPU_NAME if (USE_INTEL_GPU or OV_GPU_AVAILABLE) else (torch.cuda.get_device_name(0) if USE_CUDA else 'CPU Multi-threaded'),
             'cuda_version': torch.version.cuda if USE_CUDA else None,
             'image_size': IMAGE_SIZE,
         },
@@ -2071,26 +2633,50 @@ if __name__ == '__main__':
         print("=" * 65)
         print()
 
+        crash_delay = 5.0
         while True:
             env = os.environ.copy()
             env["DETECTOR_WORKER"] = "1"
             script_path = os.path.abspath(sys.argv[0])
-            p = subprocess.Popen([sys.executable, script_path] + sys.argv[1:], env=env)
+            started_at = time.time()
+            try:
+                p = subprocess.Popen([sys.executable, script_path] + sys.argv[1:], env=env)
+            except OSError as exc:
+                # e.g. WinError 1455 (out of memory): wait and try again instead of giving up
+                print(f"\n[SUPERVISOR] Could not start the server ({exc}). Retrying in {crash_delay:.0f}s...\n", flush=True)
+                try:
+                    time.sleep(crash_delay)
+                except KeyboardInterrupt:
+                    sys.exit(0)
+                crash_delay = min(60.0, crash_delay * 2)
+                continue
             try:
                 ret = p.wait()
             except KeyboardInterrupt:
                 p.terminate()
                 sys.exit(0)
 
-            if ret != 3:
-                sys.exit(ret)
+            if ret == 3:
+                crash_delay = 5.0
+                print("\n[SUPERVISOR] >>> Code change detected. Reloading server with new code... <<<\n", flush=True)
+                time.sleep(0.5)
+                continue
+            if ret == 0:
+                sys.exit(0)
 
-            print("\n[SUPERVISOR] >>> Code change detected. Reloading server with new code... <<<\n", flush=True)
-            time.sleep(0.5)
+            # The server crashed: restart it automatically (waiting longer after repeated crashes)
+            if time.time() - started_at > 120:
+                crash_delay = 5.0
+            print(f"\n[SUPERVISOR] Server stopped unexpectedly (exit code {ret}). Restarting in {crash_delay:.0f}s...\n", flush=True)
+            try:
+                time.sleep(crash_delay)
+            except KeyboardInterrupt:
+                sys.exit(0)
+            crash_delay = min(60.0, crash_delay * 2)
 
     print("=" * 65)
     print("  DUAL CAMERA LICENSE PLATE DETECTION SERVER (OPTIMIZED)")
-    print("  Entrance (IN: 192.168.1.18) + Exit (OUT: 192.168.1.19)")
+    print("  Entrance (IN) + Exit (OUT)")
     print("  YOLOv10 + EasyOCR + MySQL | EXIT ONLY ON EXIT CAM")
     print("=" * 65)
     print()
@@ -2102,11 +2688,11 @@ if __name__ == '__main__':
 
     if detector.start():
         print()
-        print(f"[INFO] Server running at http://127.0.0.1:{SERVER_PORT}")
-        print(f"[INFO] Entrance feed: http://127.0.0.1:{SERVER_PORT}/video/entrance (192.168.1.18)")
-        print(f"[INFO] Exit feed:     http://127.0.0.1:{SERVER_PORT}/video/exit (192.168.1.19 - EXIT ONLY)")
-        print(f"[INFO] Detections:    http://127.0.0.1:{SERVER_PORT}/api/detections")
-        print(f"[INFO] Cameras API:   http://127.0.0.1:{SERVER_PORT}/api/cameras")
+        print(f"[INFO] Server running at http://localhost:{SERVER_PORT}")
+        print(f"[INFO] Entrance feed: http://localhost:{SERVER_PORT}/video/entrance")
+        print(f"[INFO] Exit feed:     http://localhost:{SERVER_PORT}/video/exit")
+        print(f"[INFO] Detections:    http://localhost:{SERVER_PORT}/api/detections")
+        print(f"[INFO] Cameras API:   http://localhost:{SERVER_PORT}/api/cameras")
         print()
 
         app.run(

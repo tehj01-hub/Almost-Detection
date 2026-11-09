@@ -43,8 +43,8 @@ if ($actorId === '') {
 /* =========================================================
    DATABASE CONNECTION
 ========================================================= */
-$conn = @new mysqli('localhost:3307', 'root', '', 'security_system');
-if ($conn->connect_error) {
+$conn = secsysConnectDb(true);
+if (!$conn || $conn->connect_error) {
     http_response_code(500);
     echo json_encode([
         'success' => false,
@@ -52,7 +52,6 @@ if ($conn->connect_error) {
     ]);
     exit();
 }
-$conn->set_charset('utf8mb4');
 secsysEnsureSchema($conn);
 
 $action = trim((string)($_POST['action'] ?? $_GET['action'] ?? 'status'));
@@ -124,24 +123,18 @@ if ($action === 'extend_duration' && $_SERVER['REQUEST_METHOD'] === 'POST') {
                 ),
                 INTERVAL ? MINUTE
             ),
+            /* MariaDB applies SET assignments left to right, so
+               expected_time_out here is already the NEW (extended) value.
+               Re-adding the extension here counted it twice. */
             allowed_minutes = TIMESTAMPDIFF(
                 MINUTE,
                 COALESCE(time_in, NOW()),
-                DATE_ADD(
-                    GREATEST(
-                        COALESCE(
-                            CASE WHEN expected_time_out >= COALESCE(time_in, date_created) THEN expected_time_out ELSE NULL END,
-                            DATE_ADD(COALESCE(time_in, NOW()), INTERVAL ? MINUTE)
-                        ),
-                        NOW()
-                    ),
-                    INTERVAL ? MINUTE
-                )
+                expected_time_out
             )
         WHERE id = ?
     ");
     if ($updVv) {
-        $updVv->bind_param('iiiii', $baseMins, $extraMins, $baseMins, $extraMins, $vvId);
+        $updVv->bind_param('iii', $baseMins, $extraMins, $vvId);
         $updVv->execute();
         $updVv->close();
     }
@@ -262,11 +255,12 @@ if ($action === 'mark_exited' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 
     // Check if latest vehicle_logs entry today is IN; if so, log corresponding OUT entry
-    $plateNoSp = str_replace(' ', '', strtoupper($plateClean));
+    $plateNoSp  = str_replace(' ', '', strtoupper($plateClean));
+    $plateAlnum = preg_replace('/[^A-Z0-9]/', '', strtoupper($plateClean));
     $stmtLatest = $conn->prepare("
         SELECT id, direction
         FROM vehicle_logs
-        WHERE (visitor_vehicle_id = ? OR REPLACE(UPPER(plate_number), ' ', '') = ?)
+        WHERE (visitor_vehicle_id = ? OR REPLACE(UPPER(plate_number), ' ', '') = ? OR REGEXP_REPLACE(UPPER(plate_number), '[^A-Z0-9]', '') = ?)
           AND vehicle_category = 'Visitor'
           AND date_created >= CURDATE()
         ORDER BY id DESC
@@ -274,7 +268,7 @@ if ($action === 'mark_exited' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     ");
     $needOutLog = true;
     if ($stmtLatest) {
-        $stmtLatest->bind_param('is', $vvId, $plateNoSp);
+        $stmtLatest->bind_param('iss', $vvId, $plateNoSp, $plateAlnum);
         $stmtLatest->execute();
         $resLatest = $stmtLatest->get_result();
         if ($rLat = $resLatest->fetch_assoc()) {
@@ -299,18 +293,35 @@ if ($action === 'mark_exited' && $_SERVER['REQUEST_METHOD'] === 'POST') {
         }
     }
 
+    // Close the visit's entry (IN) log row, like the camera logger does,
+    // so the entry no longer appears to be still inside in logs/reports
+    $closeEntry = $conn->prepare("
+        UPDATE vehicle_logs
+        SET date_out = CURDATE()
+        WHERE (visitor_vehicle_id = ? OR REPLACE(UPPER(plate_number), ' ', '') = ? OR REGEXP_REPLACE(UPPER(plate_number), '[^A-Z0-9]', '') = ?)
+          AND vehicle_category = 'Visitor'
+          AND direction = 'IN'
+          AND date_out IS NULL
+    ");
+    if ($closeEntry) {
+        $closeEntry->bind_param('iss', $vvId, $plateNoSp, $plateAlnum);
+        @$closeEntry->execute();
+        $closeEntry->close();
+    }
+
     // Close open vehicle_log_dates record if present
     $updVld = $conn->prepare("
         UPDATE vehicle_log_dates
         SET status = 'OUT',
             date_out = CURDATE(),
             time_out = NOW()
-        WHERE REPLACE(UPPER(plate_number), ' ', '') = ?
+        WHERE (REPLACE(UPPER(plate_number), ' ', '') = ? OR REGEXP_REPLACE(UPPER(plate_number), '[^A-Z0-9]', '') = ?)
           AND vehicle_category = 'Visitor'
           AND status = 'IN'
+          AND time_out IS NULL
     ");
     if ($updVld) {
-        $updVld->bind_param('s', $plateNoSp);
+        $updVld->bind_param('ss', $plateNoSp, $plateAlnum);
         @$updVld->execute();
         $updVld->close();
     }

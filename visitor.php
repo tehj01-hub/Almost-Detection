@@ -24,18 +24,7 @@ if (!isset($_SESSION['username'])) {
 /* =========================================================
    DATABASE CONNECTION
 ========================================================= */
-$conn = new mysqli(
-    "localhost:3307",
-    "root",
-    "",
-    "security_system"
-);
-
-if ($conn->connect_error) {
-    die("Database Connection Failed: " . $conn->connect_error);
-}
-
-$conn->set_charset("utf8mb4");
+$conn = secsysConnectDb();
 secsysEnsureSchema($conn);
 $systemName = secsysGetSystemName($conn);
 $systemIcon = secsysGetSystemIcon($conn);
@@ -107,6 +96,7 @@ try {
             plate_number,
             purpose,
             id_type,
+            id_number,
             status,
             time_in,
             time_out,
@@ -123,6 +113,7 @@ try {
             plate_number,
             purpose,
             id_type,
+            id_number,
             status,
             time_in,
             time_out,
@@ -189,7 +180,7 @@ $time_to   = (isset($_GET["time_to"]) && preg_match('/^\d{2}:\d{2}$/', trim($_GE
 /* =========================================================
    ARCHIVE BASIS & DATE / MONTH
 ========================================================= */
-$show_archive = isset($_GET["show_archive"]) && $_GET["show_archive"] === "1";
+$show_archive = (isset($_GET["show_archive"]) && $_GET["show_archive"] === "1") || isset($_GET["archive_q"]);
 
 $archive_basis = strtolower(trim($_GET["archive_basis"] ?? "daily"));
 if (!in_array($archive_basis, ["daily", "monthly"], true)) {
@@ -271,6 +262,7 @@ if ($search !== "") {
             plate_number,
             purpose,
             id_type,
+            id_number,
             status,
             time_in,
             time_out,
@@ -282,6 +274,7 @@ if ($search !== "") {
             OR address_to_visit LIKE ?
             OR purpose LIKE ?
             OR id_type LIKE ?
+            OR id_number LIKE ?
             OR vehicle_type LIKE ?
         ORDER BY id DESC
     ");
@@ -290,7 +283,8 @@ if ($search !== "") {
         "%" . $search . "%";
 
     $stmt->bind_param(
-        "ssssss",
+        "sssssss",
+        $search_param,
         $search_param,
         $search_param,
         $search_param,
@@ -310,6 +304,7 @@ if ($search !== "") {
             plate_number,
             purpose,
             id_type,
+            id_number,
             status,
             time_in,
             time_out,
@@ -320,10 +315,91 @@ if ($search !== "") {
 }
 
 $stmt->execute();
-
 $result = $stmt->get_result();
 
-while ($row = $result->fetch_assoc()) {
+/* =========================================================
+   DAILY / MONTHLY VIEW
+   Today (default) = live visitors only. Another day or a month =
+   live visitors in that range + visitors already moved to the
+   archive at midnight (shown read-only with an "Archived" badge).
+========================================================= */
+$listPeriod = secsysListPeriod('daily', false);
+
+$candidateRows = [];
+while ($r = $result->fetch_assoc()) {
+    if ($listPeriod['is_today'] || secsysPeriodMatches($r['date_created'] ?? null, $listPeriod)) {
+        $candidateRows[] = $r;
+    }
+}
+
+if (!$listPeriod['is_today']) {
+    $archiveSql = "
+        SELECT
+            archive_id,
+            visitor_name,
+            address_to_visit,
+            vehicle_type,
+            plate_number,
+            purpose,
+            id_type,
+            id_number,
+            status,
+            time_in,
+            time_out,
+            original_date_created
+        FROM visitor_vehicles_archive
+        WHERE original_date_created >= ? AND original_date_created < ?
+    ";
+    if ($search !== "") {
+        $archiveSql .= "
+          AND (
+                visitor_name LIKE ?
+             OR plate_number LIKE ?
+             OR address_to_visit LIKE ?
+             OR purpose LIKE ?
+             OR id_type LIKE ?
+             OR id_number LIKE ?
+             OR vehicle_type LIKE ?
+          )";
+    }
+    $stmtArchived = $conn->prepare($archiveSql);
+    if ($search !== "") {
+        $like = "%" . $search . "%";
+        $stmtArchived->bind_param("sssssssss", $listPeriod['start'], $listPeriod['end'],
+            $like, $like, $like, $like, $like, $like, $like);
+    } else {
+        $stmtArchived->bind_param("ss", $listPeriod['start'], $listPeriod['end']);
+    }
+    $stmtArchived->execute();
+    $resArchived = $stmtArchived->get_result();
+    while ($a = $resArchived->fetch_assoc()) {
+        $candidateRows[] = [
+            "id"               => 0,
+            "visitor_name"     => $a["visitor_name"],
+            "address_to_visit" => $a["address_to_visit"],
+            "vehicle_type"     => $a["vehicle_type"],
+            "plate_number"     => $a["plate_number"],
+            "purpose"          => $a["purpose"],
+            "id_type"          => $a["id_type"],
+            "id_number"        => $a["id_number"],
+            "status"           => $a["status"],
+            "time_in"          => $a["time_in"],
+            "time_out"         => $a["time_out"],
+            "date_created"     => $a["original_date_created"],
+            "is_archived"      => true,
+        ];
+    }
+    $stmtArchived->close();
+
+    // newest first across live + archived rows
+    usort($candidateRows, function ($x, $y) {
+        $tx = strtotime($x["time_in"] ?: ($x["date_created"] ?? "1970-01-01"));
+        $ty = strtotime($y["time_in"] ?: ($y["date_created"] ?? "1970-01-01"));
+        return $ty <=> $tx;
+    });
+}
+
+foreach ($candidateRows as $row) {
     if ($time_from !== "" || $time_to !== "") {
         $tIn  = !empty($row["time_in"]) ? date("H:i", strtotime($row["time_in"])) : null;
         $tOut = !empty($row["time_out"]) ? date("H:i", strtotime($row["time_out"])) : null;
@@ -397,31 +473,28 @@ $visitors_page =
    COUNT ARCHIVE (BY DATE ARCHIVED)
 ========================================================= */
 
+/* Archive filter: date / month + optional search text (archive_q) */
+$archive_search = secsysArchiveSearchFromRequest();
 if ($archive_basis === "monthly") {
-    $stmt = $conn->prepare("
-        SELECT COUNT(*) AS total
-        FROM visitor_vehicles_archive
-        WHERE MONTH(archived_at) = ?
-          AND YEAR(archived_at) = ?
-    ");
-
-    $stmt->bind_param(
-        "ii",
-        $archive_month,
-        $current_year
-    );
+    $archive_filter_sql = "MONTH(archived_at) = ? AND YEAR(archived_at) = ?";
+    $archive_filter_types = "ii";
+    $archive_filter_args = [$archive_month, $current_year];
 } else {
-    $stmt = $conn->prepare("
-        SELECT COUNT(*) AS total
-        FROM visitor_vehicles_archive
-        WHERE DATE(archived_at) = ?
-    ");
-
-    $stmt->bind_param(
-        "s",
-        $archive_date
-    );
+    $archive_filter_sql = "DATE(archived_at) = ?";
+    $archive_filter_types = "s";
+    $archive_filter_args = [$archive_date];
 }
+if ($archive_search !== "") {
+    $archive_like = "%" . $archive_search . "%";
+    $archive_filter_sql .= " AND (plate_number LIKE ? OR visitor_name LIKE ? OR vehicle_type LIKE ? OR purpose LIKE ? OR id_type LIKE ? OR address_to_visit LIKE ?)";
+    $archive_filter_types .= "ssssss";
+    for ($i = 0; $i < 6; $i++) {
+        $archive_filter_args[] = $archive_like;
+    }
+}
+
+$stmt = $conn->prepare("SELECT COUNT(*) AS total FROM visitor_vehicles_archive WHERE " . $archive_filter_sql);
+$stmt->bind_param($archive_filter_types, ...$archive_filter_args);
 
 $stmt->execute();
 
@@ -473,67 +546,9 @@ $archive_offset =
 
 $archived_visitors = [];
 
-if ($archive_basis === "monthly") {
-    $stmt = $conn->prepare("
-        SELECT
-            archive_id,
-            original_id,
-            visitor_name,
-            vehicle_type,
-            plate_number,
-            purpose,
-            id_type,
-            status,
-            time_in,
-            time_out,
-            original_date_created,
-            archive_date,
-            archived_at,
-            archive_reason
-        FROM visitor_vehicles_archive
-        WHERE MONTH(archived_at) = ?
-          AND YEAR(archived_at) = ?
-        ORDER BY archived_at DESC
-        LIMIT ? OFFSET ?
-    ");
-
-    $stmt->bind_param(
-        "iiii",
-        $archive_month,
-        $current_year,
-        $archive_records_per_page,
-        $archive_offset
-    );
-} else {
-    $stmt = $conn->prepare("
-        SELECT
-            archive_id,
-            original_id,
-            visitor_name,
-            vehicle_type,
-            plate_number,
-            purpose,
-            id_type,
-            status,
-            time_in,
-            time_out,
-            original_date_created,
-            archive_date,
-            archived_at,
-            archive_reason
-        FROM visitor_vehicles_archive
-        WHERE DATE(archived_at) = ?
-        ORDER BY archived_at DESC
-        LIMIT ? OFFSET ?
-    ");
-
-    $stmt->bind_param(
-        "sii",
-        $archive_date,
-        $archive_records_per_page,
-        $archive_offset
-    );
-}
+$archive_select_args = array_merge($archive_filter_args, [$archive_records_per_page, $archive_offset]);
+$stmt = $conn->prepare("SELECT archive_id, original_id, visitor_name, vehicle_type, plate_number, purpose, id_type, status, time_in, time_out, original_date_created, archive_date, archived_at, archive_reason FROM visitor_vehicles_archive WHERE " . $archive_filter_sql . " ORDER BY archived_at DESC LIMIT ? OFFSET ?");
+$stmt->bind_param($archive_filter_types . "ii", ...$archive_select_args);
 
 $stmt->execute();
 
@@ -822,7 +837,7 @@ if (
 
                     <td>
                         ' . e(
-                            $visitor["id_type"]
+                            trim(($visitor["id_type"] ?? "") . (!empty($visitor["id_number"]) ? " - " . $visitor["id_number"] : "")) ?: "—"
                         ) . '
                     </td>
 
@@ -895,6 +910,13 @@ if (
     ';
 
 
+    // CSV option: same rows as the PDF
+    require_once __DIR__ . '/app/print_report.php';
+    if (secsysWantsCsvDownload()) {
+        secsysStreamCsvFromHtml($pdf_html, "visitor_report_" . date("Y-m-d"));
+        exit();
+    }
+
     $dompdf->loadHtml(
         $pdf_html
     );
@@ -953,63 +975,9 @@ if (
      */
     $archive_download_rows = [];
 
-    if ($archive_basis === "monthly") {
-        $stmt = $conn->prepare("
-            SELECT
-                archive_id,
-                original_id,
-                visitor_name,
-                address_to_visit,
-                vehicle_type,
-                plate_number,
-                purpose,
-                id_type,
-                status,
-                time_in,
-                time_out,
-                original_date_created,
-                archive_date,
-                archived_at,
-                archive_reason
-            FROM visitor_vehicles_archive
-            WHERE MONTH(archived_at) = ?
-              AND YEAR(archived_at) = ?
-            ORDER BY archived_at DESC
-        ");
-
-        $stmt->bind_param(
-            "ii",
-            $archive_month,
-            $current_year
-        );
-    } else {
-        $stmt = $conn->prepare("
-            SELECT
-                archive_id,
-                original_id,
-                visitor_name,
-                address_to_visit,
-                vehicle_type,
-                plate_number,
-                purpose,
-                id_type,
-                status,
-                time_in,
-                time_out,
-                original_date_created,
-                archive_date,
-                archived_at,
-                archive_reason
-            FROM visitor_vehicles_archive
-            WHERE DATE(archived_at) = ?
-            ORDER BY archived_at DESC
-        ");
-
-        $stmt->bind_param(
-            "s",
-            $archive_date
-        );
-    }
+    /* same date / month + search filter as the archive window */
+    $stmt = $conn->prepare("SELECT archive_id, original_id, visitor_name, address_to_visit, vehicle_type, plate_number, purpose, id_type, status, time_in, time_out, original_date_created, archive_date, archived_at, archive_reason FROM visitor_vehicles_archive WHERE " . $archive_filter_sql . " ORDER BY archived_at DESC");
+    $stmt->bind_param($archive_filter_types, ...$archive_filter_args);
 
     $stmt->execute();
 
@@ -1153,10 +1121,10 @@ if (
 
                     <th>#</th>
                     <th>Address to Visit</th>
-                    <th>Vehicle Type</th>
-                    <th>Plate Number</th>
                     <th>Purpose</th>
                     <th>ID Type</th>
+                    <th>Vehicle Type</th>
+                    <th>Plate Number</th>
                     <th>Date</th>
                     <th>Time In</th>
                     <th>Time Out</th>
@@ -1246,7 +1214,7 @@ if (
 
                     <td>
                         ' . e(
-                            $visitor["id_type"]
+                            trim(($visitor["id_type"] ?? "") . (!empty($visitor["id_number"]) ? " - " . $visitor["id_number"] : "")) ?: "—"
                         ) . '
                     </td>
 
@@ -1329,6 +1297,13 @@ if (
     ';
 
 
+    // CSV option: same rows as the PDF
+    require_once __DIR__ . '/app/print_report.php';
+    if (secsysWantsCsvDownload()) {
+        secsysStreamCsvFromHtml($pdf_html, "visitor_archive_" . ($archive_basis === "monthly" ? strtolower($month_names[$archive_month]) . "_" . $current_year : $archive_date));
+        exit();
+    }
+
     $dompdf->loadHtml(
         $pdf_html
     );
@@ -1359,7 +1334,7 @@ $conn->close();
 
 <!DOCTYPE html>
 
-<html lang="en">
+<html lang="en" class="ui-scale-fixed">
 
 <head>
 
@@ -1897,42 +1872,32 @@ body {
 
 .vehicle-table th:nth-child(1),
 .vehicle-table td:nth-child(1) {
-    width: 15%;
+    width: 16%;
 }
 
 .vehicle-table th:nth-child(2),
 .vehicle-table td:nth-child(2) {
-    width: 16%;
+    width: 18%;
 }
 
 .vehicle-table th:nth-child(3),
 .vehicle-table td:nth-child(3) {
-    width: 14%;
+    width: 24%;
 }
 
 .vehicle-table th:nth-child(4),
 .vehicle-table td:nth-child(4) {
-    width: 10%;
+    width: 14%;
 }
 
 .vehicle-table th:nth-child(5),
 .vehicle-table td:nth-child(5) {
-    width: 10%;
+    width: 14%;
 }
 
 .vehicle-table th:nth-child(6),
 .vehicle-table td:nth-child(6) {
-    width: 10%;
-}
-
-.vehicle-table th:nth-child(7),
-.vehicle-table td:nth-child(7) {
-    width: 12.5%;
-}
-
-.vehicle-table th:nth-child(8),
-.vehicle-table td:nth-child(8) {
-    width: 12.5%;
+    width: 14%;
 }
 
 
@@ -2304,6 +2269,15 @@ body {
 
 </style>
 
+<link rel="stylesheet" href="assets/css/period_filter.css?v=<?php echo (int)@filemtime(__DIR__ . '/assets/css/period_filter.css'); ?>">
+
+<script src="assets/js/archive_search.js?v=<?php echo (int)@filemtime(__DIR__ . '/assets/js/archive_search.js'); ?>"></script>
+
+<!-- Same look as the Security Guard dashboard for every Administrator page -->
+<link rel="stylesheet" href="assets/css/admin_uniform.css?v=<?php echo (int)@filemtime(__DIR__ . '/assets/css/admin_uniform.css'); ?>">
+<!-- Enlarges the page 25% (logs +25% more) on laptops/desktops for easier reading (loaded after the page styles) -->
+<link rel="stylesheet" href="assets/css/ui_scale.css?v=<?php echo (int)@filemtime(__DIR__ . '/assets/css/ui_scale.css'); ?>">
+
 </head>
 
 
@@ -2332,9 +2306,7 @@ body {
                 <?php echo htmlspecialchars($systemName); ?>
             </div>
 
-            <div class="logo-subtitle">
-                Administrator
-            </div>
+            <div class="logo-subtitle"><?php echo secsysAdminSidebarSubtitleHtml(); ?></div>
 
         </div>
 
@@ -2435,6 +2407,18 @@ body {
 
         </a>
 
+        <a href="backup.php">
+
+            <span class="nav-icon">
+                💾
+            </span>
+
+            <span>
+                Backup &amp; Retrieve
+            </span>
+
+        </a>
+
         <a href="profile.php">
 
             <span class="nav-icon">
@@ -2496,6 +2480,7 @@ body {
             method="GET"
             class="search-form"
         >
+            <?= secsysPeriodHiddenInputs($listPeriod) ?>
 
             <input
                 type="text"
@@ -2538,9 +2523,9 @@ body {
             <button
                 type="button"
                 class="btn"
-                onclick="downloadReport()"
+                onclick="downloadReport(this)"
             >
-                📥 Download PDF
+                📥 Download ▾
             </button>
 
 
@@ -2560,6 +2545,13 @@ body {
     <!-- =================================================
          TABLE
     ================================================== -->
+
+    <!-- DAILY / MONTHLY VIEW -->
+    <?= secsysRenderPeriodFilter($listPeriod, 'visitor.php', [
+        'search'    => $search,
+        'time_from' => $time_from,
+        'time_to'   => $time_to,
+    ]) ?>
 
     <section class="table-card" id="liveVisitorTable" data-live>
 
@@ -2615,10 +2607,6 @@ body {
 
                         <th>
                             Time Out
-                        </th>
-
-                        <th>
-                            Stay Timer
                         </th>
 
                     </tr>
@@ -2702,11 +2690,7 @@ body {
 
                             <td>
 
-                                <?= e(
-                                    $visitor[
-                                        "plate_number"
-                                    ]
-                                ) ?>
+                                <?= secsysClickablePlateHtml($visitor["plate_number"], $visitor) ?>
 
                             </td>
 
@@ -2749,16 +2733,6 @@ body {
                             </td>
 
 
-                            <td>
-                                <?php
-                                $visStatus = (strtoupper(trim((string)($visitor["status"] ?? "IN"))) === "OUT" || $timeOut !== "") ? "OUT" : "IN";
-                                ?>
-                                <span class="vda-inline-timer" data-vda-plate="<?= e($visitor["plate_number"]) ?>" data-vda-status="<?= $visStatus ?>">
-                                    <?= $visStatus === "IN" ? "⏱ Active" : "✓ Completed" ?>
-                                </span>
-                            </td>
-
-
                         </tr>
 
 
@@ -2771,7 +2745,7 @@ body {
                     <tr>
 
                         <td
-                            colspan="7"
+                            colspan="6"
                             class="empty"
                         >
 
@@ -2802,7 +2776,7 @@ body {
             ): ?>
 
                 <a
-                    href="?page=<?= $current_page - 1 ?>&search=<?= urlencode($search) ?>"
+                    href="?page=<?= $current_page - 1 ?>&search=<?= urlencode($search) ?><?= secsysPeriodQuery($listPeriod) !== '' ? '&amp;' . e(secsysPeriodQuery($listPeriod)) : '' ?><?= $time_from !== '' ? '&amp;time_from=' . urlencode($time_from) : '' ?><?= $time_to !== '' ? '&amp;time_to=' . urlencode($time_to) : '' ?>"
                 >
                     ‹
                 </a>
@@ -2817,7 +2791,7 @@ body {
             ): ?>
 
                 <a
-                    href="?page=<?= $p ?>&search=<?= urlencode($search) ?>"
+                    href="?page=<?= $p ?>&search=<?= urlencode($search) ?><?= secsysPeriodQuery($listPeriod) !== '' ? '&amp;' . e(secsysPeriodQuery($listPeriod)) : '' ?><?= $time_from !== '' ? '&amp;time_from=' . urlencode($time_from) : '' ?><?= $time_to !== '' ? '&amp;time_to=' . urlencode($time_to) : '' ?>"
                     class="<?= $p === $current_page
                         ? "active"
                         : ""
@@ -2834,7 +2808,7 @@ body {
             ): ?>
 
                 <a
-                    href="?page=<?= $current_page + 1 ?>&search=<?= urlencode($search) ?>"
+                    href="?page=<?= $current_page + 1 ?>&search=<?= urlencode($search) ?><?= secsysPeriodQuery($listPeriod) !== '' ? '&amp;' . e(secsysPeriodQuery($listPeriod)) : '' ?><?= $time_from !== '' ? '&amp;time_from=' . urlencode($time_from) : '' ?><?= $time_to !== '' ? '&amp;time_to=' . urlencode($time_to) : '' ?>"
                 >
                     ›
                 </a>
@@ -3012,6 +2986,12 @@ body {
                         <?php endforeach; ?>
                     </select>
                 </div>
+<!-- SEARCH INSIDE THE ARCHIVE -->
+<div class="archive-search-box">
+    <span class="archive-search-icon" aria-hidden="true">🔍</span>
+    <input type="search" id="archiveSearch" class="archive-search-input" data-reload="loadArchiveFilter" placeholder="Search plate, visitor, type or purpose..." value="<?= e(secsysArchiveSearchFromRequest()) ?>" autocomplete="off" aria-label="Search the archive">
+</div>
+
             </div>
 
             <div
@@ -3034,9 +3014,9 @@ body {
                 <button
                     type="button"
                     class="btn"
-                    onclick="downloadArchive()"
+                    onclick="downloadArchive(this)"
                 >
-                    📥 Download Archive PDF
+                    📥 Download Archive ▾
                 </button>
 
             </div>
@@ -3105,11 +3085,7 @@ body {
                             </td>
 
                             <td>
-                                <?= e(
-                                    $visitor[
-                                        "plate_number"
-                                    ]
-                                ) ?>
+                                <?= secsysClickablePlateHtml($visitor["plate_number"], $visitor) ?>
                             </td>
 
                             <td>
@@ -3230,7 +3206,7 @@ body {
             ): ?>
 
                 <a
-                    href="visitor.php?show_archive=1&archive_basis=<?= urlencode($archive_basis) ?>&archive_date=<?= urlencode($archive_date) ?>&archive_month=<?= (int)$archive_month ?>&archive_page=<?= $archive_page - 1 ?>"
+                    href="visitor.php?show_archive=1&archive_q=<?= urlencode($archive_search) ?>&archive_basis=<?= urlencode($archive_basis) ?>&archive_date=<?= urlencode($archive_date) ?>&archive_month=<?= (int)$archive_month ?>&archive_page=<?= $archive_page - 1 ?>"
                 >
                     ‹
                 </a>
@@ -3245,7 +3221,7 @@ body {
             ): ?>
 
                 <a
-                    href="visitor.php?show_archive=1&archive_basis=<?= urlencode($archive_basis) ?>&archive_date=<?= urlencode($archive_date) ?>&archive_month=<?= (int)$archive_month ?>&archive_page=<?= $p ?>"
+                    href="visitor.php?show_archive=1&archive_q=<?= urlencode($archive_search) ?>&archive_basis=<?= urlencode($archive_basis) ?>&archive_date=<?= urlencode($archive_date) ?>&archive_month=<?= (int)$archive_month ?>&archive_page=<?= $p ?>"
                     class="<?= $p === $archive_page
                         ? "active"
                         : ""
@@ -3263,7 +3239,7 @@ body {
             ): ?>
 
                 <a
-                    href="visitor.php?show_archive=1&archive_basis=<?= urlencode($archive_basis) ?>&archive_date=<?= urlencode($archive_date) ?>&archive_month=<?= (int)$archive_month ?>&archive_page=<?= $archive_page + 1 ?>"
+                    href="visitor.php?show_archive=1&archive_q=<?= urlencode($archive_search) ?>&archive_basis=<?= urlencode($archive_basis) ?>&archive_date=<?= urlencode($archive_date) ?>&archive_month=<?= (int)$archive_month ?>&archive_page=<?= $archive_page + 1 ?>"
                 >
                     ›
                 </a>
@@ -3297,13 +3273,13 @@ function printReport()
    DOWNLOAD CURRENT REPORT
 ========================================================= */
 
-function downloadReport()
+function downloadReport(btn)
 {
     const search =
         <?= json_encode($search) ?>;
 
     let url =
-        "visitor.php?download=visitor";
+        "visitor.php?download=visitor" + <?= json_encode(secsysPeriodQuery($listPeriod) !== '' ? '&' . secsysPeriodQuery($listPeriod) : '') ?>;
 
     if (search !== "") {
 
@@ -3314,8 +3290,7 @@ function downloadReport()
             );
     }
 
-    window.location.href =
-        url;
+    SecsysDownload.choose(url, btn);   // pick PDF or CSV
 }
 
 
@@ -3446,7 +3421,7 @@ function loadArchiveFilter(archivePage)
         "&archive_basis=" + encodeURIComponent(basis) +
         "&archive_date=" + encodeURIComponent(date) +
         "&archive_month=" + encodeURIComponent(month) +
-        "&archive_page=" + encodeURIComponent(pageNum);
+        "&archive_q=" + encodeURIComponent(window.ArchiveSearch ? ArchiveSearch.value("archiveSearch") : "") + "&archive_page=" + encodeURIComponent(pageNum);
 
     fetch(url, { credentials: "same-origin" })
         .then(function(response) {
@@ -3459,7 +3434,9 @@ function loadArchiveFilter(archivePage)
             const currentModal = document.getElementById("archiveModal");
 
             if (newModal && currentModal) {
-                currentModal.innerHTML = newModal.innerHTML;
+                if (window.ArchiveSearch) ArchiveSearch.capture();
+currentModal.innerHTML = newModal.innerHTML;
+if (window.ArchiveSearch) ArchiveSearch.restore();
                 currentModal.style.display = "flex";
                 bindArchivePaginationLinks();
             }
@@ -3495,7 +3472,7 @@ document.addEventListener("DOMContentLoaded", bindArchivePaginationLinks);
    DOWNLOAD ARCHIVE
 ========================================================= */
 
-function downloadArchive()
+function downloadArchive(btn)
 {
     const basis =
         document.getElementById("archiveBasis")
@@ -3513,13 +3490,12 @@ function downloadArchive()
         : "";
 
     const url =
-        "visitor.php?download=visitor_archive" +
+        "visitor.php?download=visitor_archive" + "&archive_q=" + encodeURIComponent(window.ArchiveSearch ? ArchiveSearch.value("archiveSearch") : "") + 
         "&archive_basis=" + encodeURIComponent(basis) +
         "&archive_date=" + encodeURIComponent(selectedDate) +
         "&archive_month=" + encodeURIComponent(selectedMonth);
 
-    window.location.href =
-        url;
+    SecsysDownload.choose(url, btn);   // pick PDF or CSV
 }
 
 
@@ -3646,13 +3622,10 @@ function printArchive()
 
 </script>
 
-<!-- Shared Per-Duration Visitor Reminder & Overstay Alarm Engine -->
-<script>window.SECSYS_ALARM_ROLE = "Administrator";</script>
-<script src="assets/js/visitor_duration_alarm.js"></script>
-
 <!-- Live auto-refresh (no full page reload) -->
 <script>window.AUTO_REFRESH_SECONDS = 5;</script>
-<script src="assets/js/auto_refresh.js"></script>
+<script src="assets/js/download_format.js?v=<?php echo (int)@filemtime(__DIR__ . '/assets/js/download_format.js'); ?>"></script>
+<script src="assets/js/auto_refresh.js?v=<?php echo (int)@filemtime(__DIR__ . '/assets/js/auto_refresh.js'); ?>"></script>
 
 </body>
 

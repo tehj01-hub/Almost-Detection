@@ -29,6 +29,8 @@ import torch
 
 from .alphabet import are_confusable_neighbors, normalize_plate_alnum
 from .ph_plate_validator import NON_PLATE_WORDS
+from .preprocessing import PlatePreprocessor
+from .gpu_char_extractor import GPUCharacterExtractor
 from .gpt_vision_reader import GPTVisionReader
 
 
@@ -69,6 +71,8 @@ PH_TEMPLATES = [
     ('motorcycle_6', 6, [0, 1], [2, 3, 4, 5], lambda s: f"{s[0:2]} {s[2:6]}"),
     ('motorcycle_alt', 6, [3, 4, 5], [0, 1, 2], lambda s: f"{s[0:3]} {s[3:6]}"),
     ('numeric_suffix_6', 6, [5], [0, 1, 2, 3, 4], lambda s: s),
+    ('numeric_prefix_6', 6, [4, 5], [0, 1, 2, 3], lambda s: f"{s[:4]} {s[4:]}"),
+    ('numeric_identifier_11', 11, [], list(range(11)), lambda s: f"{s[:4]}-{s[4:]}"),
 ]
 
 
@@ -127,9 +131,13 @@ def assess_image_quality(bgr_crop: np.ndarray) -> QualityMetrics:
     h, w = bgr_crop.shape[:2]
     gray = cv2.cvtColor(bgr_crop, cv2.COLOR_BGR2GRAY) if len(bgr_crop.shape) == 3 else bgr_crop
 
-    # Laplacian variance for focus / blur detection
+    # Laplacian variance for focus / blur detection (standardized to 64px height so high-res crops are not penalized)
     lap = cv2.Laplacian(gray, cv2.CV_64F)
     sharpness = float(lap.var())
+    if h > 64:
+        norm_w = max(16, int(round(w * (64.0 / float(h)))))
+        gray_norm = cv2.resize(gray, (norm_w, 64), interpolation=cv2.INTER_AREA)
+        sharpness = max(sharpness, float(cv2.Laplacian(gray_norm, cv2.CV_64F).var()))
 
     # Pixel brightness & contrast
     brightness = float(np.mean(gray))
@@ -165,55 +173,57 @@ def assess_image_quality(bgr_crop: np.ndarray) -> QualityMetrics:
 
 
 def score_and_fix_syntax(candidate: str, template_spec: Tuple) -> Tuple[Optional[str], int, str]:
-    """Score candidate against a Philippine plate template with positional corrections."""
+    """Match a template without substituting any OCR characters."""
     name, length, let_indices, dig_indices, formatter = template_spec
     if len(candidate) != length:
         return None, 999, ""
 
-    chars = list(candidate)
-    cost = 0
-
-    for idx in let_indices:
-        c = chars[idx]
-        if c.isdigit():
-            if c in DIGIT_TO_LETTER:
-                chars[idx] = DIGIT_TO_LETTER[c]
-                cost += 1
-            else:
-                return None, 999, ""
-        elif not c.isalpha():
-            return None, 999, ""
-
-    for idx in dig_indices:
-        c = chars[idx]
-        if c.isalpha():
-            if c in LETTER_TO_DIGIT:
-                chars[idx] = LETTER_TO_DIGIT[c]
-                cost += 1
-            else:
-                return None, 999, ""
-        elif not c.isdigit():
-            return None, 999, ""
-
-    fixed = "".join(chars)
-    return fixed, cost, formatter(fixed)
+    if any(not candidate[idx].isalpha() for idx in let_indices):
+        return None, 999, ""
+    if any(not candidate[idx].isdigit() for idx in dig_indices):
+        return None, 999, ""
+    return candidate, 0, formatter(candidate)
 
 
 def extract_best_template_match(raw_string: str, registered_plates: Optional[Dict[str, Any]] = None) -> Tuple[str, str, float, str, int, bool]:
-    """Extract exact 6 or 7 character Philippine plate using sliding window."""
+    """Preserve short plates and numeric identifiers up to the database's 20 digits."""
     if not raw_string:
         return "", "", 0.0, "", 999, False
 
     regs = registered_plates or {}
     clean = re.sub(r'[^A-Z0-9]', '', raw_string.upper())
-    for word in NON_PLATE_WORDS:
-        clean = clean.replace(word, '')
+    if clean in NON_PLATE_WORDS:
+        return "", "", 0.0, "", 999, False
+    if not (5 <= len(clean) <= 7 or (clean.isdigit() and 8 <= len(clean) <= 20)):
+        tokens = re.findall(r'[A-Z0-9]+', raw_string.upper())
+        headers = sorted((i for i, token in enumerate(tokens) if token in NON_PLATE_WORDS),
+                         key=lambda i: len(tokens[i]), reverse=True)
+        for index in headers:
+            if len(clean) <= 7 or (clean.isdigit() and len(clean) <= 20):
+                break
+            tokens[index] = ''
+            clean = ''.join(tokens)
 
-    if len(clean) < 4:
+    if len(clean) < 4 or clean in NON_PLATE_WORDS:
         return "", "", 0.0, "", 999, False
 
+    if 5 <= len(clean) <= 7 or (clean.isdigit() and 8 <= len(clean) <= 20):
+        if len(set(clean)) <= 1:
+            return "", "", 0.0, "", 999, False
+        for template in PH_TEMPLATES:
+            exact, _, display = score_and_fix_syntax(clean, template)
+            if exact:
+                return clean, display, 1.0, template[0], 0, clean in regs
+        kind = "numeric_identifier" if len(clean) > 7 else "alphanumeric"
+        return clean, clean, 1.0, kind, 0, clean in regs
+
+    if clean.isdigit():
+        return "", "", 0.0, "", 999, False
+
+    # Longer OCR strings can include headers or border noise. Extract only
+    # exact known-format windows; never invent characters to make one fit.
     candidates = []
-    for L in (6, 7):
+    for L in (6, 7, 11):
         for start in range(len(clean) - L + 1):
             sub = clean[start:start + L]
             for tpl in PH_TEMPLATES:
@@ -373,20 +383,32 @@ class QuadReaderEnsemble:
         self.min_accept_confidence = min_accept_confidence
         self.min_sharpness = min_sharpness
         self.reader_pool = reader_pool or BoundedReaderPool()
+        self.gpu_extractor = GPUCharacterExtractor()
+        if self.easyocr is not None and hasattr(self.easyocr, "recognizer"):
+            self.gpu_extractor.accelerate_easyocr_reader(self.easyocr)
 
     @staticmethod
-    def preprocess_crop(bgr_crop: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Standardize crop height to 70px using cubic interpolation + CLAHE enhancement."""
+    def preprocess_crop(bgr_crop: np.ndarray, target_h=None) -> Tuple[np.ndarray, np.ndarray]:
+        """Standardize crop height using cubic interpolation + gamma/CLAHE enhancement."""
         if bgr_crop is None or bgr_crop.size == 0:
             return bgr_crop, bgr_crop
 
         crop_h, crop_w = bgr_crop.shape[:2]
-        target_h = 96
+        if target_h is None:
+            target_h = 96
         scale = target_h / float(max(1, crop_h))
         target_w = max(10, int(crop_w * scale))
         resized = cv2.resize(bgr_crop, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
 
-        gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+        gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY) if resized.ndim == 3 else resized
+        mean_val = float(np.mean(gray))
+        if mean_val < 70.0:
+            lut = np.array([((i / 255.0) ** (1.0 / 1.40)) * 255.0 for i in range(256)]).clip(0, 255).astype(np.uint8)
+            gray = cv2.LUT(gray, lut)
+        elif mean_val > 215.0:
+            lut = np.array([((i / 255.0) ** (1.0 / 0.75)) * 255.0 for i in range(256)]).clip(0, 255).astype(np.uint8)
+            gray = cv2.LUT(gray, lut)
+
         clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
         enhanced = clahe.apply(gray)
         gaussian = cv2.GaussianBlur(enhanced, (0, 0), 1.5)
@@ -397,103 +419,291 @@ class QuadReaderEnsemble:
 
     @staticmethod
     def number_region(crop):
-        # Tall plate crops often contain a small registration header above the main line.
+        """Rectify a visible character row; never discard a fixed image fraction."""
         h, w = crop.shape[:2]
-        return crop[int(h * 0.25):, :] if w / max(1, h) < 2.7 else crop
+        if h < 16 or w < 45:
+            return crop
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
+        _, mask = cv2.threshold(cv2.GaussianBlur(gray, (3, 3), 0), 0, 255,
+                                cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        boxes = [cv2.boundingRect(contour) for contour in contours]
+        boxes = [box for box in boxes
+                 if .2 * h < box[3] < .85 * h and .015 * w < box[2] < .25 * w
+                 and box[0] > 0 and box[1] > 0
+                 and box[0] + box[2] < w and box[1] + box[3] < h]
+        if len(boxes) < 5:
+            return crop
+        xs = np.array([x + bw / 2 for x, y, bw, bh in boxes])
+        if np.ptp(xs) < .35 * w:
+            return crop
+        top_values = np.array([y for x, y, bw, bh in boxes])
+        bottom_values = np.array([y + bh for x, y, bw, bh in boxes])
+        tops = np.polyfit(xs, top_values, 1)
+        bottoms = np.polyfit(xs, bottom_values, 1)
+        median_height = float(np.median([box[3] for box in boxes]))
+        # A single misaligned graphic must not become a digit when context is cropped away.
+        if (max(abs(tops[0]), abs(bottoms[0])) > .65
+                or np.median(np.abs(np.polyval(tops, xs) - top_values)) > .25 * median_height
+                or np.median(np.abs(np.polyval(bottoms, xs) - bottom_values)) > .25 * median_height
+                or np.max(np.abs(np.polyval(tops, xs) - top_values)) > .35 * median_height
+                or np.max(np.abs(np.polyval(bottoms, xs) - bottom_values)) > .35 * median_height):
+            return crop
+        pad = .1 * median_height
+        # Include edge characters that touch the holder and lack a separate contour.
+        margin = 2 * float(np.median([box[2] for box in boxes]))
+        left = max(0, min(box[0] for box in boxes) - margin)
+        right = min(w - 1, max(box[0] + box[2] for box in boxes) + margin)
+        top_left = np.clip(np.polyval(tops, left) - pad, 0, h - 1)
+        top_right = np.clip(np.polyval(tops, right) - pad, 0, h - 1)
+        bottom_left = np.clip(np.polyval(bottoms, left) + pad, 0, h - 1)
+        bottom_right = np.clip(np.polyval(bottoms, right) + pad, 0, h - 1)
+        out_w = round(right - left)
+        out_h = round(max(bottom_left - top_left, bottom_right - top_right))
+        if out_w < 45 or out_h < 16 or min(bottom_left - top_left, bottom_right - top_right) < 16:
+            return crop
+        source = np.array([[left, top_left], [right, top_right],
+                           [right, bottom_right], [left, bottom_left]], np.float32)
+        target = np.array([[0, 0], [out_w - 1, 0], [out_w - 1, out_h - 1],
+                           [0, out_h - 1]], np.float32)
+        matrix = cv2.getPerspectiveTransform(source, target)
+        return cv2.warpPerspective(crop, matrix, (out_w, out_h),
+                                   flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+
+    @staticmethod
+    def _is_known_ph_template(raw_text: str) -> bool:
+        plate, _, _, fmt, _, _ = extract_best_template_match(raw_text, None)
+        return bool(plate and fmt in {tpl[0] for tpl in PH_TEMPLATES})
+
+    @staticmethod
+    def _trim_side_borders(crop: np.ndarray, ratio: float = 0.035) -> np.ndarray:
+        """Trim narrow left/right plastic plate-holder edges without touching central glyphs."""
+        if crop is None or crop.size == 0:
+            return crop
+        h, w = crop.shape[:2]
+        pad_x = int(round(w * ratio))
+        if w - 2 * pad_x < 45:
+            return crop
+        trimmed = PlatePreprocessor.trim_holder_borders(crop) if crop.ndim == 3 else crop
+        return trimmed[:, pad_x:w - pad_x]
+
+    @staticmethod
+    def _parse_easyocr_items(res: Any) -> Tuple[str, float]:
+        if not res:
+            return "", 0.0
+        blocks = []
+        for item in res:
+            if not item or len(item) < 2:
+                continue
+            txt = str(item[1]).strip()
+            if not txt:
+                continue
+            conf = float(item[2]) if len(item) > 2 else 0.5
+            pts = item[0] if isinstance(item[0], (list, tuple)) and len(item[0]) > 0 else []
+            if pts and isinstance(pts[0], (list, tuple)):
+                xs = [float(p[0]) for p in pts]
+                ys = [float(p[1]) for p in pts]
+                min_x, min_y = min(xs), min(ys)
+                bh = max(1.0, max(ys) - min_y)
+            else:
+                min_x, min_y, bh = 0.0, 0.0, 1.0
+            blocks.append((min_x, min_y, bh, txt, conf))
+
+        if not blocks:
+            return "", 0.0
+
+        if len(blocks) > 1:
+            max_bh = max(b[2] for b in blocks)
+            filtered = [b for b in blocks if b[2] >= 0.40 * max_bh and b[3].upper() not in NON_PLATE_WORDS]
+            if filtered:
+                blocks = filtered
+
+        blocks.sort(key=lambda b: b[0])
+        tokens = [b[3] for b in blocks]
+        confs = [b[4] for b in blocks]
+        return " ".join(tokens), sum(confs) / max(1, len(confs))
 
     def read_with_easyocr(self, bgr_crop: np.ndarray) -> Tuple[str, float]:
-        """Run EasyOCR on standardized CLAHE-enhanced & raw crop."""
+        """Run GTX GPU character-band localization + multi-view tensor enhancement + beamsearch CTC."""
         if self.easyocr is None:
             return "", 0.0
 
         try:
-            resized, sharpened_bgr = self.preprocess_crop(self.number_region(bgr_crop))
-            sharpened_gray = cv2.cvtColor(sharpened_bgr, cv2.COLOR_BGR2GRAY)
+            gpu_ext = getattr(self, "gpu_extractor", None)
+            if gpu_ext is not None and hasattr(self.easyocr, "recognizer") and not getattr(self.easyocr, "gtx_accelerated", False):
+                gpu_ext.accelerate_easyocr_reader(self.easyocr)
 
-            # YOLO already found the plate: recognize the main number line directly.
+            gpu_active = bool(
+                (gpu_ext is not None and gpu_ext.is_gpu_available)
+                or getattr(self.easyocr, "gtx_accelerated", False)
+                or str(getattr(self.easyocr, "device", "cpu")) != "cpu"
+            )
+            allowlist = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-"
+            decoder = "beamsearch" if gpu_active else "greedy"
+            beam_w = 5 if gpu_active else 3
+
             def recognize(image):
                 gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
                 height, width = gray.shape[:2]
                 return self.easyocr.recognize(
                     gray, horizontal_list=[[0, width, 0, height]], free_list=[],
-                    allowlist="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ", paragraph=False,
-                    decoder="greedy", detail=1)
+                    allowlist=allowlist, paragraph=False,
+                    decoder=decoder, beamWidth=beam_w, detail=1)
 
-            res = recognize(sharpened_gray)
-            if not res or not any(str(item[1]).strip() for item in res):
-                res = recognize(resized)
+            def parse_items(res):
+                if hasattr(self, "_parse_easyocr_items"):
+                    return self._parse_easyocr_items(res)
+                if not res:
+                    return "", 0.0
+                tokens = [str(it[1]).strip() for it in res if it and len(it) > 1 and str(it[1]).strip()]
+                confs = [float(it[2]) if len(it) > 2 else 0.5 for it in res if it and len(it) > 1 and str(it[1]).strip()]
+                return (" ".join(tokens), sum(confs) / len(confs)) if tokens else ("", 0.0)
 
-            if not res:
+            def check_tpl(text):
+                if hasattr(self, "_is_known_ph_template"):
+                    return self._is_known_ph_template(text)
+                return bool(text and len(text.strip()) >= 5)
+
+            candidates = []
+
+            def add_candidate(text, conf):
+                if not text:
+                    return False
+                is_tpl = check_tpl(text)
+                candidates.append((is_tpl, conf, text))
+                return is_tpl and conf >= 0.85
+
+            # 1. GTX GPU Character-Band Isolation (CRAFT on GTX) + Multi-View Padded Canvas Enhancement
+            if gpu_active and gpu_ext is not None:
+                band_crop = gpu_ext.localize_character_band(self.easyocr, bgr_crop)
+                base_for_gpu = band_crop if band_crop is not None else self.number_region(bgr_crop)
+                gpu_views = gpu_ext.enhance_variants_gpu(base_for_gpu)
+
+                for view_gray in gpu_views:
+                    txt, cf = parse_items(recognize(view_gray))
+                    if add_candidate(txt, cf):
+                        return txt, cf
+
+            # 2. Standard number-region fallback when GPU views are absent or low-confidence
+            best_so_far = max((c[1] for c in candidates), default=0.0)
+            if best_so_far < 0.72:
+                num_crop = self.number_region(bgr_crop)
+                resized, sharpened_bgr = self.preprocess_crop(num_crop)
+                sharpened_gray = cv2.cvtColor(sharpened_bgr, cv2.COLOR_BGR2GRAY)
+
+                for line_img in (sharpened_gray, resized):
+                    txt, cf = parse_items(recognize(line_img))
+                    if add_candidate(txt, cf):
+                        return txt, cf
+
+            if not candidates:
                 return "", 0.0
 
-            sorted_items = sorted(res, key=lambda x: min(pt[0] for pt in x[0]) if len(x) > 0 and len(x[0]) > 0 else 0)
-            tokens = [str(item[1]).strip() for item in sorted_items if item[1]]
-            confs = [float(item[2]) for item in sorted_items if len(item) > 2]
-            avg_conf = sum(confs) / max(1, len(confs)) if confs else 0.5
-            raw_text = " ".join(tokens)
-            return raw_text, avg_conf
+            # Multi-view character consensus when multiple GPU views agree on the same plate string
+            vote_counts = {}
+            for is_tpl, cf, txt in candidates:
+                clean_key = "".join(ch for ch in txt.upper() if ch.isalnum())
+                if clean_key:
+                    vote_counts.setdefault(clean_key, []).append(cf + (0.05 if is_tpl else 0.0))
+
+            best_multi = max(
+                ((len(scores), sum(scores) / len(scores), key) for key, scores in vote_counts.items()),
+                default=(0, 0.0, ""),
+            )
+            if best_multi[0] >= 2 and check_tpl(best_multi[2]):
+                return best_multi[2], min(0.99, best_multi[1])
+
+            candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+            _, best_conf, best_text = candidates[0]
+            return best_text, best_conf
         except Exception:
             return "", 0.0
 
+    def _decode_paddle_output(self, res: Any) -> Tuple[str, float]:
+        if not res:
+            return "", 0.0
+
+        tokens = []
+        confs = []
+
+        # PaddleOCR 3 / LocalPPOCRv6Recognizer returns dictionaries with rec_text(s)/rec_score(s).
+        result_items = res if isinstance(res, (list, tuple)) else [res]
+        for item in result_items:
+            if isinstance(item, dict):
+                data = item.get('res', item)
+                texts = data.get('rec_texts', [])
+                scores = data.get('rec_scores', [])
+                if 'rec_text' in data:
+                    texts = [data['rec_text']]
+                    scores = [data.get('rec_score', 0.0)]
+                for index, text in enumerate(texts):
+                    if str(text).strip():
+                        tokens.append(str(text).strip())
+                        confs.append(float(scores[index]) if index < len(scores) else 0.0)
+        if tokens:
+            return ' '.join(tokens), sum(confs) / len(confs)
+
+        lines = res[0] if isinstance(res, list) and len(res) > 0 and isinstance(res[0], list) else res
+        for line in lines:
+            if isinstance(line, (list, tuple)) and len(line) > 1 and line[1]:
+                txt = str(line[1][0]).strip() if isinstance(line[1], (list, tuple)) else str(line[1]).strip()
+                conf = float(line[1][1]) if isinstance(line[1], (list, tuple)) and len(line[1]) > 1 else 0.5
+                tokens.append(txt)
+                confs.append(conf)
+            elif hasattr(line, 'rec_text'):
+                tokens.append(str(line.rec_text).strip())
+                confs.append(getattr(line, 'rec_score', 0.5))
+
+        if not tokens:
+            return "", 0.0
+
+        avg_conf = sum(confs) / max(1, len(confs)) if confs else 0.5
+        return " ".join(tokens), avg_conf
+
     def read_with_paddleocr(self, bgr_crop: np.ndarray) -> Tuple[str, float]:
-        """Run PaddleOCR on standardized crop with safe error handling."""
+        """Run PaddleOCR on standardized crop with multi-variant fallback when holder edges intrude."""
         if self.paddleocr is None:
             return "", 0.0
 
         try:
             resized, sharpened_bgr = self.preprocess_crop(bgr_crop)
 
-            res = None
             if getattr(self.paddleocr, 'plate_recognition_only', False):
-                res = self.paddleocr.predict(self.number_region(bgr_crop))
-            else:
+                primary_crop = self.number_region(bgr_crop)
+                txt, conf = self._decode_paddle_output(self.paddleocr.predict(primary_crop))
+                if txt and self._is_known_ph_template(txt) and conf >= 0.88:
+                    return txt, conf
+
+                candidates: List[Tuple[bool, float, str]] = []
+                if txt:
+                    candidates.append((self._is_known_ph_template(txt), conf, txt))
+
+                trimmed_crop = self._trim_side_borders(primary_crop, ratio=0.04)
+                gpu_paddle_crop = self.gpu_extractor.enhance_for_paddle_bgr(trimmed_crop)
+                for alt_crop in (trimmed_crop, gpu_paddle_crop, sharpened_bgr):
+                    alt_txt, alt_conf = self._decode_paddle_output(self.paddleocr.predict(alt_crop))
+                    if alt_txt:
+                        is_tpl = self._is_known_ph_template(alt_txt)
+                        candidates.append((is_tpl, alt_conf, alt_txt))
+                        if is_tpl and alt_conf >= 0.90:
+                            break
+
+                if not candidates:
+                    return "", 0.0
+                candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+                _, best_conf, best_txt = candidates[0]
+                return best_txt, best_conf
+
+            res = None
+            try:
+                res = self.paddleocr.ocr(sharpened_bgr)
+            except Exception:
                 try:
-                    res = self.paddleocr.ocr(sharpened_bgr)
+                    res = self.paddleocr.predict(sharpened_bgr)
                 except Exception:
-                    try:
-                        res = self.paddleocr.predict(sharpened_bgr)
-                    except Exception:
-                        pass
+                    pass
 
-            if not res:
-                return "", 0.0
-
-            tokens = []
-            confs = []
-
-            # PaddleOCR 3 returns dictionaries with rec_texts/rec_scores arrays.
-            result_items = res if isinstance(res, (list, tuple)) else [res]
-            for item in result_items:
-                if isinstance(item, dict):
-                    data = item.get('res', item)
-                    texts = data.get('rec_texts', [])
-                    scores = data.get('rec_scores', [])
-                    if 'rec_text' in data:
-                        texts = [data['rec_text']]
-                        scores = [data.get('rec_score', 0.0)]
-                    for index, text in enumerate(texts):
-                        if str(text).strip():
-                            tokens.append(str(text).strip())
-                            confs.append(float(scores[index]) if index < len(scores) else 0.0)
-            if tokens:
-                return ' '.join(tokens), sum(confs) / len(confs)
-
-            lines = res[0] if isinstance(res, list) and len(res) > 0 and isinstance(res[0], list) else res
-            for line in lines:
-                if isinstance(line, (list, tuple)) and len(line) > 1 and line[1]:
-                    txt = str(line[1][0]).strip() if isinstance(line[1], (list, tuple)) else str(line[1]).strip()
-                    conf = float(line[1][1]) if isinstance(line[1], (list, tuple)) and len(line[1]) > 1 else 0.5
-                    tokens.append(txt)
-                    confs.append(conf)
-                elif hasattr(line, 'rec_text'):
-                    tokens.append(str(line.rec_text).strip())
-                    confs.append(getattr(line, 'rec_score', 0.5))
-
-            if not tokens:
-                return "", 0.0
-
-            avg_conf = sum(confs) / max(1, len(confs)) if confs else 0.5
-            return " ".join(tokens), avg_conf
+            return self._decode_paddle_output(res)
         except Exception:
             return "", 0.0
 
@@ -615,7 +825,7 @@ class QuadReaderEnsemble:
             glyphs = str.maketrans({'O':'0', 'D':'0', 'Q':'0', 'I':'1', 'L':'1', 'Z':'2', 'S':'5', 'G':'6', 'B':'8'})
             families = {}
             for name, (plate, confidence) in reliable.items():
-                key = (model_preds[name]['format'], plate.translate(glyphs))
+                key = (len(plate), plate.translate(glyphs))
                 families.setdefault(key, []).append(name)
             supported = [names for names in families.values() if len(names) >= 2]
             if len(supported) == 1:
@@ -630,7 +840,7 @@ class QuadReaderEnsemble:
                         model_predictions=model_preds, char_analysis=[], quality=quality, review_reason=None)
         # One trained recognizer can nominate a very strong reading; the live tracker
         # logs clear 80%+ readings immediately and confirms lower scores across frames.
-        if len(reliable) == 1 and 'paddleocr' in reliable and reliable['paddleocr'][1] >= 0.70:
+        if len(reliable) == 1 and 'paddleocr' in reliable and reliable['paddleocr'][1] >= 0.80:
             plate, confidence = reliable['paddleocr']
             return QuadEnsembleResult(
                 decision='ACCEPT', final_plate=plate, display_plate=model_preds['paddleocr']['display'],

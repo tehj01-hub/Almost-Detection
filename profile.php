@@ -15,18 +15,7 @@ if (!isset($_SESSION['username'])) {
 /* =========================================================
    DATABASE CONNECTION
 ========================================================= */
-$conn = new mysqli(
-    "localhost:3307",
-    "root",
-    "",
-    "security_system"
-);
-
-if ($conn->connect_error) {
-    die("Database Connection Failed: " . $conn->connect_error);
-}
-
-$conn->set_charset("utf8mb4");
+$conn = secsysConnectDb();
 secsysEnsureSchema($conn);
 
 /* =========================================================
@@ -133,6 +122,20 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
             exit();
         }
 
+        // Contact number: used to verify "Forgot password" on the login page
+        $contactNumber = trim((string)($_POST['contact_number'] ?? ''));
+        $contactDigits = preg_replace('/\D+/', '', $contactNumber);
+        if ($contactNumber !== '' && (strlen($contactDigits) < 7 || strlen($contactDigits) > 15 || !preg_match('/^[0-9+\-\s()]+$/', $contactNumber))) {
+            $_SESSION['flash_error'] = 'Please enter a valid contact number (digits only, e.g. 09171234567).';
+            header("Location: profile.php");
+            exit();
+        }
+        $contactToSave = $contactNumber !== '' ? $contactNumber : null;
+        $stmtContact = $conn->prepare("UPDATE users SET contact_number = ? WHERE username = ?");
+        $stmtContact->bind_param("ss", $contactToSave, $currentUsername);
+        $stmtContact->execute();
+        $stmtContact->close();
+
         // Verify current password if changing password
         if ($newPass !== '') {
             if ($newPass !== $confirmPass) {
@@ -198,6 +201,31 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         header("Location: profile.php");
         exit();
     }
+
+    // ACTION 3: UPDATE SECURITY CONTACTS (SECURITY OFFICE & SUBDIVISION ADMIN OFFICE)
+    if ($action === 'update_security_contacts') {
+        $secOfficeNum = trim((string)($_POST['security_office_number'] ?? ''));
+        $admOfficeNum = trim((string)($_POST['subdivision_admin_office_number'] ?? ''));
+
+        if ($secOfficeNum === '' || $admOfficeNum === '') {
+            $_SESSION['flash_error'] = 'Both Security Office and Subdivision Admin Office contact numbers are required.';
+            header("Location: profile.php");
+            exit();
+        }
+
+        secsysUpdateSecurityOfficeContacts($conn, $secOfficeNum, $admOfficeNum);
+
+        secsysLogActivity(
+            $conn,
+            $currentUsername,
+            'Security Contacts Update',
+            'Updated Security Office (' . $secOfficeNum . ') and Subdivision Admin Office (' . $admOfficeNum . ') contact numbers.'
+        );
+
+        $_SESSION['flash_success'] = 'Security Office and Subdivision Admin Office contact numbers updated!';
+        header("Location: profile.php");
+        exit();
+    }
 }
 
 /* =========================================================
@@ -208,6 +236,8 @@ $systemTitle    = secsysGetSetting($conn, 'system_title', "Lessandra’s Surveil
 $systemSubtitle = secsysGetSetting($conn, 'system_subtitle', 'Phase 2, Salinas 1, Bacoor, Cavite');
 $systemIcon     = secsysGetSetting($conn, 'system_icon', '');
 $loginBg        = secsysGetSetting($conn, 'login_background', '');
+$securityOfficeNumber         = secsysGetSecurityOfficeNumber($conn);
+$subdivisionAdminOfficeNumber = secsysGetSubdivisionAdminOfficeNumber($conn);
 
 $adminUser = [
     'username'     => $currentUsername,
@@ -229,7 +259,7 @@ if ($stmtAdmin) {
 }
 ?>
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" class="ui-scale-fixed">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -637,6 +667,11 @@ body {
     font-weight: 600;
 }
 </style>
+<!-- Same look as the Security Guard dashboard for every Administrator page -->
+<link rel="stylesheet" href="assets/css/admin_uniform.css?v=<?php echo (int)@filemtime(__DIR__ . '/assets/css/admin_uniform.css'); ?>">
+<!-- Enlarges the page 25% (logs +25% more) on laptops/desktops for easier reading (loaded after the page styles) -->
+<link rel="stylesheet" href="assets/css/ui_scale.css?v=<?php echo (int)@filemtime(__DIR__ . '/assets/css/ui_scale.css'); ?>">
+
 </head>
 <body>
 
@@ -654,7 +689,7 @@ body {
         </div>
         <div class="logo-text">
             <div class="logo-title"><?php echo e($systemName); ?></div>
-            <div class="logo-subtitle">Administrator</div>
+            <div class="logo-subtitle"><?php echo secsysAdminSidebarSubtitleHtml(); ?></div>
         </div>
     </div>
 
@@ -686,6 +721,10 @@ body {
         <a href="report.php">
             <span class="nav-icon">📈</span>
             <span>Report</span>
+        </a>
+        <a href="backup.php">
+            <span class="nav-icon">💾</span>
+            <span>Backup &amp; Retrieve</span>
         </a>
         <a href="profile.php" class="active">
             <span class="nav-icon">⚙️</span>
@@ -875,6 +914,12 @@ body {
                         <input type="text" class="form-input" id="full_name" name="full_name" value="<?php echo e($adminUser['full_name']); ?>" required>
                     </div>
 
+                    <div class="form-group">
+                        <label class="form-label" for="contact_number">Contact Number:</label>
+                        <input type="tel" class="form-input" id="contact_number" name="contact_number" value="<?php echo e($adminUser['contact_number'] ?? ''); ?>" placeholder="e.g. 09171234567" inputmode="tel" maxlength="30">
+                        <div style="font-size:11px; color:#64748b; margin-top:4px;">Used to verify your identity if you forget your password.</div>
+                    </div>
+
                     <hr style="border:none; border-top:1px solid #e2e8f0; margin:20px 0;">
 
                     <div style="font-size:13px; font-weight:700; color:#0f172a; margin-bottom:12px;">
@@ -899,6 +944,56 @@ body {
                     <button type="submit" class="btn btn-primary" style="margin-top:8px;">
                         <span>💾</span>
                         <span>Update Administrator Profile</span>
+                    </button>
+                </form>
+            </div>
+
+            <!-- SECURITY CONTACTS CARD -->
+            <div class="card" id="security-contacts">
+                <div class="card-title">
+                    <span>📞</span>
+                    <span>Security Contacts</span>
+                </div>
+                <div class="card-subtitle">
+                    Contact numbers displayed under Security Contacts in the Security Information module.
+                </div>
+
+                <form method="POST" action="profile.php">
+                    <input type="hidden" name="action" value="update_security_contacts">
+
+                    <div class="form-group">
+                        <label class="form-label" for="security_office_number">Security Office Contact Number:</label>
+                        <input
+                            type="tel"
+                            class="form-input"
+                            id="security_office_number"
+                            name="security_office_number"
+                            value="<?php echo e($securityOfficeNumber); ?>"
+                            placeholder="e.g. 0917-123-4567"
+                            maxlength="50"
+                            required
+                        >
+                        <div class="form-hint">Displayed for <strong>Security Office</strong> (24/7 Main Gate Security).</div>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label" for="subdivision_admin_office_number">Subdivision Admin Office Contact Number:</label>
+                        <input
+                            type="tel"
+                            class="form-input"
+                            id="subdivision_admin_office_number"
+                            name="subdivision_admin_office_number"
+                            value="<?php echo e($subdivisionAdminOfficeNumber); ?>"
+                            placeholder="e.g. 0918-765-4321"
+                            maxlength="50"
+                            required
+                        >
+                        <div class="form-hint">Displayed for <strong>Subdivision Admin Office</strong> (Subdivision Administration).</div>
+                    </div>
+
+                    <button type="submit" class="btn btn-primary" style="margin-top:8px;">
+                        <span>💾</span>
+                        <span>Save Security Contacts</span>
                     </button>
                 </form>
             </div>

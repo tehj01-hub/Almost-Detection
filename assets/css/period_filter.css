@@ -1,0 +1,150 @@
+/* =========================================================
+   DAILY / MONTHLY LIST FILTER
+   Used by logs.php, registered.php, visitor.php
+   (markup from secsysRenderPeriodFilter() in app/system_config.php).
+   Same look as the Daily / Monthly toggle in the archive windows.
+========================================================= */
+
+.period-filter {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin: 0 0 14px;
+    padding: 10px 14px;
+    background: #ffffff;
+    border: 1px solid #e1e1e1;
+    border-radius: 18px;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
+}
+
+.period-filter-label {
+    font-size: 12px;
+    font-weight: 600;
+    color: #555;
+}
+
+.period-toggle {
+    display: inline-flex;
+    background: #eef4fc;
+    border: 1px solid #c8dcf7;
+    border-radius: 22px;
+    padding: 3px;
+    gap: 4px;
+}
+
+.period-toggle button {
+    border: none;
+    height: 32px;
+    padding: 0 16px;
+    border-radius: 18px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    background: transparent;
+    color: #1769d3;
+}
+
+.period-toggle button.active {
+    background: #2f80ed;
+    color: #ffffff;
+}
+
+.period-toggle button:not(.active):hover {
+    background: #dfeafb;
+}
+
+.period-input {
+    height: 36px;
+    border: 1px solid #2f80ed;
+    border-radius: 22px;
+    padding: 0 13px;
+    font-size: 12px;
+    color: #333;
+    background: #ffffff;
+    cursor: pointer;
+}
+
+.period-today-link {
+    font-size: 12px;
+    color: #1769d3;
+    text-decoration: none;
+    font-weight: 600;
+}
+
+.period-today-link:hover {
+    text-decoration: underline;
+}
+
+.period-current {
+    margin-left: auto;
+    font-size: 12px;
+    color: #64748b;
+}
+
+.period-current strong {
+    color: #1e293b;
+}
+
+/* Rows shown from the archive in a past Daily / Monthly view */
+.archived-row-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 8px;
+    border-radius: 9999px;
+    background: #f1f5f9;
+    border: 1px solid #e2e8f0;
+    color: #64748b;
+    font-size: 10.5px;
+    font-weight: 700;
+    white-space: nowrap;
+}
+
+@media print {
+    .period-filter {
+        display: none !important;
+    }
+}
+
+
+/* =========================================================
+   SEARCH BAR INSIDE ARCHIVE WINDOWS
+   (registered.php, visitor.php, registered_logs.php,
+    visitor_logs.php; wired by assets/js/archive_search.js)
+========================================================= */
+
+.archive-search-box {
+    flex: 1 1 240px;
+    min-width: 200px;
+    max-width: 380px;
+    height: 36px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    border: 1px solid #2f80ed;
+    border-radius: 22px;
+    padding: 0 14px;
+    background: #ffffff;
+    box-sizing: border-box;
+}
+
+.archive-search-box:focus-within {
+    box-shadow: 0 0 0 3px rgba(47, 128, 237, 0.18);
+}
+
+.archive-search-icon {
+    font-size: 12px;
+    opacity: 0.7;
+}
+
+.archive-search-input {
+    flex: 1;
+    min-width: 0;
+    height: 100%;
+    border: none;
+    outline: none;
+    background: transparent;
+    font-size: 12px;
+    color: #333;
+}

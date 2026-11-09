@@ -1,7 +1,7 @@
 import ast,threading,time,unittest
 from pathlib import Path
 node=next(n for n in ast.parse(Path('detect_plate_server.py').read_text(encoding='utf-8')).body if isinstance(n,ast.ClassDef) and n.name=='CameraChannel')
-ns=dict(threading=threading,time=time)
+ns=dict(threading=threading,time=time,USE_HW_VIDEO_DECODE=False)
 exec(compile(ast.Module(body=[node],type_ignores=[]),'<channel>','exec'),ns)
 class Capture:
  def __init__(self):self.releases=[]
@@ -19,7 +19,7 @@ class CameraLifecycleTests(unittest.TestCase):
   c=self.channel();c.source='old/stream1'
   first=Capture();first.isOpened=lambda:True;first.read=lambda:(False,None)
   second=Capture();second.isOpened=lambda:True;second.set=lambda *a:None
-  def read_second():c.set_source('new/stream1');return True,object()
+  def read_second():c.set_source('new/stream1');return True,SimpleNamespace(shape=(720,1280,3))
   second.read=read_second
   captures=iter([first,second])
   ns['cv2']=SimpleNamespace(CAP_FFMPEG=1,CAP_PROP_BUFFERSIZE=2,CAP_PROP_OPEN_TIMEOUT_MSEC=3,CAP_PROP_READ_TIMEOUT_MSEC=4,VideoCapture=lambda *a:next(captures))

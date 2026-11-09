@@ -22,18 +22,7 @@ if (!isset($_SESSION['username'])) {
 /* =========================================================
    DATABASE CONNECTION
 ========================================================= */
-$conn = new mysqli(
-    "localhost:3307",
-    "root",
-    "",
-    "security_system"
-);
-
-if ($conn->connect_error) {
-    die("Database Connection Failed: " . $conn->connect_error);
-}
-
-$conn->set_charset("utf8mb4");
+$conn = secsysConnectDb();
 secsysEnsureSchema($conn);
 $systemName = secsysGetSystemName($conn);
 $systemIcon = secsysGetSystemIcon($conn);
@@ -87,6 +76,9 @@ if (
     $model        = trim($_POST["model"] ?? "");
     $address      = trim($_POST["address"] ?? "");
     $vehicle_type = trim($_POST["vehicle_type"] ?? "");
+    if (!in_array($vehicle_type, SECSYS_VEHICLE_TYPES, true)) {
+        $vehicle_type = "";
+    }
 
     if (
         $brand === ""
@@ -199,7 +191,7 @@ if (
 
                 // Notify python detection server to invalidate registered plates cache
                 $ctx = stream_context_create(['http' => ['timeout' => 0.4]]);
-                @file_get_contents("http://127.0.0.1:5000/api/refresh_registered", false, $ctx);
+                @file_get_contents("http://localhost:5000/api/refresh_registered", false, $ctx) ?: @file_get_contents("http://127.0.0.1:5000/api/refresh_registered", false, $ctx);
 
                 $isAjax = (
                     isset($_POST['ajax']) ||
@@ -262,6 +254,9 @@ if (
     $model        = trim($_POST["model"] ?? "");
     $address      = trim($_POST["address"] ?? "");
     $vehicle_type = trim($_POST["vehicle_type"] ?? "");
+    if (!in_array($vehicle_type, SECSYS_VEHICLE_TYPES, true)) {
+        $vehicle_type = "";
+    }
 
     if (
         $id <= 0
@@ -349,7 +344,7 @@ if (
 
                 // Notify python detection server
                 $ctx = stream_context_create(['http' => ['timeout' => 0.4]]);
-                @file_get_contents("http://127.0.0.1:5000/api/refresh_registered", false, $ctx);
+                @file_get_contents("http://localhost:5000/api/refresh_registered", false, $ctx) ?: @file_get_contents("http://127.0.0.1:5000/api/refresh_registered", false, $ctx);
 
                 $isAjax = (
                     isset($_POST['ajax']) ||
@@ -693,7 +688,8 @@ $show_archive =
     || isset($_GET["archive_basis"])
     || isset($_GET["archive_date"])
     || isset($_GET["archive_month"])
-    || isset($_GET["archive_page"]);
+    || isset($_GET["archive_page"])
+    || isset($_GET["archive_q"]);
 
 $archive_display_label =
     $archive_basis === "monthly"
@@ -768,6 +764,21 @@ while ($row = $result->fetch_assoc()) {
 }
 
 $stmt->close();
+
+/* =========================================================
+   DAILY / MONTHLY VIEW (by registration date)
+   All (default) | Daily = registered on that day | Monthly
+========================================================= */
+$listPeriod = secsysListPeriod('all', true);
+
+if ($listPeriod['basis'] !== 'all') {
+    $all_vehicles = array_values(array_filter(
+        $all_vehicles,
+        function ($vehicle) use ($listPeriod) {
+            return secsysPeriodMatches($vehicle['date_created'] ?? null, $listPeriod);
+        }
+    ));
+}
 
 /* =========================================================
    GROUP VEHICLES BY ADDRESS
@@ -883,27 +894,28 @@ if ($archive_page < 1) {
    COUNT ARCHIVE
 ========================================================= */
 
+/* Archive filter: date / month + optional search text (archive_q) */
+$archive_search = secsysArchiveSearchFromRequest();
 if ($archive_basis === "monthly") {
-    $stmt = $conn->prepare("
-        SELECT COUNT(*) AS total
-        FROM registered_vehicles_archive
-        WHERE MONTH(archive_date) = ?
-    ");
-    $stmt->bind_param(
-        "i",
-        $archive_month
-    );
+    $archive_filter_sql = "MONTH(archive_date) = ?";
+    $archive_filter_types = "i";
+    $archive_filter_args = [$archive_month];
 } else {
-    $stmt = $conn->prepare("
-        SELECT COUNT(*) AS total
-        FROM registered_vehicles_archive
-        WHERE archive_date = ?
-    ");
-    $stmt->bind_param(
-        "s",
-        $archive_date
-    );
+    $archive_filter_sql = "archive_date = ?";
+    $archive_filter_types = "s";
+    $archive_filter_args = [$archive_date];
 }
+if ($archive_search !== "") {
+    $archive_like = "%" . $archive_search . "%";
+    $archive_filter_sql .= " AND (plate_number LIKE ? OR owner_name LIKE ? OR brand LIKE ? OR model LIKE ? OR address LIKE ? OR vehicle_type LIKE ?)";
+    $archive_filter_types .= "ssssss";
+    for ($i = 0; $i < 6; $i++) {
+        $archive_filter_args[] = $archive_like;
+    }
+}
+
+$stmt = $conn->prepare("SELECT COUNT(*) AS total FROM registered_vehicles_archive WHERE " . $archive_filter_sql);
+$stmt->bind_param($archive_filter_types, ...$archive_filter_args);
 
 $stmt->execute();
 
@@ -950,63 +962,9 @@ $archive_offset =
 
 $archived_vehicles = [];
 
-if ($archive_basis === "monthly") {
-    $stmt = $conn->prepare("
-        SELECT
-            archive_id,
-            original_id,
-            owner_name,
-            brand,
-            plate_number,
-            model,
-            address,
-            vehicle_type,
-            status,
-            original_date_created,
-            archive_date,
-            archived_at,
-            archive_reason
-        FROM registered_vehicles_archive
-        WHERE MONTH(archive_date) = ?
-        ORDER BY archived_at DESC
-        LIMIT ? OFFSET ?
-    ");
-
-    $stmt->bind_param(
-        "iii",
-        $archive_month,
-        $archive_records_per_page,
-        $archive_offset
-    );
-} else {
-    $stmt = $conn->prepare("
-        SELECT
-            archive_id,
-            original_id,
-            owner_name,
-            brand,
-            plate_number,
-            model,
-            address,
-            vehicle_type,
-            status,
-            original_date_created,
-            archive_date,
-            archived_at,
-            archive_reason
-        FROM registered_vehicles_archive
-        WHERE archive_date = ?
-        ORDER BY archived_at DESC
-        LIMIT ? OFFSET ?
-    ");
-
-    $stmt->bind_param(
-        "sii",
-        $archive_date,
-        $archive_records_per_page,
-        $archive_offset
-    );
-}
+$archive_select_args = array_merge($archive_filter_args, [$archive_records_per_page, $archive_offset]);
+$stmt = $conn->prepare("SELECT archive_id, original_id, owner_name, brand, plate_number, model, address, vehicle_type, status, original_date_created, archive_date, archived_at, archive_reason FROM registered_vehicles_archive WHERE " . $archive_filter_sql . " ORDER BY archived_at DESC LIMIT ? OFFSET ?");
+$stmt->bind_param($archive_filter_types . "ii", ...$archive_select_args);
 
 $stmt->execute();
 
@@ -1363,6 +1321,13 @@ if ($download_type === "registered") {
 
     ';
 
+    // CSV option: same rows as the PDF
+    require_once __DIR__ . '/app/print_report.php';
+    if (secsysWantsCsvDownload()) {
+        secsysStreamCsvFromHtml($pdf_html, "registered_vehicle_report_" . date("Y-m-d"));
+        exit();
+    }
+
     $dompdf->loadHtml(
         $pdf_html
     );
@@ -1715,6 +1680,13 @@ if ($download_type === "archive") {
 
     ';
 
+    // CSV option: same rows as the PDF
+    require_once __DIR__ . '/app/print_report.php';
+    if (secsysWantsCsvDownload()) {
+        secsysStreamCsvFromHtml($pdf_html, "registered_vehicle_archive_" . $archive_date);
+        exit();
+    }
+
     $dompdf->loadHtml(
         $pdf_html
     );
@@ -1741,7 +1713,7 @@ if ($download_type === "archive") {
 ?>
 <!DOCTYPE html>
 
-<html lang="en">
+<html lang="en" class="ui-scale-fixed">
 
 <head>
 
@@ -2857,6 +2829,16 @@ body {
 
 </style>
 
+<link rel="stylesheet" href="assets/css/period_filter.css?v=<?php echo (int)@filemtime(__DIR__ . '/assets/css/period_filter.css'); ?>">
+
+<script src="assets/js/print_report.js?v=<?php echo (int)@filemtime(__DIR__ . '/assets/js/print_report.js'); ?>"></script>
+<script src="assets/js/archive_search.js?v=<?php echo (int)@filemtime(__DIR__ . '/assets/js/archive_search.js'); ?>"></script>
+
+<!-- Same look as the Security Guard dashboard for every Administrator page -->
+<link rel="stylesheet" href="assets/css/admin_uniform.css?v=<?php echo (int)@filemtime(__DIR__ . '/assets/css/admin_uniform.css'); ?>">
+<!-- Enlarges the page 25% (logs +25% more) on laptops/desktops for easier reading (loaded after the page styles) -->
+<link rel="stylesheet" href="assets/css/ui_scale.css?v=<?php echo (int)@filemtime(__DIR__ . '/assets/css/ui_scale.css'); ?>">
+
 </head>
 
 <body>
@@ -2884,9 +2866,7 @@ body {
                 <?php echo htmlspecialchars($systemName); ?>
             </div>
 
-            <div class="logo-subtitle">
-                Administrator
-            </div>
+            <div class="logo-subtitle"><?php echo secsysAdminSidebarSubtitleHtml(); ?></div>
 
         </div>
 
@@ -2987,6 +2967,18 @@ body {
 
         </a>
 
+        <a href="backup.php">
+
+            <span class="nav-icon">
+                💾
+            </span>
+
+            <span>
+                Backup &amp; Retrieve
+            </span>
+
+        </a>
+
         <a href="profile.php">
 
             <span class="nav-icon">
@@ -3061,6 +3053,7 @@ body {
             action="registered.php"
             class="search-form"
         >
+            <?php echo secsysPeriodHiddenInputs($listPeriod); ?>
 
             <input
                 type="text"
@@ -3117,9 +3110,9 @@ body {
         <button
             type="button"
             class="btn btn-secondary"
-            onclick="downloadCurrentVehicles()"
+            onclick="downloadCurrentVehicles(this)"
         >
-            📥 Download PDF
+            📥 Download ▾
         </button>
 
         <button
@@ -3135,6 +3128,9 @@ body {
     <!-- =================================================
          REGISTERED TABLE
     ================================================= -->
+
+    <!-- DAILY / MONTHLY VIEW (by registration date) -->
+    <?php echo secsysRenderPeriodFilter($listPeriod, 'registered.php', ['search' => $search]); ?>
 
     <div class="table-card" id="liveRegisteredTable" data-live>
 
@@ -3304,13 +3300,7 @@ body {
 
                                     <div class="vehicle-detail-small">
 
-                                        <?php
-                                        echo e(
-                                            $first_vehicle[
-                                                "plate_number"
-                                            ]
-                                        );
-                                        ?>
+                                        <?php echo secsysClickablePlateHtml($first_vehicle["plate_number"], $first_vehicle); ?>
 
                                     </div>
 
@@ -3388,13 +3378,7 @@ body {
                                                             class="preview-plate"
                                                         >
 
-                                                            <?php
-                                                            echo e(
-                                                                $preview[
-                                                                    "plate_number"
-                                                                ]
-                                                            );
-                                                            ?>
+                                                            <?php echo secsysClickablePlateHtml($preview["plate_number"], $preview); ?>
 
                                                         </div>
 
@@ -3559,7 +3543,7 @@ body {
 
                     <a
                         class="page-link"
-                        href="registered.php?search=<?php
+                        href="registered.php?<?php echo secsysPeriodQuery($listPeriod) !== '' ? e(secsysPeriodQuery($listPeriod)) . '&amp;' : ''; ?>search=<?php
                             echo urlencode($search);
                         ?>&page=<?php
                             echo $current_page - 1;
@@ -3585,7 +3569,7 @@ body {
                                 ? "active"
                                 : "";
                         ?>"
-                        href="registered.php?search=<?php
+                        href="registered.php?<?php echo secsysPeriodQuery($listPeriod) !== '' ? e(secsysPeriodQuery($listPeriod)) . '&amp;' : ''; ?>search=<?php
                             echo urlencode($search);
                         ?>&page=<?php
                             echo $i;
@@ -3602,7 +3586,7 @@ body {
 
                     <a
                         class="page-link"
-                        href="registered.php?search=<?php
+                        href="registered.php?<?php echo secsysPeriodQuery($listPeriod) !== '' ? e(secsysPeriodQuery($listPeriod)) . '&amp;' : ''; ?>search=<?php
                             echo urlencode($search);
                         ?>&page=<?php
                             echo $current_page + 1;
@@ -3791,6 +3775,12 @@ body {
                             <?php endforeach; ?>
                         </select>
                     </div>
+<!-- SEARCH INSIDE THE ARCHIVE -->
+<div class="archive-search-box">
+    <span class="archive-search-icon" aria-hidden="true">🔍</span>
+    <input type="search" id="archiveSearch" class="archive-search-input" data-reload="loadArchiveFilter" placeholder="Search plate, owner, brand, model or address..." value="<?php echo e(secsysArchiveSearchFromRequest()); ?>" autocomplete="off" aria-label="Search the archive">
+</div>
+
                 </div>
 
                 <div
@@ -3813,9 +3803,9 @@ body {
                     <button
                         type="button"
                         class="btn btn-secondary"
-                        onclick="downloadArchiveVehicles()"
+                        onclick="downloadArchiveVehicles(this)"
                     >
-                        📥 Download Archive PDF
+                        📥 Download Archive ▾
                     </button>
 
                 </div>
@@ -3887,13 +3877,7 @@ body {
                                         "
                                     >
 
-                                        <?php
-                                        echo e(
-                                            $archive[
-                                                "plate_number"
-                                            ]
-                                        );
-                                        ?>
+                                        <?php echo secsysClickablePlateHtml($archive["plate_number"], $archive); ?>
 
                                     </div>
 
@@ -3901,13 +3885,7 @@ body {
 
                                 <td>
 
-                                    <?php
-                                    echo e(
-                                        $archive[
-                                            "plate_number"
-                                        ]
-                                    );
-                                    ?>
+                                    <?php echo secsysClickablePlateHtml($archive["plate_number"], $archive); ?>
 
                                 </td>
 
@@ -3981,7 +3959,7 @@ body {
 
                         <a
                             class="page-link"
-                            href="registered.php?show_archive=1&archive_basis=<?php
+                            href="registered.php?show_archive=1&archive_q=<?php echo urlencode($archive_search); ?>&archive_basis=<?php
                                 echo urlencode($archive_basis);
                             ?>&archive_date=<?php
                                 echo urlencode($archive_date);
@@ -4011,7 +3989,7 @@ body {
                                     ? "active"
                                     : "";
                             ?>"
-                            href="registered.php?show_archive=1&archive_basis=<?php
+                            href="registered.php?show_archive=1&archive_q=<?php echo urlencode($archive_search); ?>&archive_basis=<?php
                                 echo urlencode($archive_basis);
                             ?>&archive_date=<?php
                                 echo urlencode($archive_date);
@@ -4035,7 +4013,7 @@ body {
 
                         <a
                             class="page-link"
-                            href="registered.php?show_archive=1&archive_basis=<?php
+                            href="registered.php?show_archive=1&archive_q=<?php echo urlencode($archive_search); ?>&archive_basis=<?php
                                 echo urlencode($archive_basis);
                             ?>&archive_date=<?php
                                 echo urlencode($archive_date);
@@ -4221,17 +4199,11 @@ body {
                         -- Select Vehicle Type --
                     </option>
 
-                    <option value="Car">
-                        Car
+                    <?php foreach (SECSYS_VEHICLE_TYPES as $vtOption): ?>
+                    <option value="<?php echo htmlspecialchars($vtOption); ?>">
+                        <?php echo htmlspecialchars($vtOption); ?>
                     </option>
-
-                    <option value="Motorcycle">
-                        Motorcycle
-                    </option>
-
-                    <option value="Truck">
-                        Truck
-                    </option>
+                    <?php endforeach; ?>
 
                 </select>
 
@@ -4383,17 +4355,11 @@ body {
                     required
                 >
 
-                    <option value="Car">
-                        Car
+                    <?php foreach (SECSYS_VEHICLE_TYPES as $vtOption): ?>
+                    <option value="<?php echo htmlspecialchars($vtOption); ?>">
+                        <?php echo htmlspecialchars($vtOption); ?>
                     </option>
-
-                    <option value="Motorcycle">
-                        Motorcycle
-                    </option>
-
-                    <option value="Truck">
-                        Truck
-                    </option>
+                    <?php endforeach; ?>
 
                 </select>
 
@@ -4558,9 +4524,9 @@ function openVehicleManager(group)
 
                         <div class="management-plate">
 
-                            ${escapeHTML(
+                            <a href="vehicle_photo.php?plate=${encodeURIComponent(vehicle.plate_number || '')}" class="secsys-plate-link" data-plate="${escapeHTML(vehicle.plate_number)}" onclick="return window.secsysOpenPlateCaptureModal ? window.secsysOpenPlateCaptureModal(event, this) : true;" title="Click to view YOLOv10 captured license plate &amp; vehicle image">${escapeHTML(
                                 vehicle.plate_number
-                            )}
+                            )}</a>
 
                         </div>
 
@@ -5104,7 +5070,7 @@ function loadArchiveFilter(archivePage)
         "&archive_basis=" + encodeURIComponent(basis) +
         "&archive_date=" + encodeURIComponent(date) +
         "&archive_month=" + encodeURIComponent(month) +
-        "&archive_page=" + encodeURIComponent(pageNum);
+        "&archive_q=" + encodeURIComponent(window.ArchiveSearch ? ArchiveSearch.value("archiveSearch") : "") + "&archive_page=" + encodeURIComponent(pageNum);
 
     fetch(url, { credentials: "same-origin" })
         .then(function(response) {
@@ -5117,7 +5083,9 @@ function loadArchiveFilter(archivePage)
             const currentPanel = document.getElementById("archivePanel");
 
             if (newPanel && currentPanel) {
-                currentPanel.innerHTML = newPanel.innerHTML;
+                if (window.ArchiveSearch) ArchiveSearch.capture();
+currentPanel.innerHTML = newPanel.innerHTML;
+if (window.ArchiveSearch) ArchiveSearch.restore();
                 currentPanel.classList.add("show");
                 bindArchivePaginationLinks();
             }
@@ -5154,113 +5122,58 @@ document.addEventListener("DOMContentLoaded", bindArchivePaginationLinks);
 
 function printCurrentVehicles()
 {
-    let report = "";
+    /* All vehicles matching the current search / Daily-Monthly filter */
+    const groups = <?php
+        $printGroups = [];
+        foreach ($owner_groups as $group) {
+            $printGroups[] = [
+                'address'  => (string)$group['address'],
+                'vehicles' => array_map(function ($v) {
+                    return [
+                        'vehicle' => trim(($v['brand'] ?? '') . ' ' . ($v['model'] ?? '')),
+                        'plate'   => (string)($v['plate_number'] ?? ''),
+                        'type'    => (string)($v['vehicle_type'] ?? ''),
+                        'date'    => !empty($v['date_created']) ? date('M d, Y', strtotime($v['date_created'])) : '-',
+                    ];
+                }, $group['vehicles']),
+            ];
+        }
+        echo json_encode($printGroups, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_UNICODE);
+    ?>;
 
-    let number = 1;
+    if (!window.SecsysPrint) { window.print(); return; }
+    const c = function (text) { return { text: text, cls: "center" }; };
 
-    <?php foreach (
-        $owner_groups_page
-        as $group
-    ): ?>
+    const rows = [];
+    groups.forEach(function (group) {
+        group.vehicles.forEach(function (v) {
+            rows.push([c(rows.length + 1), group.address, v.vehicle, c(v.plate), c(v.type), c(v.date)]);
+        });
+    });
 
-        report += `
-            <div class="vehicle-item">
+    const meta = ["Showing: " + <?php echo json_encode($listPeriod['label']); ?>];
+    <?php if ($search !== ""): ?>
+    meta.push("Search: " + <?php echo json_encode($search); ?>);
+    <?php endif; ?>
+    meta.push("Total Owners / Addresses: " + groups.length + "  |  Total Vehicles: " + rows.length);
 
-                <strong>
-                    ${number}.
-                    Address:
-                </strong>
-
-                <?php
-                echo e(
-                    $group["address"]
-                );
-                ?>
-
-                <br><br>
-
-        `;
-
-        <?php foreach (
-            $group["vehicles"]
-            as $vehicle
-        ): ?>
-
-            report += `
-
-                <strong>
-                    Vehicle:
-                </strong>
-
-                <?php
-                echo e(
-                    $vehicle["brand"]
-                );
-                ?>
-
-                <?php
-                echo e(
-                    $vehicle["model"]
-                );
-                ?>
-
-                <br>
-
-                &nbsp;&nbsp;&nbsp;
-                <strong>
-                    Plate:
-                </strong>
-
-                <?php
-                echo e(
-                    $vehicle["plate_number"]
-                );
-                ?>
-
-                <br>
-
-                &nbsp;&nbsp;&nbsp;
-                <strong>
-                    Type:
-                </strong>
-
-                <?php
-                echo e(
-                    $vehicle["vehicle_type"]
-                );
-                ?>
-
-                <br><br>
-
-            `;
-
-        <?php endforeach; ?>
-
-        report += `
-            </div>
-        `;
-
-        number++;
-
-    <?php endforeach; ?>
-
-    if (report === "") {
-
-        report =
-            "<p>No registered vehicles found.</p>";
-    }
-
-    openPrintWindow(
-        "Registered Vehicle Report",
-        report
-    );
+    SecsysPrint.print({
+        title: "Registered Vehicle Report",
+        meta: meta,
+        body: SecsysPrint.table(
+            [["#", 5], ["Address", 25], ["Vehicle", 22], ["Plate Number", 16], ["Vehicle Type", 14], ["Date Registered", 18]],
+            rows,
+            "No registered vehicles found."
+        ),
+        footer: "Registered Vehicle Monitoring Report"
+    });
 }
 
 /* =========================================================
    DOWNLOAD CURRENT REGISTERED VEHICLES PDF
 ========================================================= */
 
-function downloadCurrentVehicles()
+function downloadCurrentVehicles(btn)
 {
     const search =
         <?php
@@ -5277,6 +5190,13 @@ function downloadCurrentVehicles()
     let url =
         "registered.php?download=registered";
 
+    const periodQuery =
+        <?php echo json_encode(secsysPeriodQuery($listPeriod)); ?>;
+
+    if (periodQuery !== "") {
+        url += "&" + periodQuery;
+    }
+
     if (search !== "") {
 
         url +=
@@ -5292,8 +5212,7 @@ function downloadCurrentVehicles()
             page
         );
 
-    window.location.href =
-        url;
+    SecsysDownload.choose(url, btn);   // pick PDF or CSV
 }
 
 /* =========================================================
@@ -5302,116 +5221,50 @@ function downloadCurrentVehicles()
 
 function printArchiveVehicles()
 {
-    const rows =
-        document.querySelectorAll(
-            "#archivePanel .vehicle-table tbody tr"
-        );
+    if (!window.SecsysPrint) { window.print(); return; }
+    const c = function (text) { return { text: text, cls: "center" }; };
 
-    let report = "";
+    const rows = [];
+    document.querySelectorAll("#archivePanel .vehicle-table tbody tr").forEach(function (row) {
+        const cells = row.querySelectorAll("td");
+        if (cells.length < 5) return;      // "No archived vehicles" row
+        // first cell = "Brand Model" + plate on a second line -> keep the vehicle name only
+        const vehicle = (cells[0].childNodes[0] ? cells[0].childNodes[0].textContent : cells[0].innerText)
+            .replace(/\s+/g, " ").trim();
+        rows.push([
+            c(rows.length + 1),
+            vehicle,
+            c(cells[1].innerText.trim()),
+            c(cells[2].innerText.trim()),
+            cells[3].innerText.trim(),
+            c(cells[4].innerText.trim())
+        ]);
+    });
 
-    let number = 1;
+    const subheading = document.querySelector("#archivePanel .archive-subheading strong");
+    const period = subheading ? subheading.innerText.trim() : <?php echo json_encode($archive_display_label); ?>;
+    const meta = ["Archive Period: " + period];
+    const q = window.ArchiveSearch ? ArchiveSearch.value("archiveSearch") : "";
+    if (q !== "") meta.push("Search: " + q);
+    meta.push("Records on this page: " + rows.length);
 
-    rows.forEach(
-        function(row)
-        {
-
-            const cells =
-                row.querySelectorAll("td");
-
-            if (cells.length < 5) {
-                return;
-            }
-
-            report += `
-
-                <div class="vehicle-item">
-
-                    <strong>
-                        ${number}.
-                        Vehicle:
-                    </strong>
-
-                    ${escapeHTML(
-                        cells[0].innerText.trim()
-                    )}
-
-                    <br>
-
-                    <strong>
-                        Plate Number:
-                    </strong>
-
-                    ${escapeHTML(
-                        cells[1].innerText.trim()
-                    )}
-
-                    <br>
-
-                    <strong>
-                        Vehicle Type:
-                    </strong>
-
-                    ${escapeHTML(
-                        cells[2].innerText.trim()
-                    )}
-
-                    <br>
-
-                    <strong>
-                        Address:
-                    </strong>
-
-                    ${escapeHTML(
-                        cells[3].innerText.trim()
-                    )}
-
-                    <br>
-
-                    <strong>
-                        Archived:
-                    </strong>
-
-                    ${escapeHTML(
-                        cells[4].innerText.trim()
-                    )}
-
-                </div>
-
-            `;
-
-            number++;
-
-        }
-    );
-
-    if (report === "") {
-
-        report =
-            "<p>No archived vehicles found for this period.</p>";
-    }
-
-    const labelEl =
-        document.querySelector(
-            "#archivePanel .archive-subheading strong"
-        );
-
-    const archiveLabel =
-        labelEl
-        ? labelEl.innerText.trim()
-        : <?php echo json_encode($archive_display_label); ?>;
-
-    openPrintWindow(
-        "Registered Vehicle Archive Report - " +
-        archiveLabel,
-        report
-    );
+    SecsysPrint.print({
+        title: "Registered Vehicle Archive Report",
+        meta: meta,
+        body: SecsysPrint.table(
+            [["#", 5], ["Vehicle", 22], ["Plate Number", 15], ["Vehicle Type", 13], ["Address", 25], ["Date Archived", 20]],
+            rows,
+            "No archived vehicles found."
+        ),
+        footer: "Registered Vehicle Archive Report"
+    });
 }
 
 /* =========================================================
    DOWNLOAD ARCHIVE VEHICLES PDF
 ========================================================= */
 
-function downloadArchiveVehicles()
+function downloadArchiveVehicles(btn)
 {
     const basis =
         document.getElementById("archiveBasis")
@@ -5429,7 +5282,7 @@ function downloadArchiveVehicles()
         : "";
 
     const url =
-        "registered.php?download=archive" +
+        "registered.php?download=archive" + "&archive_q=" + encodeURIComponent(window.ArchiveSearch ? ArchiveSearch.value("archiveSearch") : "") + 
         "&archive_basis=" +
         encodeURIComponent(basis) +
         "&archive_date=" +
@@ -5445,8 +5298,7 @@ function downloadArchiveVehicles()
         echo (int)$archive_page;
         ?>;
 
-    window.location.href =
-        url;
+    SecsysDownload.choose(url, btn);   // pick PDF or CSV
 }
 
 /* =========================================================
@@ -5731,7 +5583,8 @@ document.addEventListener("DOMContentLoaded", function() {
 
 <!-- Live auto-refresh (no full page reload) -->
 <script>window.AUTO_REFRESH_SECONDS = 5;</script>
-<script src="assets/js/auto_refresh.js"></script>
+<script src="assets/js/download_format.js?v=<?php echo (int)@filemtime(__DIR__ . '/assets/js/download_format.js'); ?>"></script>
+<script src="assets/js/auto_refresh.js?v=<?php echo (int)@filemtime(__DIR__ . '/assets/js/auto_refresh.js'); ?>"></script>
 
 </body>
 

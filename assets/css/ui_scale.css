@@ -1,0 +1,232 @@
+/* =========================================================
+   UI SCALE (all Administrator + Security Guard modules)
+   ---------------------------------------------------------
+   Two levels of enlargement for easier reading:
+
+   1) Whole page: 125%  (--ui-scale)
+      Every module opts in with <html class="ui-scale-fixed">:
+        Administrator: superadmin_dashboard, logs, registered, visitor,
+                       security_guard, security_information, report,
+                       backup, profile
+        Security Guard: guard_dashboard, registered_logs, visitor_logs
+      Applies on every laptop/desktop window (700px and wider), even
+      with Windows display scaling. Phones (< 700px) stay at 100%.
+
+   2) Logs: another +25% on top (--log-scale), so log text is about
+      156% of the original size. "Logs" = every data table (log,
+      vehicle, guard, report and archive tables) and the guard
+      dashboard's live Visitor / Registered activity lists.
+      Wide tables scroll sideways inside their own card.
+
+   Pages without the class (none at the moment) step with width:
+      >= 1330px -> 125%, >= 1220px -> 115%, else 100%.
+
+   With CSS zoom, viewport units (vh / vw) and percentage widths are
+   scaled too, so the rules below divide those sizes by the scale so
+   they still fit the screen / their card exactly.
+   Load this file AFTER the page's own <style>.
+========================================================= */
+
+:root {
+    --ui-scale: 1;
+    --log-scale: 1;
+}
+
+@media (min-width: 1220px) {
+    :root {
+        --ui-scale: 1.15;
+    }
+}
+
+@media (min-width: 1330px) {
+    :root {
+        --ui-scale: 1.25;
+    }
+}
+
+/* Opted-in modules: fixed 125% page + 125% logs on any laptop/desktop */
+@media (min-width: 700px) {
+    html.ui-scale-fixed {
+        --ui-scale: 1.25;
+        --log-scale: 1.25;
+    }
+}
+
+
+/* =========================================================
+   LEVEL 1 - WHOLE PAGE
+========================================================= */
+
+@media screen {
+
+    html {
+        zoom: var(--ui-scale);
+    }
+
+    /* Full-height layout */
+    .sidebar {
+        height: calc(100vh / var(--ui-scale)) !important;
+        /* On short screens the enlarged menu can be taller than the window:
+           let it scroll so Profile / Logout stay reachable. */
+        overflow-y: auto !important;
+        overscroll-behavior: contain;
+    }
+
+    .main {
+        min-height: calc(100vh / var(--ui-scale)) !important;
+    }
+
+    /* Dashboard modals & drawers sized in viewport units */
+    .tapo-modal-body {
+        max-height: calc(75vh / var(--ui-scale)) !important;
+    }
+
+    .notif-drawer {
+        max-width: calc(92vw / var(--ui-scale)) !important;
+    }
+
+    .visitor-modal-box {
+        max-height: calc(92vh / var(--ui-scale)) !important;
+    }
+
+    .visitor-modal-body {
+        max-height: calc(92vh / var(--ui-scale) - 130px) !important;
+    }
+
+    /* registered_logs / visitor_logs archive overlay + modal */
+    .modal-overlay {
+        width: calc(100vw / var(--ui-scale)) !important;
+        height: calc(100vh / var(--ui-scale)) !important;
+    }
+
+    .modal-overlay .modal-content {
+        max-height: calc(90vh / var(--ui-scale)) !important;
+    }
+
+    /* security_guard / registered / visitor modals */
+    .modal .modal-content {
+        max-height: calc(92vh / var(--ui-scale)) !important;
+    }
+
+    /* report.php Audit Actions modal */
+    .audit-modal-backdrop {
+        width: calc(100vw / var(--ui-scale)) !important;
+        height: calc(100vh / var(--ui-scale)) !important;
+    }
+
+    .audit-modal {
+        max-width: min(920px, calc(94vw / var(--ui-scale))) !important;
+        max-height: calc(86vh / var(--ui-scale)) !important;
+    }
+
+    /* Drawer injected by assets/js/visitor_duration_alarm.js */
+    html .vda-drawer {
+        height: calc(100vh / var(--ui-scale)) !important;
+        max-width: calc(96vw / var(--ui-scale)) !important;
+    }
+
+    /* Chart.js measures its box with getBoundingClientRect(), which includes
+       the zoom, so it would draw the canvas too wide. Pin the canvas to its
+       wrapper; tooltip positions are fixed by assets/js/chart_zoom_fix.js. */
+    .chart-wrapper canvas {
+        width: 100% !important;
+        height: 100% !important;
+    }
+}
+
+
+/* =========================================================
+   LEVEL 2 - LOGS (+25% on top of the page)
+========================================================= */
+
+@media screen {
+
+    /* Every data table: bigger text and rows. A zoomed element's percentage
+       width still resolves against its card, so width:100% keeps the table
+       filling its card exactly (measured: table/card ratio 1.000). */
+    html.ui-scale-fixed table:not(.print-table):not(.header-table):not(.data-table):not(.audit-modal-table) {
+        zoom: var(--log-scale);
+        width: 100% !important;
+    }
+
+    /* Bigger tables scroll sideways inside their own card, never the page. */
+    html.ui-scale-fixed :is(div, section):has(> table:not(.print-table):not(.audit-modal-table)) {
+        overflow-x: auto;
+    }
+
+    /* Guard dashboard: live Visitor / Registered activity log rows */
+    html.ui-scale-fixed .activity-stack {
+        zoom: var(--log-scale);
+    }
+}
+
+
+/* =========================================================
+   LAYOUT FIT AT 125% ON NARROWER LAPTOP WINDOWS
+========================================================= */
+
+/* security_guard.php: 4 x 150px stat cards fit from ~1160px */
+@media screen and (max-width: 1159px) {
+    html.ui-scale-fixed .stats-row {
+        grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+    }
+}
+
+/* report.php: 4 x 190px summary cards fit from ~1400px */
+@media screen and (max-width: 1399px) {
+    html.ui-scale-fixed .summary-grid,
+    html.ui-scale-fixed .vehicle-summary-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+    }
+}
+
+/* Dashboards: the two-column camera / activity / totals layout needs about
+   1,065 CSS px; at 125% that is a ~1330px window. Below that, stack the
+   cards in one column (each card then gets the full width). */
+@media screen and (min-width: 700px) and (max-width: 1329px) {
+
+    html.ui-scale-fixed .camera-grid,
+    html.ui-scale-fixed .activity-grid,
+    html.ui-scale-fixed .vehicle-cards,
+    html.ui-scale-fixed .total-cards,
+    html.ui-scale-fixed .profile-grid {
+        grid-template-columns: minmax(0, 1fr) !important;
+    }
+
+    /* Let the dashboard header wrap: title/date on one line, timers,
+       bell and clocks on the next. */
+    html.ui-scale-fixed .header {
+        flex-wrap: wrap !important;
+        row-gap: 10px;
+    }
+}
+
+/* Dashboard header tweaks while enlarged */
+@media screen and (min-width: 700px) {
+
+    /* Internet / System clocks: a bit more compact so both stay on one row
+       (styles come from assets/js/dual_clock.js). */
+    .dual-clock {
+        flex-wrap: nowrap !important;
+        gap: 8px !important;
+    }
+
+    .clock-card {
+        min-width: 0 !important;
+        padding: 4px 8px 5px !important;
+    }
+
+    .dual-clock .clock {
+        font-size: 17px !important;
+    }
+
+    /* Keep the page title / date / on-duty line from wrapping; the right
+       side (timers, bell, clocks) uses tighter spacing to make room. */
+    .header > .header-left {
+        flex-shrink: 0;
+    }
+
+    .header-right {
+        gap: 8px !important;
+    }
+}

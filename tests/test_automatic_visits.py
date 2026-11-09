@@ -1,9 +1,19 @@
 """Exercise the real visit writer using disposable copies of production table schemas."""
 import importlib.util
+import os
 from pathlib import Path
 import unittest
 import uuid
 import mysql.connector
+
+def _connect_test_mysql(**kwargs):
+    env_port=os.environ.get('SECSYS_DB_PORT')
+    ports=[int(env_port)] if env_port else [3306,3307]
+    last_err=None
+    for port in ports:
+        try:return mysql.connector.connect(host='127.0.0.1',port=port,user='root',password='',connection_timeout=3,**kwargs)
+        except Exception as e:last_err=e
+    raise last_err
 
 module_path=Path('app/vehicle_visit_logger.py')
 record_vehicle_visit=None
@@ -16,9 +26,9 @@ class AutomaticVisitTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.name='secsys_'+uuid.uuid4().hex[:12]+'_test'
-        cls.admin=mysql.connector.connect(host='127.0.0.1',port=3307,user='root',password='')
+        cls.admin=_connect_test_mysql()
         cur=cls.admin.cursor();cur.execute('CREATE DATABASE `'+cls.name+'`')
-        for table in ['vehicle_logs','vehicle_log_dates','visitor_vehicles']:
+        for table in ['vehicle_logs','vehicle_log_dates','visitor_vehicles','registered_vehicles']:
             cur.execute('CREATE TABLE `'+cls.name+'`.`'+table+'` LIKE security_system.`'+table+'`')
         cur.close()
     @classmethod
@@ -26,9 +36,9 @@ class AutomaticVisitTests(unittest.TestCase):
         assert cls.name.startswith('secsys_') and cls.name.endswith('_test')
         cur=cls.admin.cursor();cur.execute('DROP DATABASE `'+cls.name+'`');cur.close();cls.admin.close()
     def setUp(self):
-        self.db=mysql.connector.connect(host='127.0.0.1',port=3307,user='root',password='',database=self.name)
+        self.db=_connect_test_mysql(database=self.name)
         cur=self.db.cursor()
-        for table in ['vehicle_log_dates','vehicle_logs','visitor_vehicles']:cur.execute('DELETE FROM '+table)
+        for table in ['vehicle_log_dates','vehicle_logs','visitor_vehicles','registered_vehicles']:cur.execute('DELETE FROM '+table)
         self.db.commit();cur.close()
         self.info=dict(category='Visitor',vehicle_type='Car',purpose='Test visit')
     def tearDown(self):self.db.close()
@@ -72,9 +82,37 @@ class AutomaticVisitTests(unittest.TestCase):
         self.write('D 566-CP')
         self.assertEqual(self.write('d566cp')['direction'],'OUT')
         self.assertEqual(len(self.rows('SELECT id FROM vehicle_log_dates')),1)
-    def test_fixed_exit_camera_remains_out_without_fabricated_entry(self):
+    def test_long_numeric_identifier_keeps_zeroes_and_exact_visit_identity(self):
+        self.assertEqual(self.write('0401-0442987')['direction'],'IN')
+        self.assertEqual(self.write('04010442987')['direction'],'OUT')
+        self.assertEqual(self.rows('SELECT plate_number,status FROM vehicle_log_dates'),
+                         [('0401-0442987','OUT')])
+        self.assertEqual(self.write('042987')['direction'],'IN')
+        self.assertEqual(len(self.rows('SELECT id FROM vehicle_log_dates')),2)
+    def test_hyphenated_long_identifier_lookup_matches_the_full_number(self):
+        from test_plate_formats import server_format_functions
+        self.write('0401-0442987')
+        namespace=server_format_functions()
+        namespace['get_db_connection']=lambda:_connect_test_mysql(database=self.name)
+        info=namespace['check_plate_in_database']('04010442987')
+        self.assertEqual(info['official_plate'],'0401-0442987')
+        self.assertIsNotNone(info['visitor_vehicle_id'])
+        self.assertIsNone(namespace['check_plate_in_database']('042987')['visitor_vehicle_id'])
+    def test_fixed_exit_camera_ignores_vehicle_that_is_already_outside(self):
+        self.assertIsNone(self.write(direction='OUT'))
+        self.assertEqual(self.rows('SELECT COUNT(*) FROM vehicle_log_dates')[0][0],0)
+        self.assertEqual(self.rows('SELECT COUNT(*) FROM vehicle_logs')[0][0],0)
+    def test_fixed_entrance_and_exit_enforce_inside_outside_state(self):
+        self.assertEqual(self.write(direction='IN')['direction'],'IN')
+        self.assertIsNone(self.write(direction='IN'))
+        self.assertEqual(self.rows('SELECT direction FROM vehicle_logs ORDER BY id'),[('IN',)])
+        self.assertEqual(self.rows('SELECT status FROM vehicle_log_dates ORDER BY id'),[('IN',)])
         self.assertEqual(self.write(direction='OUT')['direction'],'OUT')
-        self.assertEqual(self.rows('SELECT time_in,time_out IS NOT NULL,status FROM vehicle_log_dates'),[(None,1,'OUT')])
+        self.assertIsNone(self.write(direction='OUT'))
+        self.assertEqual(self.rows('SELECT direction FROM vehicle_logs ORDER BY id'),[('IN',),('OUT',)])
+        self.assertEqual(self.rows('SELECT status FROM vehicle_log_dates ORDER BY id'),[('OUT',)])
+        self.assertEqual(self.write(direction='IN')['direction'],'IN')
+        self.assertEqual(self.rows('SELECT direction FROM vehicle_logs ORDER BY id'),[('IN',),('OUT',),('IN',)])
     def test_failed_visit_write_rolls_back_event_and_visitor(self):
         self.assertIsNotNone(record_vehicle_visit,'Missing atomic automatic visit writer')
         self.rows("CREATE TRIGGER reject_test_visit BEFORE INSERT ON vehicle_log_dates FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='intentional test failure'")

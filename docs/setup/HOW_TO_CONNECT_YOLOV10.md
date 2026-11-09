@@ -12,7 +12,7 @@ flowchart LR
     B -->|1. Detects Plate| C["🤖 YOLOv10 (best.pt)"]
     C -->|2. Reads Text| D["🔍 EasyOCR"]
     D -->|3. Auto-Insert Logs| E["🗄️ MySQL Database\n(Port 3307: security_system)"]
-    B -->|4. Live MJPEG Feed| F["🖥️ CCTV Monitor\n(cctv.html)"]
+    B -->|4. Live MJPEG Feed| G
     E -->|5. Real-Time Stats| G["🛡️ Security Guard Dashboard\n(guard_dashboard.php)"]
 ```
 
@@ -20,7 +20,7 @@ flowchart LR
 2. **YOLOv10 AI**: Detects license plate bounding boxes in real-time.
 3. **EasyOCR Engine**: Crops the plate and reads alphanumeric characters (e.g., `ABC 1234`).
 4. **Automatic Logging**: Checks if plate exists in `registered_vehicles` or `visitor_vehicles`, then records entry/exit in `vehicle_logs`.
-5. **Web Interface**: `cctv.html` shows live video with boxes, and `guard_dashboard.php` automatically displays updated stats.
+5. **Web Interface**: `guard_dashboard.php` shows the live video with boxes and automatically displays updated stats.
 
 ---
 
@@ -71,7 +71,7 @@ Open [`detect_plate_server.py`](../../detect_plate_server.py) and confirm lines 
 
 ```python
 # 1. CCTV RTSP URL (Tapo C500)
-RTSP_URL = "rtsp://Jhetlogs:12345678I@192.168.1.17:554/stream1"
+RTSP_URL = "rtsp://USERNAME:PASSWORD@CAMERA_IP:554/stream2"
 
 # 2. Database connection (Port 3307 matches your XAMPP configuration)
 DB_CONFIG = {
@@ -117,10 +117,10 @@ Keep this terminal window running in the background.
 
 ### Step 5: View Live Detections on the Web Pages
 
-#### A. CCTV Monitoring Page (`cctv.html`)
-1. Open your browser and go to:
+#### A. Live Camera View (Guard Dashboard)
+1. Log in as a security guard and open:
    ```
-   http://localhost/NewCapstone/cctv.html
+   http://localhost/Ultra/guard_dashboard.php
    ```
 2. You will see:
    - **Left side:** Live video stream with green bounding boxes and confidence tags over detected plates.
@@ -161,7 +161,7 @@ When a license plate is detected and read:
 
 ### 1. Camera stream is black or says "Camera Offline"
 - Confirm your PC and Tapo C500 are on the same local network subnet (`192.168.1.x`).
-- Verify credentials in `detect_plate_server.py` (`Jhetlogs:12345678I`).
+- Verify the camera username and password in Camera Setup (saved in the local `camera_config.json`, which is not uploaded to GitHub).
 - Test your RTSP stream in VLC Player (`Media -> Open Network Stream`).
 - For quick testing without camera, set `RTSP_URL = 0` (webcam) or pass a video file path: `RTSP_URL = "test_video.mp4"`.
 
@@ -183,5 +183,4 @@ When a license plate is detected and read:
 | [`weights/best.pt`](../../weights/best.pt) | Your trained YOLOv10 license plate weights |
 | [`test_plate_detection.py`](../../tests/test_plate_detection.py) | Standalone test script for single images |
 | [`detect_plate_server.py`](../../detect_plate_server.py) | Full backend: Camera + AI + OCR + MySQL |
-| [`cctv.html`](../../cctv.html) | Live web interface with video + detection logs |
 | [`guard_dashboard.php`](../../guard_dashboard.php) | Security guard web dashboard |

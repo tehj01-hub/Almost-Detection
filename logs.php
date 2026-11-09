@@ -18,18 +18,7 @@ if (!isset($_SESSION['username'])) {
    DATABASE CONNECTION
 ========================================================= */
 
-$conn = new mysqli(
-    "localhost:3307",
-    "root",
-    "",
-    "security_system"
-);
-
-if ($conn->connect_error) {
-    die("Database Connection Failed: " . $conn->connect_error);
-}
-
-$conn->set_charset("utf8mb4");
+$conn = secsysConnectDb();
 secsysEnsureSchema($conn);
 $systemName = secsysGetSystemName($conn);
 $systemIcon = secsysGetSystemIcon($conn);
@@ -127,6 +116,12 @@ function logsQuery($changes = [], $dropPages = true)
         $params['q'] = $_GET['q'];
     }
 
+    foreach (['period', 'period_date', 'period_month'] as $periodKey) {
+        if (($_GET[$periodKey] ?? '') !== '') {
+            $params[$periodKey] = $_GET[$periodKey];
+        }
+    }
+
     if ($_GET['status'] ?? '') {
         $params['status'] = $_GET['status'];
     }
@@ -145,10 +140,6 @@ function logsQuery($changes = [], $dropPages = true)
 
     if ($_GET['dir'] ?? '') {
         $params['dir'] = $_GET['dir'];
-    }
-
-    if ($_GET['archive_date'] ?? '') {
-        $params['archive_date'] = $_GET['archive_date'];
     }
 
     if (
@@ -204,6 +195,24 @@ function logsQuery($changes = [], $dropPages = true)
     }
 
     return http_build_query($params);
+}
+
+
+/* =========================================================
+   UNARCHIVE (move archived logs from today back to the
+   active list; past days stay archived)
+========================================================= */
+
+if (
+    $_SERVER['REQUEST_METHOD'] === 'POST' &&
+    ($_POST['action'] ?? '') === 'unarchive_selected'
+) {
+    $actorId = trim((string)($_SESSION['username'] ?? 'Administrator'));
+    $unarchive = secsysUnarchiveLogs($conn, secsysPostedLogIds(), $actorId, null);
+    header("Location: logs.php?" . ($unarchive['error'] !== null
+        ? 'unarchived=error'
+        : 'unarchived=' . (int)$unarchive['restored'] . '&kept=' . (int)$unarchive['kept_past']));
+    exit();
 }
 
 
@@ -279,37 +288,8 @@ if (
 
             $sqlArchive = "
                 INSERT INTO vehicle_logs_archive
-                (
-                    id,
-                    plate_number,
-                    vehicle_type,
-                    vehicle_category,
-                    registered_vehicle_id,
-                    visitor_vehicle_id,
-                    visitor_name,
-                    purpose,
-                    direction,
-                    recognition_method,
-                    date_created,
-                    archived_at,
-                    archived_by
-                )
-
-                SELECT
-                    id,
-                    plate_number,
-                    vehicle_type,
-                    vehicle_category,
-                    registered_vehicle_id,
-                    visitor_vehicle_id,
-                    visitor_name,
-                    purpose,
-                    direction,
-                    recognition_method,
-                    date_created,
-                    NOW(),
-                    ?
-
+                (" . SECSYS_VEHICLE_LOG_COLUMNS . ", archived_at, archived_by)
+                SELECT " . SECSYS_VEHICLE_LOG_COLUMNS . ", NOW(), ?
                 FROM vehicle_logs
 
                 WHERE id IN ($placeholders)
@@ -394,7 +374,72 @@ if (
    GET ARCHIVE DATE
 ========================================================= */
 
+/* Archive modal filters (same model as registered.php / visitor.php):
+   Daily (one date) or Monthly (Jan-Dec of the current year) + search. */
+$archiveMonthNames = [
+    1 => 'January', 2 => 'February', 3 => 'March', 4 => 'April',
+    5 => 'May', 6 => 'June', 7 => 'July', 8 => 'August',
+    9 => 'September', 10 => 'October', 11 => 'November', 12 => 'December',
+];
+
+$archiveBasis = (($_GET['archive_basis'] ?? '') === 'monthly') ? 'monthly' : 'daily';
+
 $archiveDate = getArchiveDate();
+if ($archiveDate === '' || $archiveDate > $today) {
+    $archiveDate = $today;
+}
+
+$archiveMonth = isset($_GET['archive_month']) ? (int)$_GET['archive_month'] : (int)date('n');
+if ($archiveMonth < 1 || $archiveMonth > 12) {
+    $archiveMonth = (int)date('n');
+}
+$archiveYear = (int)date('Y');
+
+$archiveSearch = trim((string)($_GET['archive_q'] ?? ''));
+if (function_exists('mb_substr')) {
+    $archiveSearch = mb_substr($archiveSearch, 0, 60);
+} else {
+    $archiveSearch = substr($archiveSearch, 0, 60);
+}
+
+$showArchive =
+    isset($_GET['show_archive'])
+    || isset($_GET['archive_basis'])
+    || isset($_GET['archive_date'])
+    || isset($_GET['archive_month'])
+    || isset($_GET['archive_q']);
+
+$archiveDisplayLabel = $archiveBasis === 'monthly'
+    ? $archiveMonthNames[$archiveMonth] . ' ' . $archiveYear
+    : date('F d, Y', strtotime($archiveDate));
+
+/* Query string for links inside the archive modal */
+function archiveQuery($changes = [])
+{
+    global $archiveBasis, $archiveDate, $archiveMonth, $archiveSearch;
+
+    $params = [
+        'show_archive'            => 1,
+        'archive_basis'           => $archiveBasis,
+        'archive_date'            => $archiveDate,
+        'archive_month'           => $archiveMonth,
+        'archive_q'               => $archiveSearch,
+        'archive_registered_page' => $_GET['archive_registered_page'] ?? 1,
+        'archive_visitor_page'    => $_GET['archive_visitor_page'] ?? 1,
+    ];
+
+    foreach ($changes as $key => $value) {
+        $params[$key] = $value;
+    }
+
+    foreach ($params as $key => $value) {
+        if ($value === '' || $value === null) {
+            unset($params[$key]);
+        }
+    }
+
+    return http_build_query($params);
+}
 
 
 /* =========================================================
@@ -428,6 +473,56 @@ if (!$resultLogs) {
 
 
 /* =========================================================
+   DAILY / MONTHLY VIEW
+   Today (default) = live logs only. Any other day or a month =
+   live logs in that range + logs already moved to the archive
+   (archived rows are shown read-only).
+========================================================= */
+
+$listPeriod = secsysListPeriod('daily', false);
+
+if (!$listPeriod['is_today']) {
+
+    $periodRows = [];
+
+    if ($listPeriod['has_today']) {
+        $stmtActive = $conn->prepare("
+            SELECT vl.*, rv.owner_name
+            FROM vehicle_logs vl
+            LEFT JOIN registered_vehicles rv ON vl.registered_vehicle_id = rv.id
+            WHERE vl.date_created >= ? AND vl.date_created < ?
+        ");
+        $stmtActive->bind_param("ss", $listPeriod['start'], $listPeriod['end']);
+        $stmtActive->execute();
+        $resActive = $stmtActive->get_result();
+        while ($r = $resActive->fetch_assoc()) {
+            $periodRows[] = $r;
+        }
+        $stmtActive->close();
+    }
+
+    $stmtArchived = $conn->prepare("
+        SELECT va.*, rv.owner_name
+        FROM vehicle_logs_archive va
+        LEFT JOIN registered_vehicles rv ON va.registered_vehicle_id = rv.id
+        WHERE va.date_created >= ? AND va.date_created < ?
+    ");
+    $stmtArchived->bind_param("ss", $listPeriod['start'], $listPeriod['end']);
+    $stmtArchived->execute();
+    $resArchived = $stmtArchived->get_result();
+    while ($r = $resArchived->fetch_assoc()) {
+        if (empty($r['archived_at'])) {
+            $r['archived_at'] = $r['date_created'];   // mark as archived (read-only)
+        }
+        $periodRows[] = $r;
+    }
+    $stmtArchived->close();
+
+    $resultLogs = $periodRows;
+}
+
+
+/* =========================================================
    CREATE DISPLAY SESSIONS
 ========================================================= */
 
@@ -438,7 +533,9 @@ function buildSessions($result)
 
     // Collect all rows and ensure strict chronological (ASC) ordering for pairing
     $rows = [];
-    if ($result) {
+    if (is_array($result)) {
+        $rows = $result;                     // already-fetched rows (Daily / Monthly view)
+    } elseif ($result) {
         while ($row = $result->fetch_assoc()) {
             $rows[] = $row;
         }
@@ -471,6 +568,7 @@ function buildSessions($result)
         if ($direction === "IN") {
             $session = [
                 "ids" => $logId > 0 ? [$logId] : [],
+                "vehicle_image" => $row['vehicle_image'] ?? null,
                 "name" => $name,
                 "plate_number" => $plate,
                 "vehicle_type" => $vehicleType,
@@ -492,6 +590,9 @@ function buildSessions($result)
                 $sessionIndex = array_shift($openSessions[$plate]);
                 if ($logId > 0) {
                     $sessions[$sessionIndex]['ids'][] = $logId;
+                    if (empty($sessions[$sessionIndex]['vehicle_image']) && !empty($row['vehicle_image'])) {
+                        $sessions[$sessionIndex]['vehicle_image'] = $row['vehicle_image'];
+                    }
                 }
                 $sessions[$sessionIndex]['time_out'] = $dateCreated;
                 $sessions[$sessionIndex]['status'] = "Outside";
@@ -505,6 +606,7 @@ function buildSessions($result)
                 // Standalone OUT event (do NOT pull from archive to prevent data overlap)
                 $sessions[] = [
                     "ids" => $logId > 0 ? [$logId] : [],
+                    "vehicle_image" => $row['vehicle_image'] ?? null,
                     "name" => $name,
                     "plate_number" => $plate,
                     "vehicle_type" => $vehicleType,
@@ -632,13 +734,17 @@ function filterAndSortSessions(
 
     if ($searchQuery !== '') {
 
-        $q = strtolower($searchQuery);
-
         $sessions = array_values(
             array_filter(
                 $sessions,
-                function ($s) use ($q) {
-                    return stripos($s['plate_number'], $q) !== false;
+                function ($s) use ($searchQuery) {
+                    return secsysMatchesPlateSearch(
+                        $searchQuery,
+                        (string)($s['plate_number'] ?? ''),
+                        (string)($s['name'] ?? ''),
+                        (string)($s['vehicle_type'] ?? ''),
+                        (string)($s['purpose'] ?? '')
+                    );
                 }
             )
         );
@@ -859,90 +965,89 @@ $archiveRegistered = [];
 
 $archiveVisitors = [];
 
-
-if ($archiveDate !== "") {
-
-    $stmt = $conn->prepare("
-        SELECT
-            va.*,
-            rv.owner_name
-
-        FROM vehicle_logs_archive va
-
-        LEFT JOIN registered_vehicles rv
-            ON va.registered_vehicle_id = rv.id
-
-        WHERE DATE(va.date_created) = ?
-
-        ORDER BY va.date_created DESC
-    ");
+$isArchivePrint =
+    (($_GET['print'] ?? '') === '1')
+    && (($_GET['source'] ?? '') === 'archive');
 
 
-    $stmt->bind_param(
-        "s",
-        $archiveDate
+/* Search inside the archive: plate, name, vehicle type or purpose */
+function archiveSessionMatches($session, $needle)
+{
+    if ($needle === '') {
+        return true;
+    }
+
+    return secsysMatchesPlateSearch(
+        (string)$needle,
+        (string)($session['plate_number'] ?? ''),
+        (string)($session['name'] ?? ''),
+        (string)($session['vehicle_type'] ?? ''),
+        (string)($session['purpose'] ?? '')
     );
+}
 
+
+if ($showArchive || $isArchivePrint) {
+
+    if ($archiveBasis === 'monthly') {
+
+        $stmt = $conn->prepare("
+            SELECT
+                va.*,
+                rv.owner_name
+            FROM vehicle_logs_archive va
+            LEFT JOIN registered_vehicles rv
+                ON va.registered_vehicle_id = rv.id
+            WHERE YEAR(va.date_created) = ?
+              AND MONTH(va.date_created) = ?
+            ORDER BY va.date_created DESC
+        ");
+
+        $stmt->bind_param("ii", $archiveYear, $archiveMonth);
+
+    } else {
+
+        $stmt = $conn->prepare("
+            SELECT
+                va.*,
+                rv.owner_name
+            FROM vehicle_logs_archive va
+            LEFT JOIN registered_vehicles rv
+                ON va.registered_vehicle_id = rv.id
+            WHERE DATE(va.date_created) = ?
+            ORDER BY va.date_created DESC
+        ");
+
+        $stmt->bind_param("s", $archiveDate);
+    }
 
     $stmt->execute();
 
-
-    $archiveResult =
-        $stmt->get_result();
-
-
-    $archiveSessions =
-        buildSessions(
-            $archiveResult
-        );
-
-
-    foreach ($archiveSessions as $session) {
-
-        if (
-            strtolower(
-                $session['category']
-            ) === "registered"
-        ) {
-
-            $archiveRegistered[] =
-                $session;
-
-        }
-
-        else {
-
-            $archiveVisitors[] =
-                $session;
-
-        }
-
-    }
-
+    $archiveSessions = buildSessions($stmt->get_result());
 
     $stmt->close();
 
+    foreach ($archiveSessions as $session) {
 
-    $archiveRegistered = filterAndSortSessions(
-        $archiveRegistered,
-        $searchQuery,
-        $sortBy,
-        $sortDir,
-        $statusFilter,
-        $timeFrom,
-        $timeTo
-    );
+        if (!archiveSessionMatches($session, $archiveSearch)) {
+            continue;
+        }
 
-    $archiveVisitors = filterAndSortSessions(
-        $archiveVisitors,
-        $searchQuery,
-        $sortBy,
-        $sortDir,
-        $statusFilter,
-        $timeFrom,
-        $timeTo
-    );
+        if (strtolower($session['category']) === "registered") {
+            $archiveRegistered[] = $session;
+        } else {
+            $archiveVisitors[] = $session;
+        }
+    }
 
+    /* Newest first */
+    $byTimeInDesc = function ($x, $y) {
+        return strtotime($y['time_in'] ?? $y['time_out'] ?? '1970-01-01')
+             <=> strtotime($x['time_in'] ?? $x['time_out'] ?? '1970-01-01');
+    };
+
+    usort($archiveRegistered, $byTimeInDesc);
+    usort($archiveVisitors, $byTimeInDesc);
 }
 
 
@@ -950,30 +1055,17 @@ if ($archiveDate !== "") {
    ARCHIVE PAGINATION
 ========================================================= */
 
-$archiveRegisteredPage =
-    isset($_GET['archive_registered_page'])
-    ? (int)$_GET['archive_registered_page']
-    : 1;
-
-
-$archiveVisitorPage =
-    isset($_GET['archive_visitor_page'])
-    ? (int)$_GET['archive_visitor_page']
-    : 1;
-
-
 $archiveRegisteredPagination =
     paginate(
         $archiveRegistered,
-        $archiveRegisteredPage,
+        isset($_GET['archive_registered_page']) ? (int)$_GET['archive_registered_page'] : 1,
         $rowsPerPage
     );
-
 
 $archiveVisitorPagination =
     paginate(
         $archiveVisitors,
-        $archiveVisitorPage,
+        isset($_GET['archive_visitor_page']) ? (int)$_GET['archive_visitor_page'] : 1,
         $rowsPerPage
     );
 
@@ -982,9 +1074,14 @@ $archiveVisitorPagination =
    PRINT MODE
 ========================================================= */
 
+/* Download PDF (logs.php?download=pdf&source=...) uses the same data as Print */
+$isPdfDownload =
+    ($_GET['download'] ?? '') === 'pdf';
+
 $isPrint =
-    isset($_GET['print']) &&
-    $_GET['print'] === "1";
+    (isset($_GET['print']) &&
+    $_GET['print'] === "1")
+    || $isPdfDownload;
 
 
 $printSource =
@@ -1007,6 +1104,10 @@ if ($isPrint) {
         $printDate =
             $archiveDate;
 
+        $printDateLabel =
+            $archiveDisplayLabel
+            . ($archiveSearch !== '' ? ' (search: "' . $archiveSearch . '")' : '');
+
     }
 
     else {
@@ -1023,15 +1124,104 @@ if ($isPrint) {
         $printDate =
             $today;
 
+        $printDateLabel =
+            $listPeriod['is_today']
+            ? date("F d, Y", strtotime($today))
+            : $listPeriod['label'];
+
     }
 
+}
+
+
+
+/* =========================================================
+   PRINT REPORT (same layout as the Visitor Vehicle Report)
+   logs.php?print=1&source=current | archive
+========================================================= */
+if ($isPrint) {
+    require_once __DIR__ . '/app/print_report.php';
+
+    $printSummary = secsysBuildVehicleSummary(array_merge($printRegistered, $printVisitors));
+    $printPlateStats = $printSummary['per_plate'];
+
+    $printColumns = [
+        ['#', 4], ['Plate Number', 13], ['Name', 16], ['Vehicle Type', 11],
+        ['Date', 11], ['Time In', 11], ['Time Out', 11], ['Entries / Exits', 13], ['Status', 10],
+    ];
+    $printRows = function (array $sessions) use ($printPlateStats): array {
+        $rows = [];
+        $number = 1;
+        foreach ($sessions as $row) {
+            $pKey = strtoupper(trim((string)($row['plate_number'] ?? '')));
+            $pIn  = (int)($printPlateStats[$pKey]['in_count'] ?? (!empty($row['time_in']) ? 1 : 0));
+            $pOut = (int)($printPlateStats[$pKey]['out_count'] ?? (!empty($row['time_out']) ? 1 : 0));
+            $rows[] = [
+                ['text' => $number++, 'class' => 'center'],
+                $row['plate_number'] ?? '-',
+                $row['name'] ?? '-',
+                $row['vehicle_type'] ?? '-',
+                ['text' => formatLogDate($row), 'class' => 'center'],
+                ['text' => formatTime($row['time_in'] ?? null), 'class' => 'center'],
+                ['text' => formatTime($row['time_out'] ?? null), 'class' => 'center'],
+                ['text' => $pIn . ' IN / ' . $pOut . ' OUT', 'class' => 'center'],
+                ['text' => $row['status'] ?? '-', 'class' => 'center'],
+            ];
+        }
+        return $rows;
+    };
+
+    $isArchiveReport = ($printSource === 'archive');
+    $reportName = $isArchiveReport ? 'Archived Vehicle Logs Report' : 'Vehicle Logs Report';
+
+    $body  = secsysPrintTable($printColumns, $printRows($printRegistered), 'No registered vehicle logs.', 'Registered Vehicle Logs (' . count($printRegistered) . ')');
+    $body .= secsysPrintTable($printColumns, $printRows($printVisitors), 'No visitor vehicle logs.', 'Visitor Vehicle Logs (' . count($printVisitors) . ')');
+
+    $reportMeta   = [($isArchiveReport ? 'Archive Period: ' : 'Period: ') . $printDateLabel];
+    $activePrintSearch = $isArchiveReport ? $archiveSearch : $searchQuery;
+    if ($activePrintSearch !== '') {
+        $reportMeta[] = 'Search Plate "' . $activePrintSearch . '": Entered (IN) ' . (int)$printSummary['total_in'] . ' time(s) | Exited (OUT) ' . (int)$printSummary['total_out'] . ' time(s)';
+    }
+    $reportFooter = $isArchiveReport ? 'Archived Vehicle Logs Monitoring Report' : 'Vehicle Logs Monitoring Report';
+
+    if ($isPdfDownload) {
+        // e.g. vehicle_logs_report_2026-11-04.pdf / archived_vehicle_logs_report_2026-11.pdf
+        $fileStamp = preg_replace('/[^0-9A-Za-z_-]+/', '-', (string)$printDate);
+        if ($isArchiveReport && ($archiveBasis ?? 'daily') === 'monthly') {
+            $fileStamp = sprintf('%04d-%02d', (int)$archiveYear, (int)$archiveMonth);
+        } elseif (!$isArchiveReport && !$listPeriod['is_today']) {
+            $fileStamp = $listPeriod['basis'] === 'monthly'
+                ? sprintf('%04d-%02d', (int)$listPeriod['year'], (int)$listPeriod['month'])
+                : $listPeriod['date'];
+        }
+        $downloadName = ($isArchiveReport ? 'archived_vehicle_logs_report_' : 'vehicle_logs_report_') . $fileStamp;
+        if (secsysWantsCsvDownload()) {
+            // CSV option: same rows as the PDF
+            secsysStreamCsvFromHtml(
+                secsysBuildPrintDocumentHtml($reportName, $reportMeta, $body, $reportFooter, false),
+                $downloadName
+            );
+            exit;
+        }
+        secsysStreamPdfReport(
+            $reportName,
+            $reportMeta,
+            $body,
+            $reportFooter,
+            $downloadName . '.pdf'
+        );
+        exit;
+    }
+
+    secsysRenderPrintDocument($reportName, $reportMeta, $body, $reportFooter);
+    exit;
 }
 
 ?>
 
 <!DOCTYPE html>
 
-<html lang="en">
+<html lang="en" class="ui-scale-fixed">
 
 <head>
 
@@ -1419,7 +1609,8 @@ body {
 
     gap: 8px;
 
-    margin-left: auto;
+    /* sits right after Print Report / Archive Selected */
+    margin-left: 0;
 }
 
 .archive-date-box label {
@@ -2387,7 +2578,279 @@ body {
     display: none;
 }
 
+
+/* =========================================================
+   ONE WIDTH FOR THE WHOLE PAGE
+   Buttons, search filter, Daily / Monthly bar and the log
+   tables all line up (tables use max-width 1080px).
+========================================================= */
+
+.main > .action-bar,
+.main > .search-filter-bar,
+.main > .period-filter,
+.main > #liveLogsPlateSearchSummary {
+    width: 100%;
+    max-width: 1080px;
+    box-sizing: border-box;
+}
+
+/* =========================================================
+   ARCHIVE WINDOW (same look as registered.php / visitor.php)
+========================================================= */
+
+.modal {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.45);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    z-index: 2000;
+    padding: 20px;
+}
+
+.modal.show {
+    display: flex;
+}
+
+.modal-content {
+    max-width: 95%;
+    max-height: 90vh;
+    overflow-y: auto;
+    background: white;
+    border-radius: 18px;
+    padding: 24px;
+    box-shadow: 0 10px 35px rgba(0, 0, 0, 0.25);
+    animation: archiveModalIn 0.18s ease-out;
+    box-sizing: border-box;
+}
+
+.modal-archive {
+    width: 96%;
+    max-width: 1250px;
+    border-radius: 20px;
+    padding: 22px;
+}
+
+@keyframes archiveModalIn {
+    from { transform: translateY(-15px); opacity: 0; }
+    to   { transform: translateY(0); opacity: 1; }
+}
+
+.modal-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 20px;
+}
+
+.modal-title {
+    font-size: 20px;
+    font-weight: 400;
+}
+
+.archive-subheading {
+    font-size: 11px;
+    color: #777;
+    padding: 4px 0 0;
+}
+
+.close-modal {
+    border: none;
+    background: none;
+    font-size: 25px;
+    cursor: pointer;
+    color: #666;
+}
+
+.close-modal:hover {
+    color: #111;
+}
+
+.archive-loading .modal-content {
+    opacity: 0.65;
+    transition: opacity 0.15s ease;
+}
+
+.archive-toolbar-card {
+    margin-bottom: 14px;
+    padding: 14px 18px;
+}
+
+.archive-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+
+.archive-filter-group {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+
+.archive-basis-toggle {
+    display: inline-flex;
+    background: #eef4fc;
+    border: 1px solid #c8dcf7;
+    border-radius: 22px;
+    padding: 3px;
+    gap: 4px;
+}
+
+.archive-basis-toggle button {
+    border: none;
+    height: 32px;
+    padding: 0 16px;
+    border-radius: 18px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    background: transparent;
+    color: #1769d3;
+}
+
+.archive-basis-toggle button.active {
+    background: #2f80ed;
+    color: #ffffff;
+}
+
+.archive-picker {
+    align-items: center;
+    gap: 8px;
+}
+
+.archive-date-label {
+    font-size: 12px;
+    color: #555;
+}
+
+#archivePanel .archive-date {
+    height: 36px;
+    border: 1px solid #2f80ed;
+    border-radius: 22px;
+}
+
+.archive-search-box {
+    flex: 1 1 240px;
+    min-width: 200px;
+    max-width: 380px;
+    height: 36px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    border: 1px solid #2f80ed;
+    border-radius: 22px;
+    padding: 0 14px;
+    background: #ffffff;
+    box-sizing: border-box;
+}
+
+.archive-search-box:focus-within {
+    box-shadow: 0 0 0 3px rgba(47, 128, 237, 0.18);
+}
+
+.archive-search-icon {
+    font-size: 12px;
+    opacity: 0.7;
+}
+
+.archive-search {
+    flex: 1;
+    min-width: 0;
+    border: none;
+    outline: none;
+    font-size: 12px;
+    color: #333;
+    background: transparent;
+    height: 100%;
+}
+
+.archive-print-btn {
+    margin-left: auto;
+    height: 36px;
+    display: inline-flex;
+    align-items: center;
+    padding: 0 16px;
+    border-radius: 20px;
+    background: #2f80ed;
+    color: #ffffff;
+    font-size: 12px;
+    font-weight: 600;
+    text-decoration: none;
+    white-space: nowrap;
+}
+
+.archive-print-btn:hover {
+    background: #1769d3;
+}
+
+.archive-log-section {
+    margin-top: 6px;
+    margin-bottom: 14px;
+}
+
+.archive-log-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin: 0 4px 8px;
+}
+
+.archive-log-title {
+    font-size: 15px;
+    font-weight: 600;
+    color: #222;
+}
+
+.archive-log-count {
+    font-size: 11px;
+    color: #777;
+}
+
+.archive-table-card {
+    margin-bottom: 0;
+    overflow: hidden;
+}
+
+.archive-table-wrapper {
+    width: 100%;
+    overflow-x: auto;
+}
+
+.archive-plate {
+    font-family: "Courier New", monospace;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+}
+
+.archive-purpose {
+    white-space: normal;
+    max-width: 240px;
+}
+
+.archive-empty-row td {
+    text-align: center;
+    color: #888;
+    padding: 22px 12px;
+}
+
+@media print {
+    #archivePanel {
+        display: none !important;
+    }
+}
+
 </style>
+
+<link rel="stylesheet" href="assets/css/period_filter.css?v=<?php echo (int)@filemtime(__DIR__ . '/assets/css/period_filter.css'); ?>">
+
+<!-- Same look as the Security Guard dashboard for every Administrator page -->
+<link rel="stylesheet" href="assets/css/admin_uniform.css?v=<?php echo (int)@filemtime(__DIR__ . '/assets/css/admin_uniform.css'); ?>">
+<!-- Enlarges the page up to 25% on desktop for easier reading (loaded after the page styles) -->
+<link rel="stylesheet" href="assets/css/ui_scale.css?v=<?php echo (int)@filemtime(__DIR__ . '/assets/css/ui_scale.css'); ?>">
 
 </head>
 
@@ -2395,272 +2858,7 @@ body {
 <body>
 
 
-<?php if ($isPrint): ?>
-
-
-<!-- =====================================================
-     PRINT VERSION
-====================================================== -->
-
-<div class="main">
-
-    <div class="print-header">
-
-        <h1>
-            L. Surveillance
-        </h1>
-
-        <p>
-            <?php echo htmlspecialchars($printTitle); ?>
-        </p>
-
-        <p>
-            Date:
-            <?php
-            echo date(
-                "F d, Y",
-                strtotime($printDate)
-            );
-            ?>
-        </p>
-
-    </div>
-
-
-    <!-- REGISTERED PRINT -->
-
-    <div class="print-section">
-
-        <h2>
-            Registered Vehicle Logs
-        </h2>
-
-
-        <table class="print-table">
-
-            <thead>
-
-                <tr>
-
-                    <th>No.</th>
-
-                    <th>Plate Number</th>
-
-                    <th>Date</th>
-
-                    <th>Time In</th>
-
-                    <th>Time Out</th>
-
-                    <th>Status</th>
-
-                </tr>
-
-            </thead>
-
-
-            <tbody>
-
-            <?php if (count($printRegistered) > 0): ?>
-
-                <?php
-                $number = 1;
-                ?>
-
-                <?php foreach ($printRegistered as $row): ?>
-
-                    <tr>
-
-                        <td>
-                            <?php echo $number++; ?>.
-                        </td>
-
-                        <td>
-                            <?php
-                            echo htmlspecialchars(
-                                $row['plate_number']
-                            );
-                            ?>
-                        </td>
-
-                        <td>
-                            <?php
-                            echo formatLogDate($row);
-                            ?>
-                        </td>
-
-                        <td>
-                            <?php
-                            echo formatTime(
-                                $row['time_in']
-                            );
-                            ?>
-                        </td>
-
-                        <td>
-                            <?php
-                            echo formatTime(
-                                $row['time_out']
-                            );
-                            ?>
-                        </td>
-
-                        <td>
-                            <?php
-                            echo htmlspecialchars(
-                                $row['status'] ?? '-'
-                            );
-                            ?>
-                        </td>
-
-                    </tr>
-
-                <?php endforeach; ?>
-
-            <?php else: ?>
-
-                <tr>
-
-                    <td colspan="6">
-                        No registered vehicle logs.
-                    </td>
-
-                </tr>
-
-            <?php endif; ?>
-
-            </tbody>
-
-        </table>
-
-    </div>
-
-
-    <!-- VISITOR PRINT -->
-
-    <div class="print-section">
-
-        <h2>
-            Visitor Vehicle Logs
-        </h2>
-
-
-        <table class="print-table">
-
-            <thead>
-
-                <tr>
-
-                    <th>No.</th>
-
-                    <th>Plate Number</th>
-
-                    <th>Date</th>
-
-                    <th>Time In</th>
-
-                    <th>Time Out</th>
-
-                    <th>Status</th>
-
-                </tr>
-
-            </thead>
-
-
-            <tbody>
-
-            <?php if (count($printVisitors) > 0): ?>
-
-                <?php
-                $number = 1;
-                ?>
-
-                <?php foreach ($printVisitors as $row): ?>
-
-                    <tr>
-
-                        <td>
-                            <?php echo $number++; ?>.
-                        </td>
-
-                        <td>
-                            <?php
-                            echo htmlspecialchars(
-                                $row['plate_number']
-                            );
-                            ?>
-                        </td>
-
-                        <td>
-                            <?php
-                            echo formatLogDate($row);
-                            ?>
-                        </td>
-
-                        <td>
-                            <?php
-                            echo formatTime(
-                                $row['time_in']
-                            );
-                            ?>
-                        </td>
-
-                        <td>
-                            <?php
-                            echo formatTime(
-                                $row['time_out']
-                            );
-                            ?>
-                        </td>
-
-                        <td>
-                            <?php
-                            echo htmlspecialchars(
-                                $row['status'] ?? '-'
-                            );
-                            ?>
-                        </td>
-
-                    </tr>
-
-                <?php endforeach; ?>
-
-            <?php else: ?>
-
-                <tr>
-
-                    <td colspan="6">
-                        No visitor vehicle logs.
-                    </td>
-
-                </tr>
-
-            <?php endif; ?>
-
-            </tbody>
-
-        </table>
-
-    </div>
-
-</div>
-
-
-<script>
-
-window.onload = function() {
-
-    window.print();
-
-};
-
-</script>
-
-
-<?php exit; ?>
-
-<?php endif; ?>
+<?php /* print view: see "PRINT REPORT" block above <!DOCTYPE html> */ ?>
 
 
 <!-- =====================================================
@@ -2686,9 +2884,7 @@ window.onload = function() {
                 <?php echo htmlspecialchars($systemName); ?>
             </div>
 
-            <div class="logo-subtitle">
-                Administrator
-            </div>
+            <div class="logo-subtitle"><?php echo secsysAdminSidebarSubtitleHtml(); ?></div>
 
         </div>
 
@@ -2791,6 +2987,18 @@ window.onload = function() {
 
         </a>
 
+        <a href="backup.php">
+
+            <span class="nav-icon">
+                💾
+            </span>
+
+            <span>
+                Backup &amp; Retrieve
+            </span>
+
+        </a>
+
         <a href="profile.php">
 
             <span class="nav-icon">
@@ -2884,6 +3092,8 @@ window.onload = function() {
 
     <?php endif; ?>
 
+    <?php echo secsysUnarchiveNoticeHtml('logs.php', 'vehicle'); ?>
+
 
     <!-- =================================================
          ACTION BAR
@@ -2896,93 +3106,36 @@ window.onload = function() {
 
         <a
             href="logs.php?<?php echo logsQuery(['print' => '1', 'source' => 'current']); ?>"
-            target="_blank"
+            onclick="return printLogsReport(this.href);"
             class="action-button"
         >
             🖨️ Print Report
         </a>
 
 
-        <!-- ARCHIVE SELECTED -->
+        <!-- DOWNLOAD PDF (same report as Print, saved as a file) -->
 
-        <button
-            type="submit"
-            form="archiveForm"
-            name="archive_selected"
-            class="action-button archive"
+        <a
+            href="logs.php?<?php echo logsQuery(['download' => 'pdf', 'source' => 'current']); ?>"
+            class="action-button download"
+            title="Download the logs report as PDF or CSV"
+            data-download-choice
         >
-            📦 Archive Selected
-        </button>
+            📥 Download ▾
+        </a>
 
 
-        <!-- ARCHIVE DATE -->
+        <!-- ARCHIVE (opens the archive window, same as Registered / Visitor) -->
 
-        <form
-            method="GET"
-            class="archive-date-box"
-        >
-
-            <label>
-                View Archive:
-            </label>
-
-            <input
-                type="date"
-                name="archive_date"
-                class="archive-date"
-                value="<?php
-                    echo htmlspecialchars(
-                        $archiveDate
-                    );
-                ?>"
-                max="<?php
-                    echo $today;
-                ?>"
-                required
-            >
-
-            <?php if ($searchQuery !== ''): ?>
-                <input
-                    type="hidden"
-                    name="q"
-                    value="<?php
-                        echo htmlspecialchars(
-                            $searchQuery
-                        );
-                    ?>"
-                >
-            <?php endif; ?>
-
-            <?php if ($sortBy !== ''): ?>
-                <input
-                    type="hidden"
-                    name="sort"
-                    value="<?php
-                        echo htmlspecialchars(
-                            $sortBy
-                        );
-                    ?>"
-                >
-                <input
-                    type="hidden"
-                    name="dir"
-                    value="<?php
-                        echo htmlspecialchars(
-                            $sortDir
-                        );
-                    ?>"
-                >
-            <?php endif; ?>
-
-
+        <div class="archive-date-box">
             <button
-                type="submit"
+                type="button"
                 class="view-archive"
+                onclick="toggleArchive()"
             >
-                📦 View Archive
+                📦 Archive
             </button>
-
-        </form>
+        </div>
 
 
     </div>
@@ -3172,6 +3325,86 @@ window.onload = function() {
          ARCHIVE FORM
     ================================================== -->
 
+    <!-- DAILY / MONTHLY VIEW -->
+    <?php
+    echo secsysRenderPeriodFilter($listPeriod, 'logs.php', [
+        'q'         => $_GET['q'] ?? '',
+        'status'    => $_GET['status'] ?? '',
+        'time_from' => $_GET['time_from'] ?? '',
+        'time_to'   => $_GET['time_to'] ?? '',
+        'sort'      => $_GET['sort'] ?? '',
+        'dir'       => $_GET['dir'] ?? '',
+    ]);
+
+    $logsPeriodStartDate = ($listPeriod['basis'] === 'monthly')
+        ? sprintf('%04d-%02d-01', (int)$listPeriod['year'], (int)$listPeriod['month'])
+        : $listPeriod['date'];
+    $logsPeriodEndDate = ($listPeriod['basis'] === 'monthly')
+        ? date('Y-m-t', strtotime($logsPeriodStartDate))
+        : $listPeriod['date'];
+    $activeLogsVehicleSummary = secsysBuildVehicleSummary(array_merge($registeredSessions, $visitorSessions));
+    $activeLogsPlateStats     = $activeLogsVehicleSummary['per_plate_map'] ?? $activeLogsVehicleSummary['per_plate'];
+    // Enrich row pills with full period DB movement counts so archived visits from the same day are also reflected
+    $knownActivePlates = [];
+    foreach ($activeLogsVehicleSummary['per_plate'] as $pi) {
+        if (!empty($pi['plate_number']) && $pi['plate_number'] !== '-') {
+            $knownActivePlates[] = $pi['plate_number'];
+        }
+    }
+    if (!empty($knownActivePlates) || $searchQuery !== '') {
+        $dbActiveCounts = secsysQueryPlateMovementCounts($conn, $searchQuery, $knownActivePlates, $logsPeriodStartDate, $logsPeriodEndDate);
+        foreach ($dbActiveCounts as $pk => $dbc) {
+            $rawUp = strtoupper(trim((string)($dbc['plate_number'] ?? '')));
+            foreach ([$pk, $rawUp] as $lookupKey) {
+                if ($lookupKey === '') {
+                    continue;
+                }
+                if (isset($activeLogsPlateStats[$lookupKey])) {
+                    $activeLogsPlateStats[$lookupKey]['in_count']  = max((int)$activeLogsPlateStats[$lookupKey]['in_count'], (int)$dbc['period_in']);
+                    $activeLogsPlateStats[$lookupKey]['out_count'] = max((int)$activeLogsPlateStats[$lookupKey]['out_count'], (int)$dbc['period_out']);
+                } else {
+                    $activeLogsPlateStats[$lookupKey] = [
+                        'in_count'  => (int)$dbc['period_in'],
+                        'out_count' => (int)$dbc['period_out'],
+                    ];
+                }
+            }
+        }
+    }
+    ?>
+
+    <style>
+    .secsys-io-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        background: #f8fafc;
+        border: 1px solid #cbd5e1;
+        border-radius: 999px;
+        padding: 2px 8px;
+        font-size: 11px;
+        font-weight: 700;
+        white-space: nowrap;
+    }
+    .secsys-io-in { color: #15803d; }
+    .secsys-io-sep { color: #94a3b8; }
+    .secsys-io-out { color: #1d4ed8; }
+    </style>
+
+    <!-- PLATE SEARCH ENTRY & EXIT COUNTER BANNER -->
+    <div id="liveLogsPlateSearchSummary" data-live>
+        <?php if ($searchQuery !== ''): ?>
+            <?php echo secsysRenderPlateSearchSummaryHtml(
+                $searchQuery,
+                array_merge($registeredSessions, $visitorSessions),
+                $listPeriod['label'],
+                $conn,
+                $logsPeriodStartDate,
+                $logsPeriodEndDate
+            ); ?>
+        <?php endif; ?>
+    </div>
+
     <form
         method="POST"
         id="archiveForm"
@@ -3271,6 +3504,10 @@ window.onload = function() {
                                 Time Out
                             </th>
 
+                            <th class="col-time">
+                                Entries / Exits
+                            </th>
+
                         </tr>
 
                     </thead>
@@ -3315,6 +3552,9 @@ window.onload = function() {
                                     ",",
                                     $row['ids']
                                 );
+                            $pKey = strtoupper(trim((string)($row['plate_number'] ?? '')));
+                            $pIn  = (int)($activeLogsPlateStats[$pKey]['in_count'] ?? (!empty($row['time_in']) ? 1 : 0));
+                            $pOut = (int)($activeLogsPlateStats[$pKey]['out_count'] ?? (!empty($row['time_out']) ? 1 : 0));
 
                             ?>
 
@@ -3326,6 +3566,7 @@ window.onload = function() {
 
                                 <td>
 
+                                    <?php if (empty($row['archived_at'])): ?>
                                     <input
                                         type="checkbox"
                                         name="selected_logs[]"
@@ -3336,6 +3577,9 @@ window.onload = function() {
                                         ?>"
                                         class="log-checkbox registered-check"
                                     >
+                                    <?php else: ?>
+                                    <span class="archived-row-badge" title="Already in the archive" aria-label="Already in the archive">📦</span>
+                                    <?php endif; ?>
 
                                 </td>
 
@@ -3355,11 +3599,7 @@ window.onload = function() {
 
                                 <td>
 
-                                    <?php
-                                    echo htmlspecialchars(
-                                        $row['plate_number']
-                                    );
-                                    ?>
+                                    <?php echo secsysClickablePlateHtml($row); ?>
 
                                 </td>
 
@@ -3401,6 +3641,13 @@ window.onload = function() {
                                 </td>
 
 
+                                <!-- ENTRIES / EXITS -->
+
+                                <td>
+                                    <?php echo secsysPlateEntryExitPillHtml($pIn, $pOut); ?>
+                                </td>
+
+
                             </tr>
 
 
@@ -3413,12 +3660,12 @@ window.onload = function() {
                         <tr>
 
                             <td
-                                colspan="6"
+                                colspan="7"
                                 class="empty-row"
                             >
 
                                 No registered vehicle
-                                logs found for today.
+                                logs found for <?php echo htmlspecialchars($listPeriod['is_today'] ? 'today' : $listPeriod['label']); ?>.
 
                             </td>
 
@@ -3628,6 +3875,10 @@ window.onload = function() {
                                 Time Out
                             </th>
 
+                            <th class="col-time">
+                                Entries / Exits
+                            </th>
+
                         </tr>
 
                     </thead>
@@ -3672,6 +3923,9 @@ window.onload = function() {
                                     ",",
                                     $row['ids']
                                 );
+                            $pKey = strtoupper(trim((string)($row['plate_number'] ?? '')));
+                            $pIn  = (int)($activeLogsPlateStats[$pKey]['in_count'] ?? (!empty($row['time_in']) ? 1 : 0));
+                            $pOut = (int)($activeLogsPlateStats[$pKey]['out_count'] ?? (!empty($row['time_out']) ? 1 : 0));
 
                             ?>
 
@@ -3681,6 +3935,7 @@ window.onload = function() {
 
                                 <td>
 
+                                    <?php if (empty($row['archived_at'])): ?>
                                     <input
                                         type="checkbox"
                                         name="selected_logs[]"
@@ -3691,6 +3946,9 @@ window.onload = function() {
                                         ?>"
                                         class="log-checkbox visitor-check"
                                     >
+                                    <?php else: ?>
+                                    <span class="archived-row-badge" title="Already in the archive" aria-label="Already in the archive">📦</span>
+                                    <?php endif; ?>
 
                                 </td>
 
@@ -3706,11 +3964,7 @@ window.onload = function() {
 
                                 <td>
 
-                                    <?php
-                                    echo htmlspecialchars(
-                                        $row['plate_number']
-                                    );
-                                    ?>
+                                    <?php echo secsysClickablePlateHtml($row); ?>
 
                                 </td>
 
@@ -3746,6 +4000,11 @@ window.onload = function() {
                                 </td>
 
 
+                                <td>
+                                    <?php echo secsysPlateEntryExitPillHtml($pIn, $pOut); ?>
+                                </td>
+
+
                             </tr>
 
 
@@ -3758,12 +4017,12 @@ window.onload = function() {
                         <tr>
 
                             <td
-                                colspan="6"
+                                colspan="7"
                                 class="empty-row"
                             >
 
                                 No visitor vehicle
-                                logs found for today.
+                                logs found for <?php echo htmlspecialchars($listPeriod['is_today'] ? 'today' : $listPeriod['label']); ?>.
 
                             </td>
 
@@ -3882,344 +4141,484 @@ window.onload = function() {
 
 
     <!-- =================================================
-         ARCHIVE
+         ARCHIVE WINDOW
+         Same layout as the Registered / Visitor archive:
+         Daily / Monthly filter, search, print, paginated tables.
     ================================================== -->
 
-    <?php if ($archiveDate !== ""): ?>
+    <?php
+    $archiveCombinedSummary = secsysBuildVehicleSummary(array_merge($archiveRegistered, $archiveVisitors));
+    $archivePlateStats      = $archiveCombinedSummary['per_plate'];
 
+    function renderArchiveTable($title, $pagination, $pageParam, $isVisitor, $emptyLabel, $archivePlateStats = [])
+    {
+        $items = $pagination['items'];
+        global $rowsPerPage;
+        $start = ($pagination['page'] - 1) * $rowsPerPage;
+        ?>
+        <div class="archive-log-section">
 
-        <section class="archive-area">
+            <div class="archive-log-header">
+                <div class="archive-log-title"><?php echo htmlspecialchars($title); ?></div>
+                <div class="archive-log-count"><?php echo (int)$pagination['total']; ?> record(s)</div>
+            </div>
 
-
-            <div class="archive-heading">
-
-                <div>
-
-                    <h2>
-                        Vehicle Log Archive
-                    </h2>
-
-                    <p>
-
-                        Showing archived logs for
-                        <strong>
-                            <?php
-                            echo date(
-                                "F d, Y",
-                                strtotime(
-                                    $archiveDate
-                                )
-                            );
-                            ?>
-                        </strong>
-
-                    </p>
-
+            <div class="table-card archive-table-card">
+                <div class="archive-table-wrapper">
+                    <table class="log-table archive-log-table">
+                        <thead>
+                            <tr>
+                                <th>No.</th>
+                                <th>Plate Number</th>
+                                <th><?php echo $isVisitor ? 'Visitor' : 'Owner'; ?></th>
+                                <th>Vehicle Type</th>
+                                <?php if ($isVisitor): ?><th>Purpose</th><?php endif; ?>
+                                <th>Date</th>
+                                <th>Time In</th>
+                                <th>Time Out</th>
+                                <th>Entries / Exits</th>
+                                <th>Action</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                        <?php if (count($items) === 0): ?>
+                            <tr class="archive-empty-row">
+                                <td colspan="<?php echo $isVisitor ? 10 : 9; ?>">
+                                    <?php echo htmlspecialchars($emptyLabel); ?>
+                                </td>
+                            </tr>
+                        <?php else: ?>
+                            <?php foreach ($items as $index => $row): ?>
+                                <?php
+                                    $pKey = strtoupper(trim((string)($row['plate_number'] ?? '')));
+                                    $pIn  = (int)($archivePlateStats[$pKey]['in_count'] ?? (!empty($row['time_in']) ? 1 : 0));
+                                    $pOut = (int)($archivePlateStats[$pKey]['out_count'] ?? (!empty($row['time_out']) ? 1 : 0));
+                                ?>
+                                <tr>
+                                    <td><?php echo $start + $index + 1; ?>.</td>
+                                    <td><?php echo secsysClickablePlateHtml($row, [], 'archive-plate'); ?></td>
+                                    <td><?php echo htmlspecialchars($row['name'] ?? '-'); ?></td>
+                                    <td><?php echo htmlspecialchars($row['vehicle_type'] ?? '-'); ?></td>
+                                    <?php if ($isVisitor): ?>
+                                        <td class="archive-purpose"><?php echo htmlspecialchars(($row['purpose'] ?? '') !== '' ? $row['purpose'] : '-'); ?></td>
+                                    <?php endif; ?>
+                                    <td><?php echo formatLogDate($row); ?></td>
+                                    <td><?php echo formatTime($row['time_in']); ?></td>
+                                    <td><?php echo formatTime($row['time_out']); ?></td>
+                                    <td><?php echo secsysPlateEntryExitPillHtml($pIn, $pOut); ?></td>
+                                    <td><?php echo secsysUnarchiveButtonHtml('logs.php', $row); ?></td>
+                                </tr>
+                            <?php endforeach; ?>
+                        <?php endif; ?>
+                        </tbody>
+                    </table>
                 </div>
 
+                <?php if ($pagination['totalPages'] > 1): ?>
+                    <div class="pagination archive-pagination">
+                        <?php $cp = $pagination['page']; $tp = $pagination['totalPages']; ?>
+                        <?php if ($cp > 1): ?>
+                            <a href="logs.php?<?php echo archiveQuery([$pageParam => $cp - 1]); ?>">&lt;</a>
+                        <?php else: ?>
+                            <a class="disabled">&lt;</a>
+                        <?php endif; ?>
+                        <?php for ($i = 1; $i <= $tp; $i++): ?>
+                            <a href="logs.php?<?php echo archiveQuery([$pageParam => $i]); ?>"
+                               class="<?php echo $i === $cp ? 'active' : ''; ?>"><?php echo $i; ?></a>
+                        <?php endfor; ?>
+                        <?php if ($cp < $tp): ?>
+                            <a href="logs.php?<?php echo archiveQuery([$pageParam => $cp + 1]); ?>">&gt;</a>
+                        <?php else: ?>
+                            <a class="disabled">&gt;</a>
+                        <?php endif; ?>
+                    </div>
+                <?php endif; ?>
+            </div>
+        </div>
+        <?php
+    }
 
-                <a
-                    href="logs.php?print=1&source=archive&archive_date=<?php
-                        echo urlencode(
-                            $archiveDate
-                        );
-                    ?>"
-                    target="_blank"
-                    class="archive-print"
+    $archiveEmptySuffix = $archiveSearch !== ''
+        ? ' matching "' . $archiveSearch . '"'
+        : '';
+    ?>
+
+    <div
+        class="modal <?php echo $showArchive ? 'show' : ''; ?>"
+        id="archivePanel"
+    >
+
+        <div class="modal-content modal-archive">
+
+            <div class="modal-header" style="margin-bottom: 14px;">
+                <div>
+                    <div class="modal-title">
+                        Vehicle Log Archive
+                    </div>
+                    <div class="archive-subheading">
+                        Archived logs for
+                        <strong><?php echo htmlspecialchars($archiveDisplayLabel); ?></strong>
+                        <?php if ($archiveSearch !== ''): ?>
+                            &bull; matching <strong>"<?php echo htmlspecialchars($archiveSearch); ?>"</strong>
+                        <?php endif; ?>
+                    </div>
+                </div>
+
+                <button
+                    type="button"
+                    class="close-modal"
+                    onclick="closeArchive()"
+                    aria-label="Close archive"
                 >
-                    Print Archive Report
-                </a>
+                    ×
+                </button>
+            </div>
+
+            <div class="table-card archive-toolbar-card">
+
+                <div class="archive-toolbar">
+
+                    <!-- DAILY OR MONTHLY FILTER -->
+                    <div class="archive-filter-group">
+
+                        <input type="hidden" id="archiveBasis" value="<?php echo htmlspecialchars($archiveBasis); ?>">
+
+                        <div class="archive-basis-toggle">
+                            <button
+                                type="button"
+                                id="btnBasisDaily"
+                                class="<?php echo $archiveBasis === 'daily' ? 'active' : ''; ?>"
+                                onclick="setArchiveBasis('daily')"
+                            >
+                                📅 Daily
+                            </button>
+                            <button
+                                type="button"
+                                id="btnBasisMonthly"
+                                class="<?php echo $archiveBasis === 'monthly' ? 'active' : ''; ?>"
+                                onclick="setArchiveBasis('monthly')"
+                            >
+                                🗓️ Monthly
+                            </button>
+                        </div>
+
+                        <!-- DAILY CALENDAR PICKER -->
+                        <div id="dailyPickerBox" class="archive-picker" style="display:<?php echo $archiveBasis === 'daily' ? 'flex' : 'none'; ?>;">
+                            <span class="archive-date-label">Select Date:</span>
+                            <input
+                                type="date"
+                                id="archiveDate"
+                                class="archive-date"
+                                value="<?php echo htmlspecialchars($archiveDate); ?>"
+                                max="<?php echo $today; ?>"
+                                onchange="loadArchiveFilter()"
+                            >
+                        </div>
+
+                        <!-- MONTHLY DROPDOWN (JANUARY - DECEMBER) -->
+                        <div id="monthlyPickerBox" class="archive-picker" style="display:<?php echo $archiveBasis === 'monthly' ? 'flex' : 'none'; ?>;">
+                            <span class="archive-date-label">Select Month:</span>
+                            <select id="archiveMonth" class="archive-date" onchange="loadArchiveFilter()">
+                                <?php foreach ($archiveMonthNames as $mNum => $mName): ?>
+                                    <option value="<?php echo (int)$mNum; ?>" <?php echo (int)$archiveMonth === (int)$mNum ? 'selected' : ''; ?>>
+                                        <?php echo htmlspecialchars($mName); ?>
+                                    </option>
+                                <?php endforeach; ?>
+                            </select>
+                        </div>
+
+                    </div>
+
+                    <!-- SEARCH INSIDE THE ARCHIVE -->
+                    <div class="archive-search-box">
+                        <span class="archive-search-icon" aria-hidden="true">🔍</span>
+                        <input
+                            type="search"
+                            id="archiveSearch"
+                            class="archive-search"
+                            placeholder="Search plate, name, type or purpose..."
+                            value="<?php echo htmlspecialchars($archiveSearch); ?>"
+                            autocomplete="off"
+                            aria-label="Search archived logs"
+                        >
+                    </div>
+
+                    <!-- PRINT -->
+                    <a
+                        class="archive-print-btn"
+                        onclick="return printLogsReport(this.href);"
+                        href="logs.php?print=1&amp;source=archive&amp;<?php echo htmlspecialchars(archiveQuery()); ?>"
+                    >
+                        🖨️ Print Archive Report
+                    </a>
+
+                    <!-- DOWNLOAD (PDF or CSV) -->
+                    <a
+                        class="archive-print-btn"
+                        data-download-choice
+                        title="Download the archive report as PDF or CSV"
+                        href="logs.php?download=pdf&amp;source=archive&amp;<?php echo htmlspecialchars(archiveQuery()); ?>"
+                    >
+                        📥 Download Archive ▾
+                    </a>
+
+                </div>
 
             </div>
 
-
-            <?php if (
-                count($archiveRegistered) === 0 &&
-                count($archiveVisitors) === 0
-            ): ?>
-
-
-                <div class="archive-empty">
-
-                    No archived vehicle logs were
-                    found for this date.
-
-                </div>
-
-
-            <?php else: ?>
-
-
-                <!-- =====================================
-                     ARCHIVED REGISTERED
-                ====================================== -->
-
-                <?php if (
-                    count($archiveRegistered) > 0
-                ): ?>
-
-                    <div class="log-section">
-
-
-                        <div class="section-header">
-
-                            <div class="section-title">
-                                Registered Vehicle Logs
-                            </div>
-
-                            <div class="section-count">
-
-                                <?php
-                                echo count(
-                                    $archiveRegistered
-                                );
-                                ?>
-
-                                record(s)
-
-                            </div>
-
-                        </div>
-
-
-                        <div class="table-card">
-
-
-                            <table class="log-table">
-
-                                <thead>
-
-                                    <tr>
-
-                                        <th>
-                                            No.
-                                        </th>
-
-                                        <th>
-                                            Plate Number
-                                        </th>
-
-                                        <th>
-                                            Date
-                                        </th>
-
-                                        <th>
-                                            Time In
-                                        </th>
-
-                                        <th>
-                                            Time Out
-                                        </th>
-
-                                    </tr>
-
-                                </thead>
-
-
-                                <tbody>
-
-                                <?php
-
-                                $number = 1;
-
-                                foreach (
-                                    $archiveRegistered
-                                    as $row
-                                ):
-
-                                ?>
-
-                                    <tr>
-
-                                        <td>
-                                            <?php
-                                            echo $number++;
-                                            ?>.
-                                        </td>
-
-                                        <td>
-                                            <?php
-                                            echo htmlspecialchars(
-                                                $row['plate_number']
-                                            );
-                                            ?>
-                                        </td>
-
-                                        <td>
-                                            <?php
-                                            echo formatLogDate($row);
-                                            ?>
-                                        </td>
-
-                                        <td>
-                                            <?php
-                                            echo formatTime(
-                                                $row['time_in']
-                                            );
-                                            ?>
-                                        </td>
-
-                                        <td>
-                                            <?php
-                                            echo formatTime(
-                                                $row['time_out']
-                                            );
-                                            ?>
-                                        </td>
-
-                                    </tr>
-
-                                <?php endforeach; ?>
-
-                                </tbody>
-
-                            </table>
-
-                        </div>
-
-                    </div>
-
-                <?php endif; ?>
-
-
-                <!-- =====================================
-                     ARCHIVED VISITORS
-                ====================================== -->
-
-                <?php if (
-                    count($archiveVisitors) > 0
-                ): ?>
-
-                    <div class="log-section">
-
-
-                        <div class="section-header">
-
-                            <div class="section-title">
-                                Visitor Vehicle Logs
-                            </div>
-
-                            <div class="section-count">
-
-                                <?php
-                                echo count(
-                                    $archiveVisitors
-                                );
-                                ?>
-
-                                record(s)
-
-                            </div>
-
-                        </div>
-
-
-                        <div class="table-card">
-
-
-                            <table class="log-table">
-
-                                <thead>
-
-                                    <tr>
-
-                                        <th>
-                                            No.
-                                        </th>
-
-                                        <th>
-                                            Plate Number
-                                        </th>
-
-                                        <th>
-                                            Date
-                                        </th>
-
-                                        <th>
-                                            Time In
-                                        </th>
-
-                                        <th>
-                                            Time Out
-                                        </th>
-
-                                    </tr>
-
-                                </thead>
-
-
-                                <tbody>
-
-                                <?php
-
-                                $number = 1;
-
-                                foreach (
-                                    $archiveVisitors
-                                    as $row
-                                ):
-
-                                ?>
-
-                                    <tr>
-
-                                        <td>
-                                            <?php
-                                            echo $number++;
-                                            ?>.
-                                        </td>
-
-                                        <td>
-                                            <?php
-                                            echo htmlspecialchars(
-                                                $row['plate_number']
-                                            );
-                                            ?>
-                                        </td>
-
-                                        <td>
-                                            <?php
-                                            echo formatLogDate($row);
-                                            ?>
-                                        </td>
-
-                                        <td>
-                                            <?php
-                                            echo formatTime(
-                                                $row['time_in']
-                                            );
-                                            ?>
-                                        </td>
-
-                                        <td>
-                                            <?php
-                                            echo formatTime(
-                                                $row['time_out']
-                                            );
-                                            ?>
-                                        </td>
-
-                                    </tr>
-
-                                <?php endforeach; ?>
-
-                                </tbody>
-
-                            </table>
-
-                        </div>
-
-                    </div>
-
-                <?php endif; ?>
-
-
-            <?php endif; ?>
-
-
-        </section>
-
-    <?php endif; ?>
+            <?php
+            if ($archiveSearch !== '') {
+                $archStartDate = ($archiveBasis === 'monthly')
+                    ? sprintf('%04d-%02d-01', (int)$archiveYear, (int)$archiveMonth)
+                    : $archiveDate;
+                $archEndDate = ($archiveBasis === 'monthly')
+                    ? date('Y-m-t', strtotime($archStartDate))
+                    : $archiveDate;
+                echo secsysRenderPlateSearchSummaryHtml(
+                    $archiveSearch,
+                    array_merge($archiveRegistered, $archiveVisitors),
+                    'Archive: ' . $archiveDisplayLabel,
+                    $conn,
+                    $archStartDate,
+                    $archEndDate
+                );
+            }
+
+            renderArchiveTable(
+                'Registered Vehicle Logs',
+                $archiveRegisteredPagination,
+                'archive_registered_page',
+                false,
+                'No archived registered vehicle logs for ' . $archiveDisplayLabel . $archiveEmptySuffix . '.',
+                $archivePlateStats
+            );
+
+            renderArchiveTable(
+                'Visitor Vehicle Logs',
+                $archiveVisitorPagination,
+                'archive_visitor_page',
+                true,
+                'No archived visitor logs for ' . $archiveDisplayLabel . $archiveEmptySuffix . '.',
+                $archivePlateStats
+            );
+            ?>
+
+        </div>
+
+    </div>
+
+
+    <script>
+
+    /* =========================================================
+       ARCHIVE WINDOW (same behaviour as registered.php)
+       Filters, search and pages reload inside the window
+       without a page jump.
+    ========================================================= */
+
+    var archiveSearchTimer = null;
+
+    /* =========================================================
+       PRINT WITHOUT A NEW TAB
+       Loads the print view (logs.php?print=1...) into a hidden
+       frame on this page; it calls window.print() when loaded,
+       so the print dialog opens here and no tab is created.
+    ========================================================= */
+    function printLogsReport(url)
+    {
+        var old = document.getElementById("logsPrintFrame");
+        if (old) old.remove();
+
+        var frame = document.createElement("iframe");
+        frame.id = "logsPrintFrame";
+        frame.setAttribute("aria-hidden", "true");
+        frame.style.cssText = "position:fixed; right:0; bottom:0; width:0; height:0; border:0; visibility:hidden;";
+        frame.src = url;
+        document.body.appendChild(frame);
+
+        return false;   // stop the link from opening the page itself
+    }
+
+    function toggleArchive()
+    {
+        var panel = document.getElementById("archivePanel");
+        if (!panel) return;
+
+        if (!panel.dataset.loaded) {
+            loadArchiveFilter();          // first open: fetch today's archive
+        } else {
+            panel.classList.add("show");
+        }
+    }
+
+    function closeArchive()
+    {
+        var panel = document.getElementById("archivePanel");
+        if (panel) panel.classList.remove("show");
+
+        // Drop the archive filters from the address bar (like registered.php)
+        if (window.history && window.history.replaceState) {
+            var url = new URL(window.location.href);
+            ["show_archive", "archive_basis", "archive_date", "archive_month",
+             "archive_q", "archive_registered_page", "archive_visitor_page"]
+                .forEach(function (k) { url.searchParams.delete(k); });
+            window.history.replaceState({}, document.title, url.pathname + url.search);
+        }
+    }
+
+    function setArchiveBasis(basis)
+    {
+        var basisInput = document.getElementById("archiveBasis");
+        if (basisInput) basisInput.value = basis;
+
+        var daily = basis !== "monthly";
+        var dailyBox = document.getElementById("dailyPickerBox");
+        var monthlyBox = document.getElementById("monthlyPickerBox");
+        if (dailyBox) dailyBox.style.display = daily ? "flex" : "none";
+        if (monthlyBox) monthlyBox.style.display = daily ? "none" : "flex";
+
+        var bd = document.getElementById("btnBasisDaily");
+        var bm = document.getElementById("btnBasisMonthly");
+        if (bd) bd.classList.toggle("active", daily);
+        if (bm) bm.classList.toggle("active", !daily);
+
+        loadArchiveFilter();
+    }
+
+    function archiveFilterUrl(extra)
+    {
+        var val = function (id) {
+            var el = document.getElementById(id);
+            return el ? el.value : "";
+        };
+
+        var params = new URLSearchParams();
+        params.set("show_archive", "1");
+        params.set("archive_basis", val("archiveBasis") || "daily");
+        params.set("archive_date", val("archiveDate"));
+        params.set("archive_month", val("archiveMonth"));
+        var q = val("archiveSearch").trim();
+        if (q !== "") params.set("archive_q", q);
+
+        Object.keys(extra || {}).forEach(function (k) { params.set(k, extra[k]); });
+
+        return "logs.php?" + params.toString();
+    }
+
+    function loadArchiveFilter(url)
+    {
+        fetchArchive(url || archiveFilterUrl({
+            archive_registered_page: 1,
+            archive_visitor_page: 1
+        }));
+    }
+
+    function fetchArchive(url)
+    {
+        var panel = document.getElementById("archivePanel");
+        if (!panel) return;
+
+        // Remember the search box state so typing is not interrupted
+        var active = document.activeElement;
+        var searchFocused = active && active.id === "archiveSearch";
+        var caret = searchFocused ? active.selectionStart : null;
+
+        panel.classList.add("show", "archive-loading");
+
+        fetch(url, { credentials: "same-origin", cache: "no-store" })
+            .then(function (response) { return response.text(); })
+            .then(function (html) {
+                var doc = new DOMParser().parseFromString(html, "text/html");
+                var fresh = doc.getElementById("archivePanel");
+                if (!fresh) throw new Error("archive missing");
+
+                // Keep what the user is typing right now (newer than the request)
+                var typed = document.getElementById("archiveSearch");
+                var typedValue = typed ? typed.value : null;
+
+                panel.innerHTML = fresh.innerHTML;
+                panel.dataset.loaded = "1";
+                panel.classList.add("show");
+                panel.classList.remove("archive-loading");
+
+                var search = document.getElementById("archiveSearch");
+                if (search && typedValue !== null && search.value !== typedValue) {
+                    search.value = typedValue;
+                }
+                bindArchiveControls();
+                if (searchFocused && search) {
+                    search.focus();
+                    var pos = caret === null ? search.value.length : Math.min(caret, search.value.length);
+                    try { search.setSelectionRange(pos, pos); } catch (e) {}
+                }
+
+                if (window.history && window.history.replaceState) {
+                    window.history.replaceState({}, document.title, url);
+                }
+            })
+            .catch(function () {
+                window.location.href = url;
+            });
+    }
+
+    function bindArchiveControls()
+    {
+        var panel = document.getElementById("archivePanel");
+        if (!panel) return;
+
+        // Search: filter as you type (short pause), Enter = immediately
+        var search = document.getElementById("archiveSearch");
+        if (search && !search.dataset.bound) {
+            search.dataset.bound = "1";
+            search.addEventListener("input", function () {
+                clearTimeout(archiveSearchTimer);
+                archiveSearchTimer = setTimeout(function () { loadArchiveFilter(); }, 350);
+            });
+            search.addEventListener("keydown", function (e) {
+                if (e.key === "Enter") {
+                    e.preventDefault();
+                    clearTimeout(archiveSearchTimer);
+                    loadArchiveFilter();
+                }
+            });
+            // The (x) clear button of type=search fires "search"
+            search.addEventListener("search", function () {
+                clearTimeout(archiveSearchTimer);
+                loadArchiveFilter();
+            });
+        }
+
+        // Pagination inside the window
+        panel.querySelectorAll(".archive-pagination a[href]").forEach(function (link) {
+            link.addEventListener("click", function (e) {
+                e.preventDefault();
+                fetchArchive(link.getAttribute("href"));
+            });
+        });
+    }
+
+    (function () {
+        var panel = document.getElementById("archivePanel");
+        if (!panel) return;
+
+        if (panel.classList.contains("show")) {
+            panel.dataset.loaded = "1";   // opened straight from a link
+        }
+        bindArchiveControls();
+
+        // Click on the dark backdrop closes the window
+        panel.addEventListener("click", function (e) {
+            if (e.target === panel) closeArchive();
+        });
+
+        document.addEventListener("keydown", function (e) {
+            if (e.key === "Escape" && panel.classList.contains("show")) {
+                closeArchive();
+            }
+        });
+    })();
+
+    </script>
 
 
 </main>
@@ -4298,6 +4697,7 @@ window.onload = function() {
     if (logSearch) {
 
         var timer = null;
+        var searchAbortCtrl = null;
 
         logSearch.addEventListener("input", function() {
 
@@ -4306,12 +4706,40 @@ window.onload = function() {
             timer = setTimeout(function() {
 
                 var url = buildUrl({
-                    "q": logSearch.value.trim()
+                    "q": logSearch.value.trim(),
+                    "registered_page": "",
+                    "visitor_page": ""
                 });
 
-                window.location.href = url;
+                if (window.history && window.history.replaceState) {
+                    window.history.replaceState(null, "", url);
+                }
 
-            }, 400);
+                if (searchAbortCtrl) {
+                    searchAbortCtrl.abort();
+                }
+                searchAbortCtrl = new AbortController();
+
+                fetch(url, { credentials: "same-origin", cache: "no-store", signal: searchAbortCtrl.signal })
+                    .then(function(r) { return r.text(); })
+                    .then(function(html) {
+                        var doc = new DOMParser().parseFromString(html, "text/html");
+                        ["liveLogsPlateSearchSummary", "liveRegisteredLogs", "liveVisitorLogs"].forEach(function(id) {
+                            var cur = document.getElementById(id);
+                            var next = doc.getElementById(id);
+                            if (cur && next) {
+                                cur.innerHTML = next.innerHTML;
+                            }
+                        });
+                        var nextClear = doc.getElementById("clearFilters");
+                        if (clearFilters && nextClear) {
+                            clearFilters.className = nextClear.className;
+                            clearFilters.setAttribute("href", nextClear.getAttribute("href") || "logs.php");
+                        }
+                    })
+                    .catch(function() {});
+
+            }, 300);
 
         });
 
@@ -4589,7 +5017,9 @@ document.querySelectorAll(
 
 <!-- Live auto-refresh (no full page reload) -->
 <script>window.AUTO_REFRESH_SECONDS = 5;</script>
-<script src="assets/js/auto_refresh.js"></script>
+<script src="assets/js/download_format.js?v=<?php echo (int)@filemtime(__DIR__ . '/assets/js/download_format.js'); ?>"></script>
+<script src="assets/js/auto_refresh.js?v=<?php echo (int)@filemtime(__DIR__ . '/assets/js/auto_refresh.js'); ?>"></script>
+<?php echo secsysYoloCaptureModalAssetsHtml(); ?>
 
 
 </body>

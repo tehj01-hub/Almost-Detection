@@ -21,20 +21,7 @@ if (!isset($_SESSION['username'])) {
    DATABASE CONNECTION
 ========================================================= */
 
-$conn = new mysqli(
-    "localhost:3307",
-    "root",
-    "",
-    "security_system"
-);
-
-if ($conn->connect_error) {
-
-    die("Database Connection Failed: " . $conn->connect_error);
-
-}
-
-$conn->set_charset("utf8mb4");
+$conn = secsysConnectDb();
 secsysEnsureSchema($conn);
 $systemName = secsysGetSystemName($conn);
 $systemIcon = secsysGetSystemIcon($conn);
@@ -200,6 +187,30 @@ $conn->query("
         date_created DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
 ");
+
+$scColsRes = $conn->query("SHOW COLUMNS FROM security_contacts");
+$scExisting = [];
+if ($scColsRes) {
+    while ($sc = $scColsRes->fetch_assoc()) {
+        $scExisting[strtolower($sc['Field'])] = true;
+    }
+    $scColsRes->close();
+}
+if (!isset($scExisting['position'])) {
+    $conn->query("ALTER TABLE security_contacts ADD COLUMN `position` VARCHAR(100) DEFAULT '' AFTER contact_name");
+}
+if (!isset($scExisting['contact_number'])) {
+    $conn->query("ALTER TABLE security_contacts ADD COLUMN `contact_number` VARCHAR(50) DEFAULT '' AFTER contact_name");
+}
+if (!isset($scExisting['email'])) {
+    $conn->query("ALTER TABLE security_contacts ADD COLUMN `email` VARCHAR(150) DEFAULT ''");
+}
+if (!isset($scExisting['address'])) {
+    $conn->query("ALTER TABLE security_contacts ADD COLUMN `address` VARCHAR(255) DEFAULT ''");
+}
+if (!isset($scExisting['status'])) {
+    $conn->query("ALTER TABLE security_contacts ADD COLUMN `status` ENUM('Active','Inactive') NOT NULL DEFAULT 'Active'");
+}
 
 
 /* =========================================================
@@ -402,14 +413,26 @@ if ($currentShift) {
    SECURITY CONTACTS
 ========================================================= */
 
+secsysEnsureSecurityContacts($conn);
+
 $contacts = [];
+
+$scColCheck = $conn->query("SHOW COLUMNS FROM security_contacts LIKE 'status'");
+$hasStatusCol = ($scColCheck && $scColCheck->num_rows > 0);
+$statusWhere = $hasStatusCol ? "WHERE status = 'Active'" : "";
 
 $contactResult = $conn->query("
     SELECT
         *
     FROM security_contacts
-    WHERE status = 'Active'
-    ORDER BY contact_name ASC
+    $statusWhere
+    ORDER BY
+        CASE
+            WHEN LOWER(TRIM(contact_name)) = 'security office' THEN 1
+            WHEN LOWER(TRIM(contact_name)) = 'subdivision admin office' THEN 2
+            ELSE 3
+        END,
+        contact_name ASC
 ");
 
 if ($contactResult) {
@@ -420,6 +443,25 @@ if ($contactResult) {
 
     }
 
+}
+
+if (empty($contacts)) {
+    $contacts = [
+        [
+            'contact_name'   => 'Security Office',
+            'position'       => '24/7 Main Gate Security',
+            'contact_number' => secsysGetSecurityOfficeNumber($conn),
+            'email'          => '',
+            'address'        => '',
+        ],
+        [
+            'contact_name'   => 'Subdivision Admin Office',
+            'position'       => 'Subdivision Administration',
+            'contact_number' => secsysGetSubdivisionAdminOfficeNumber($conn),
+            'email'          => '',
+            'address'        => '',
+        ],
+    ];
 }
 
 /* =========================================================
@@ -472,7 +514,7 @@ if (($_GET['ajax'] ?? '') === 'guard_status') {
 
 ?>
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" class="ui-scale-fixed">
 
 <head>
 
@@ -1393,6 +1435,11 @@ tbody tr:hover {
 
 </style>
 
+<!-- Same look as the Security Guard dashboard for every Administrator page -->
+<link rel="stylesheet" href="assets/css/admin_uniform.css?v=<?php echo (int)@filemtime(__DIR__ . '/assets/css/admin_uniform.css'); ?>">
+<!-- Enlarges the page 25% on laptops/desktops for easier reading (loaded after the page styles) -->
+<link rel="stylesheet" href="assets/css/ui_scale.css?v=<?php echo (int)@filemtime(__DIR__ . '/assets/css/ui_scale.css'); ?>">
+
 </head>
 
 
@@ -1421,9 +1468,7 @@ tbody tr:hover {
             <?php echo htmlspecialchars($systemName); ?>
         </div>
 
-        <div class="logo-subtitle">
-            Administrator
-        </div>
+        <div class="logo-subtitle"><?php echo secsysAdminSidebarSubtitleHtml(); ?></div>
 
     </div>
 
@@ -1466,6 +1511,11 @@ tbody tr:hover {
     <a href="report.php">
         <span class="nav-icon">📈</span>
         <span>Report</span>
+    </a>
+
+    <a href="backup.php">
+        <span class="nav-icon">💾</span>
+        <span>Backup &amp; Retrieve</span>
     </a>
 
     <a href="profile.php">
@@ -1512,7 +1562,7 @@ tbody tr:hover {
          CURRENT SHIFT
     ====================================================== -->
 
-    <section class="shift-banner">
+    <section class="shift-banner" id="liveShiftBanner" data-live>
 
         <div>
 
@@ -1652,7 +1702,7 @@ tbody tr:hover {
          SECURITY GUARDS
     ====================================================== -->
 
-    <section class="card">
+    <section class="card" id="liveGuardInfo" data-live>
 
 
         <div class="card-header">
@@ -1685,6 +1735,10 @@ tbody tr:hover {
                         </th>
 
                         <th>
+                            Date Hired
+                        </th>
+
+                        <th>
                             Shift
                         </th>
 
@@ -1712,7 +1766,7 @@ tbody tr:hover {
 
                     <tr>
 
-                        <td colspan="5"
+                        <td colspan="6"
                             style="text-align:center; padding:30px; color:#888;">
 
                             No active security guards found.
@@ -1758,6 +1812,10 @@ tbody tr:hover {
 
                                 </div>
 
+                            </td>
+                            <!-- DATE HIRED -->
+                            <td>
+                                <?php echo !empty($guard['date_hired']) && $guard['date_hired'] !== '0000-00-00' ? e(date('M d, Y', strtotime($guard['date_hired']))) : '&mdash;'; ?>
                             </td>
 
 
@@ -1903,7 +1961,7 @@ tbody tr:hover {
          SECURITY CONTACTS
     ====================================================== -->
 
-    <section class="card">
+    <section class="card" id="liveSecurityContacts" data-live>
 
 
         <div class="card-header">
@@ -1919,6 +1977,10 @@ tbody tr:hover {
                 </p>
 
             </div>
+
+            <a href="profile.php#security-contacts" class="btn-outline" style="text-decoration:none; font-size:12px;">
+                ✏️ Edit in Profile
+            </a>
 
         </div>
 
@@ -2151,6 +2213,9 @@ updateGuardStatus();
 setInterval(updateGuardStatus, 5000);
 
 </script>
+
+<script>window.AUTO_REFRESH_SECONDS = 5;</script>
+<script src="assets/js/auto_refresh.js?v=<?php echo (int)@filemtime(__DIR__ . '/assets/js/auto_refresh.js'); ?>"></script>
 
 </body>
 

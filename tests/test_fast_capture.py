@@ -28,7 +28,7 @@ class FastCaptureTests(unittest.TestCase):
         tree = ast.parse(Path('detect_plate_server.py').read_text(encoding='utf-8'))
         cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'PlateDetector')
         ns = dict(cv2=cv2, IMAGE_SIZE=640, CONFIDENCE_THRESHOLD=.60, DETECTION_CANDIDATE_THRESHOLD=.22, USE_INTEL_GPU=True,
-                  DEVICE='cpu', AUTO_CHECK_UPSIDE_DOWN=False, is_valid_plate=lambda p:True)
+                  DEVICE='cpu', USE_CUDA=False, AUTO_CHECK_UPSIDE_DOWN=False, is_valid_plate=lambda p:True)
         exec(compile(ast.Module(body=[cls], type_ignores=[]), '<detector>', 'exec'), ns)
         detector = ns['PlateDetector'].__new__(ns['PlateDetector'])
         box = SimpleNamespace(xyxy=[np.array([20,20,180,80])], conf=[.9])
@@ -57,6 +57,15 @@ class FastCaptureTests(unittest.TestCase):
         self.assertGreaterEqual(distant[0]['confidence'], .60)
         detector._extract_ocr_from_crop = lambda c:('ABC1234','ABC1234',.1,'NEEDS_REVIEW','test',None)
         self.assertEqual(detector.detect_plates_on_frame(frame), ([], []))
+        # Inside vehicles must not be scanned on Entrance (IN) and Outside vehicles must not be scanned on Exit (OUT)
+        box.conf = [.9]
+        detector._extract_ocr_from_crop = lambda c:('ABC1234','ABC1234',.95,'ACCEPT','test',None)
+        detector.can_scan_plate = lambda plate, direction, use_cache=True: False
+        self.assertEqual(detector.detect_plates_on_frame(frame, channel_direction='IN'), ([], []))
+        self.assertEqual(detector.detect_plates_on_frame(frame, channel_direction='OUT'), ([], []))
+        detector.can_scan_plate = lambda plate, direction, use_cache=True: True
+        self.assertEqual(len(detector.detect_plates_on_frame(frame, channel_direction='IN')[1]), 1)
+        self.assertEqual(len(detector.detect_plates_on_frame(frame, channel_direction='OUT')[1]), 1)
 
     def test_photo_save_failure_does_not_retry_committed_vehicle_visit(self):
         import test_camera_modes as modes
@@ -90,5 +99,27 @@ class FastCaptureTests(unittest.TestCase):
             self.assertEqual(metadata['plate'], 'ABC1234')
             self.assertEqual(metadata['confidence'], .85)
             self.assertNotEqual(saved['image'],save_plate_capture(directory,crop,reading)['image'])
+
+    def test_visitor_arrival_saves_plate_crop_and_vehicle_photo(self):
+        import test_camera_modes as modes
+        fixture = modes.CameraModeTests()
+        fixture.setUp()
+        fixture.apply()
+        save_mock = Mock(return_value={'image': 'visitor_plate.jpg', 'metadata': 'visitor_plate.json'})
+        fixture.detector._capture_vehicle = Mock(return_value='uploads/vehicle_captures/pv_12345_abcdef.jpg')
+        with patch.dict(modes.ns, dict(
+                check_plate_in_database=lambda p: dict(category='Visitor', vehicle_type='Car', official_plate=p),
+                enqueue_pending_visitor=lambda plate, info, **kw: dict(pending_id='pv_12345_abcdef'),
+                has_open_visitor_visit=lambda p: False,
+                save_plate_capture=save_mock,
+                os=__import__('os'), BASE_DIR='.')):
+            crop_obj = object()
+            reading = dict(normalized='VIS999', text='VIS 999', confidence=.91, _plate_crop=crop_obj)
+            self.assertTrue(fixture.detector.handle_detection(reading, fixture.detector.channels['entrance']))
+            fixture.detector._capture_vehicle.assert_called_once_with(reading, 'pv_12345_abcdef')
+            save_mock.assert_called_once()
+            saved_meta = save_mock.call_args.args[2]
+            self.assertEqual(saved_meta['plate'], 'VIS 999')
+            self.assertEqual(saved_meta['vehicle_image'], 'uploads/vehicle_captures/pv_12345_abcdef.jpg')
 
 if __name__ == '__main__': unittest.main()

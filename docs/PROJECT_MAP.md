@@ -12,25 +12,23 @@ NewCapstone/
 |-- docs/
 |   |-- PROJECT_MAP.md       Start here when locating a bug
 |   |-- setup/               Camera/YOLO connection and Colab notes
-|   |-- archive/             Preserved miscellaneous files
 |   `-- superpowers/plans/   Organization implementation record
 |-- lpr_engine/              OCR readers, preprocessing, decoding, validation
 |-- tests/                   Standalone detection and OCR checks
-|   `-- artifacts/           Generated test images (local, ignored by Git)
+|   `-- run_all.py           Runs every automated unit test
 |-- tools/                   Crop collection/labeling and OCR evaluation
 |-- training/                Training scripts, notebooks, and dataset YAML
 |-- *.php                   Public pages and the visitor alarm API
-|-- cctv.html                Camera preview page
-|-- camera*.py              Camera preview/stream launch scripts
-|-- detect_plate*.py         Detection server launch files and variants
-|-- composer.json / .lock    PHP dependencies and exact versions
+|-- detect_plate_server.py   Detection server (camera + YOLOv10 + OCR + MySQL)
 `-- requirements.txt         Python dependencies
 ```
 
 The following existing local folders stay in place: `weights/` (trained models),
-`datasets/` and `numberplate_dataset/` (training images/labels), `uploads/`
-(application uploads), `vendor/` (Composer dependencies), `yolov10/` (local
-detection library), `scratch/` (experiments), and the model cache folders.
+`numberplate_dataset/` (training images/labels), `uploads/` (application
+uploads; vehicle photos in `uploads/vehicle_captures/` are served only through
+`vehicle_photo.php`), `vendor/` (PHP libraries, e.g. Dompdf), `yolov10/` (local
+detection library), and the model cache folders. The server runs on the
+normal Python install (`python -u detect_plate_server.py`).
 Their contents are ignored by Git. Local `camera_config.json` and
 `openai_config.json` also stay at the root and are ignored.
 
@@ -48,7 +46,7 @@ Their contents are ignored by Git. Local `camera_config.json` and
 | Dashboard data does not refresh | [assets/js/auto_refresh.js](../assets/js/auto_refresh.js) | Relevant PHP page and its `data-live` markup |
 | General logs or PDF/report output | [logs.php](../logs.php) | `report.php`, `composer.json`, `vendor/` |
 | Guard accounts, profiles, or security information | [security_guard.php](../security_guard.php) | `profile.php`, `security_information.php` |
-| Camera connection or video stream | [detect_plate_server.py](../detect_plate_server.py) | root `camera_config.json`, `camera.py`, `camera_stream.py`, `cctv.html` |
+| Camera connection or video stream | [detect_plate_server.py](../detect_plate_server.py) | root `camera_config.json`, `guard_dashboard.php` (camera Setup), `camera_proxy.php` |
 | Plate is not detected or model will not load | [detect_plate_server.py](../detect_plate_server.py) | local `weights/`, local `yolov10/`, `tests/test_plate_detection.py` |
 | Plate is found but characters are wrong | [lpr_engine/quad_ensemble.py](../lpr_engine/quad_ensemble.py) | `recognizer.py`, `preprocessing.py`, `ctc_decoder.py`, `ph_plate_validator.py` in `lpr_engine/` |
 | GPT reader configuration | [lpr_engine/gpt_vision_reader.py](../lpr_engine/gpt_vision_reader.py) | root `openai_config.json`, `tests/test_gpt_vision.py` |
@@ -81,6 +79,9 @@ Existing page URLs such as `/NewCapstone/login.php` and
 `/NewCapstone/guard_dashboard.php` keep the same paths.
 
 ```powershell
+# All automated unit tests in one run (sets up the import paths they need)
+python tests/run_all.py
+
 # Offline OCR engine checks: synthetic inputs, no camera or API call
 python tests/test_lprnet_pipeline.py
 
@@ -134,6 +135,8 @@ See [camera and YOLO setup](setup/HOW_TO_CONNECT_YOLOV10.md) and
 | `database_updates.sql` | `database/database_updates.sql` |
 | `HOW_TO_CONNECT_YOLOV10.md` | `docs/setup/HOW_TO_CONNECT_YOLOV10.md` |
 | `colab.md` | `docs/setup/colab.md` |
-| `git` | `docs/archive/git` |
 
-The last file is the existing placeholder, preserved for completeness.
+The old placeholder `docs/archive/git`, the standalone `cctv.html` /
+`camera.py` / `camera_stream.py` preview tools, the unused `.venv`, and the
+`scratch/` experiments were removed on 2026-11-09 (sent to the Recycle Bin).
+Live camera views are on the guard and admin dashboards.

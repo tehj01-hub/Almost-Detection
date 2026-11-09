@@ -37,23 +37,7 @@ if (
    DATABASE CONNECTION
 ========================================================= */
 
-$conn = new mysqli(
-    "localhost:3307",
-    "root",
-    "",
-    "security_system"
-);
-
-if ($conn->connect_error) {
-
-    die(
-        "Database Connection Failed: " .
-        $conn->connect_error
-    );
-
-}
-
-$conn->set_charset("utf8mb4");
+$conn = secsysConnectDb();
 secsysEnsureSchema($conn);
 $systemName = secsysGetSystemName($conn);
 $systemIcon = secsysGetSystemIcon($conn);
@@ -1148,10 +1132,7 @@ if (
             $_POST['address'] ?? ''
         );
 
-    $dateHired =
-        trim(
-            $_POST['date_hired'] ?? ''
-        );
+    // Date hired is set automatically when the guard is added and is not edited here.
 
     $shiftID =
         (int)(
@@ -1169,7 +1150,6 @@ if (
         $fullName === '' ||
         $contactNumber === '' ||
         $address === '' ||
-        $dateHired === '' ||
         $shiftID <= 0
     ) {
 
@@ -1189,7 +1169,6 @@ if (
                     full_name = ?,
                     contact_number = ?,
                     address = ?,
-                    date_hired = ?,
                     shift_id = ?,
                     assignment = ?
                 WHERE ID = ?
@@ -1197,11 +1176,10 @@ if (
 
 
         $stmt->bind_param(
-            "ssssisi",
+            "sssisi",
             $fullName,
             $contactNumber,
             $address,
-            $dateHired,
             $shiftID,
             $assignment,
             $id
@@ -2028,7 +2006,7 @@ $conn->close();
 
 <!DOCTYPE html>
 
-<html lang="en">
+<html lang="en" class="ui-scale-fixed">
 
 <head>
 
@@ -2998,6 +2976,11 @@ tr:hover td{
 
 </style>
 
+<!-- Same look as the Security Guard dashboard for every Administrator page -->
+<link rel="stylesheet" href="assets/css/admin_uniform.css?v=<?php echo (int)@filemtime(__DIR__ . '/assets/css/admin_uniform.css'); ?>">
+<!-- Enlarges the page 25% on laptops/desktops for easier reading (loaded after the page styles) -->
+<link rel="stylesheet" href="assets/css/ui_scale.css?v=<?php echo (int)@filemtime(__DIR__ . '/assets/css/ui_scale.css'); ?>">
+
 </head>
 
 <body>
@@ -3024,9 +3007,7 @@ tr:hover td{
             <?php echo htmlspecialchars($systemName); ?>
         </div>
 
-        <div class="logo-subtitle">
-            Administrator
-        </div>
+        <div class="logo-subtitle"><?php echo secsysAdminSidebarSubtitleHtml(); ?></div>
 
     </div>
 
@@ -3069,6 +3050,11 @@ tr:hover td{
     <a href="report.php">
         <span class="nav-icon">📈</span>
         <span>Report</span>
+    </a>
+
+    <a href="backup.php">
+        <span class="nav-icon">💾</span>
+        <span>Backup &amp; Retrieve</span>
     </a>
 
     <a href="profile.php">
@@ -3122,7 +3108,7 @@ tr:hover td{
      STATISTICS
 ====================================================== -->
 
-<div class="stats-row">
+<div class="stats-row" id="liveGuardStats" data-live>
 
     <div class="stat-card">
 
@@ -3234,7 +3220,7 @@ tr:hover td{
      ACTIVE GUARDS
 ====================================================== -->
 
-<section class="table-card">
+<section class="table-card" id="liveGuardTable" data-live>
 
     <div class="table-header">
 
@@ -3576,7 +3562,7 @@ tr:hover td{
 
         </div>
 
-        <div class="table-card" style="box-shadow:none; margin:0;">
+        <div class="table-card" style="box-shadow:none; margin:0;" id="liveArchivedGuards" data-live>
 
             <div class="table-wrapper">
 
@@ -4103,21 +4089,6 @@ tr:hover td{
             </div>
 
 
-            <div class="form-group">
-
-                <label>
-                    Date Hired *
-                </label>
-
-                <input
-                    type="date"
-                    name="date_hired"
-                    id="edit_date_hired"
-                    required>
-
-            </div>
-
-
             <div class="form-group full">
 
                 <label>
@@ -4555,12 +4526,6 @@ function editGuard(guard)
 
 
     document.getElementById(
-        "edit_date_hired"
-    ).value =
-        guard.date_hired;
-
-
-    document.getElementById(
         "edit_shift_id"
     ).value =
         guard.shift_id;
@@ -4804,6 +4769,9 @@ setInterval(
 );
 
 </script>
+
+<script>window.AUTO_REFRESH_SECONDS = 5;</script>
+<script src="assets/js/auto_refresh.js?v=<?php echo (int)@filemtime(__DIR__ . '/assets/js/auto_refresh.js'); ?>"></script>
 
 </body>
 </html>

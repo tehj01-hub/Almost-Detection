@@ -1,6 +1,7 @@
 <?php
 
 require_once __DIR__ . '/app/session_helper.php';
+require_once __DIR__ . '/app/system_config.php';
 
 /* ===========================================================
    WHICH USER(S) ARE LOGGING OUT?
@@ -46,16 +47,9 @@ if ($wantGuard) {
        DATABASE CONNECTION
     ===================================================== */
 
-    $conn = new mysqli(
-        "localhost:3307",
-        "root",
-        "",
-        "security_system"
-    );
+    $conn = secsysConnectDb(true);
 
-    if (!$conn->connect_error && $role === "Security Guard") {
-
-        $conn->set_charset("utf8mb4");
+    if ($conn && !$conn->connect_error && $role === "Security Guard") {
 
 
         /* =================================================

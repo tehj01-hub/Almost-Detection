@@ -104,5 +104,23 @@ class CameraModeTests(unittest.TestCase):
         self.apply()
         self.detector.handle_detection(dict(normalized='ABC1234'),self.detector.channels['entrance'])
         self.assertEqual(self.logs,['IN','OUT'])
+    def test_inside_vehicle_is_not_scanned_on_entrance_and_outside_vehicle_is_not_scanned_on_exit(self):
+        self.cfg['camera_mode']='dual'
+        self.apply()
+        inside_plates={'INSIDE1'}
+        self.detector.can_scan_plate=lambda plate,direction,use_cache=True:(
+            (plate not in inside_plates) if direction=='IN' else ((plate in inside_plates) if direction=='OUT' else True)
+        )
+        # Vehicle already INSIDE must not be scanned on Entrance (IN)
+        self.assertFalse(self.detector.handle_detection(dict(normalized='INSIDE1'),self.detector.channels['entrance']))
+        # Vehicle already OUTSIDE must not be scanned on Exit (OUT)
+        self.assertFalse(self.detector.handle_detection(dict(normalized='OUTSIDE1'),self.detector.channels['exit']))
+        self.assertEqual(self.logs,[])
+        self.assertEqual(self.detector.recent_detections,[])
+        # Outside vehicle CAN be scanned on Entrance (IN)
+        self.assertTrue(self.detector.handle_detection(dict(normalized='OUTSIDE1'),self.detector.channels['entrance']))
+        # Inside vehicle CAN be scanned on Exit (OUT)
+        self.assertTrue(self.detector.handle_detection(dict(normalized='INSIDE1'),self.detector.channels['exit']))
+        self.assertEqual(self.logs,['IN','OUT'])
 
 if __name__=='__main__': unittest.main()

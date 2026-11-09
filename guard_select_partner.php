@@ -13,11 +13,7 @@ if (
     exit();
 }
 
-$conn = new mysqli("localhost:3307", "root", "", "security_system");
-if ($conn->connect_error) {
-    die("Database Connection Failed: " . $conn->connect_error);
-}
-$conn->set_charset("utf8mb4");
+$conn = secsysConnectDb();
 
 secsysEnsureSchema($conn);
 $systemName = secsysGetSystemName($conn);

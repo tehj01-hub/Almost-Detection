@@ -29,6 +29,7 @@
         ".modal.show",
         ".modal.active",
         ".modal-overlay.open",
+        ".audit-modal-backdrop.open",
         ".tapo-modal-overlay.active",
         ".notif-drawer.open",
         ".visitor-modal-overlay.active",
@@ -39,60 +40,9 @@
     ].join(",");
 
     var isFetching = false;
-    var indicator = null;
 
-
-    /* ---------------------------------------------------------
-       UI: small "Live" indicator in the bottom-left corner
-    --------------------------------------------------------- */
-
-    function createIndicator() {
-
-        indicator = document.createElement("div");
-        indicator.id = "liveRefreshIndicator";
-        indicator.style.cssText = [
-            "position:fixed",
-            "left:12px",
-            "bottom:12px",
-            "z-index:9998",
-            "background:rgba(17,24,39,0.82)",
-            "color:#fff",
-            "font:600 11px/1 Arial, sans-serif",
-            "padding:6px 10px",
-            "border-radius:12px",
-            "display:flex",
-            "align-items:center",
-            "gap:6px",
-            "pointer-events:none",
-            "box-shadow:0 2px 6px rgba(0,0,0,0.2)"
-        ].join(";");
-
-        indicator.innerHTML =
-            '<span id="liveRefreshDot" style="width:7px;height:7px;' +
-            'border-radius:50%;background:#22c55e;display:inline-block;"></span>' +
-            '<span id="liveRefreshText">Live</span>';
-
-        document.body.appendChild(indicator);
-    }
-
-    function setIndicator(text, color) {
-
-        if (!indicator) {
-            return;
-        }
-
-        document.getElementById("liveRefreshText").textContent = text;
-        document.getElementById("liveRefreshDot").style.background = color;
-    }
-
-    function timeNow() {
-
-        return new Date().toLocaleTimeString([], {
-            hour: "2-digit",
-            minute: "2-digit",
-            second: "2-digit"
-        });
-    }
+    /* (The bottom-left "Live · time" indicator was removed on request;
+       the background refresh below keeps running silently.) */
 
 
     /* ---------------------------------------------------------
@@ -246,11 +196,9 @@
                 updateChart();
                 document.dispatchEvent(new CustomEvent("live:updated"));
             }
-
-            setIndicator("Live \u00b7 " + timeNow(), "#22c55e");
         })
         .catch(function () {
-            setIndicator("Reconnecting\u2026", "#f59e0b");
+            /* Network hiccup: try again on the next interval. */
         })
         .then(function () {
             isFetching = false;
@@ -263,9 +211,6 @@
     --------------------------------------------------------- */
 
     function start() {
-
-        createIndicator();
-        setIndicator("Live \u00b7 " + timeNow(), "#22c55e");
 
         setInterval(refresh, INTERVAL_MS);
 

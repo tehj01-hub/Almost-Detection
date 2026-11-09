@@ -22,6 +22,7 @@ from .preprocessing import PlatePreprocessor, CropQualityMetrics
 from .ctc_decoder import CTCDecoder, DecodedPlateResult, CandidatePrediction
 from .ph_plate_validator import PhilippinePlateValidator, ValidationDecision
 from .recognizer import LPRNetRecognizer, RecognitionOutput
+from .gpu_char_extractor import GPUCharacterExtractor
 from .gpt_vision_reader import GPTVisionReader
 from .quad_ensemble import QuadReaderEnsemble, QuadEnsembleResult, TripleReaderEnsemble, TripleEnsembleResult
 
@@ -48,6 +49,7 @@ __all__ = [
     "ValidationDecision",
     "LPRNetRecognizer",
     "RecognitionOutput",
+    "GPUCharacterExtractor",
     "GPTVisionReader",
     "QuadReaderEnsemble",
     "QuadEnsembleResult",
