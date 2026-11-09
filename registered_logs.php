@@ -716,7 +716,7 @@ tbody tr:last-child td { border-bottom: none; }
 .checkbox-col { width: 38px; text-align: center; }
 .checkbox-custom { width: 15px; height: 15px; cursor: pointer; accent-color: #2f80ed; }
 .status-badge { display: inline-flex; align-items: center; justify-content: center; margin: 0 auto; padding: 3px 10px; border-radius: 14px; font-size: 11px; font-weight: 600; }
-.status-inside { background: #e7f7ed; color: #16733b; border: 1px solid #bde5ca; }
+.status-inside { background: #fef9c3; color: #854d0e; border: 1px solid #facc15; font-weight: 700; }
 .status-outside { background: #edf5ff; color: #245b9e; border: 1px solid #c9ddf7; }
 .empty-cell { text-align: center; padding: 36px 12px; color: #888; font-size: 13px; }
 

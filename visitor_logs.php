@@ -725,7 +725,7 @@ tbody td.purpose-cell { white-space: normal; min-width: 130px; max-width: 220px;
 .checkbox-col { width: 38px; text-align: center; }
 .checkbox-custom { width: 15px; height: 15px; cursor: pointer; accent-color: #2f80ed; }
 .status-badge { display: inline-flex; align-items: center; justify-content: center; margin: 0 auto; padding: 3px 10px; border-radius: 14px; font-size: 11px; font-weight: 600; }
-.status-inside { background: #dcfce7; color: #15803d; border: 1px solid #86efac; font-weight: 700; }
+.status-inside { background: #fef9c3; color: #854d0e; border: 1px solid #facc15; font-weight: 700; }
 .status-outside { background: #fee2e2; color: #b91c1c; border: 1px solid #fca5a5; font-weight: 700; }
 .empty-cell { text-align: center; padding: 36px 12px; color: #888; font-size: 13px; }
 

@@ -876,6 +876,28 @@ function secsysGetSetting(mysqli $conn, string $key, string $default = ''): stri
 }
 
 /**
+ * SQL column "still_inside" (1/0) for a vehicle_logs row aliased $alias:
+ * 1 when it is an entry (IN) whose vehicle has not left yet, i.e. its visit
+ * has no time out and no later exit (OUT) was logged for the same plate.
+ * Dashboards show these rows in yellow ("INSIDE").
+ */
+function secsysStillInsideSql(string $alias = 'vl'): string
+{
+    $a = preg_replace('/[^A-Za-z0-9_]/', '', $alias);
+    return "CASE WHEN {$a}.direction = 'IN'
+            AND NOT EXISTS (
+                SELECT 1 FROM vehicle_log_dates si_d
+                WHERE si_d.vehicle_log_id = {$a}.id AND si_d.time_out IS NOT NULL
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM vehicle_logs si_o
+                WHERE si_o.direction = 'OUT' AND si_o.id > {$a}.id
+                  AND REPLACE(UPPER(si_o.plate_number), ' ', '') = REPLACE(UPPER({$a}.plate_number), ' ', '')
+            )
+        THEN 1 ELSE 0 END AS still_inside";
+}
+
+/**
  * This PC's address on the network, so other devices (guard PCs, phones)
  * know what to type. Found from the connection the PC uses to reach the
  * internet, so it stays correct when the router hands out a new IP.

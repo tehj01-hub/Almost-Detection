@@ -921,6 +921,7 @@ if (isset($_GET['download']) && $_GET['download'] === 'pdf') {
             table.data-table td { font-size: 9px; padding: 5px 6px; border: 1px solid #dcdcdc; vertical-align: top; }
             table.data-table tr:nth-child(even) { background: #f8fafc; }
             .badge-in { color: #16733b; font-weight: bold; }
+            .badge-inside { color: #a16207; background: #fef9c3; font-weight: bold; }
             .badge-out { color: #245b9e; font-weight: bold; }
         </style>
     </head>
@@ -1029,7 +1030,7 @@ if (isset($_GET['download']) && $_GET['download'] === 'pdf') {
     } else {
         $idx = 1;
         foreach ($allCombinedSessions as $row) {
-            $stClass = ($row['status'] === 'Inside') ? 'badge-in' : 'badge-out';
+            $stClass = ($row['status'] === 'Inside') ? 'badge-inside' : 'badge-out';
             $archDateStr = !empty($row['archived_at']) ? formatDateTime($row['archived_at']) : 'Active Log';
             $pKey = strtoupper(trim((string)($row['plate_number'] ?? '')));
             $pIn  = (int)($perPlateReportStats[$pKey]['in_count'] ?? (!empty($row['time_in']) ? 1 : 0));
@@ -1469,7 +1470,7 @@ tbody tr:hover { background: #fbfdff; }
     font-size: 11px;
     font-weight: 600;
 }
-.status-inside { background: #e7f7ed; color: #16733b; border: 1px solid #bde5ca; }
+.status-inside { background: #fef9c3; color: #854d0e; border: 1px solid #facc15; font-weight: 700; }
 .status-outside { background: #edf5ff; color: #245b9e; border: 1px solid #c9ddf7; }
 .status-online { background: #dcfce7; color: #15803d; border: 1px solid #86efac; }
 .status-offline { background: #f1f5f9; color: #475569; border: 1px solid #cbd5e1; }
@@ -1706,7 +1707,7 @@ tbody tr:hover { background: #fbfdff; }
         <div class="summary-card">
             <div class="summary-label">Inside vs Outside Status</div>
             <div class="summary-value" style="font-size:22px;">
-                <span style="color:#16733b;"><?php echo $insideCount; ?> Inside</span>
+                <span style="color:#a16207;"><?php echo $insideCount; ?> Inside</span>
                 <span style="color:#94a3b8; font-weight:400;">/</span>
                 <span style="color:#245b9e;"><?php echo $outsideCount; ?> Outside</span>
             </div>

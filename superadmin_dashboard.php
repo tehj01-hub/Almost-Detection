@@ -557,7 +557,8 @@ $stmtRecentVis = $conn->prepare("
         COALESCE(NULLIF(vl.purpose, ''), vv.purpose, '') AS purpose,
         COALESCE(NULLIF(vl.visitor_name, ''), vv.visitor_name, '') AS visitor_name,
         vl.direction,
-        vl.date_created
+        vl.date_created,
+        " . secsysStillInsideSql('vl') . "
     FROM vehicle_logs vl
     LEFT JOIN visitor_vehicles vv
         ON vl.visitor_vehicle_id = vv.id
@@ -582,7 +583,8 @@ $stmtRecentReg = $conn->prepare("
         vl.plate_number,
         vl.vehicle_type,
         vl.direction,
-        vl.date_created
+        vl.date_created,
+        " . secsysStillInsideSql('vl') . "
     FROM vehicle_logs vl
     WHERE DATE(vl.date_created) = ?
       AND LOWER(TRIM(vl.vehicle_category)) = 'registered'
@@ -2252,6 +2254,13 @@ body {
     color: #15803d !important;
     border: 1px solid #86efac !important;
 }
+/* Vehicle still INSIDE the subdivision: yellow (entered, not yet exited) */
+.dir-badge-inside {
+    background: #fef9c3 !important;
+    color: #854d0e !important;
+    border: 1px solid #facc15 !important;
+}
+
 
 .admin-activity .dir-badge-out {
     background: #fee2e2 !important;
@@ -2312,19 +2321,19 @@ body {
 }
 
 .admin-activity .vehicle-item.row-in {
-    background: #dcfce7 !important;
-    border: 1px solid #86efac !important;
-    border-left: 5px solid #16a34a !important;
+    background: #fef9c3 !important;
+    border: 1px solid #fde047 !important;
+    border-left: 5px solid #eab308 !important;
 }
 
 .admin-activity .vehicle-item.row-in:hover {
-    background: #bbf7d0 !important;
+    background: #fef08a !important;
     transform: translateY(-1px);
-    box-shadow: 0 3px 8px rgba(22, 163, 74, 0.18);
+    box-shadow: 0 3px 8px rgba(202, 138, 4, 0.20);
 }
 
 .admin-activity .vehicle-item.row-in .plate-text {
-    color: #064e3b !important;
+    color: #713f12 !important;
 }
 
 .admin-activity .vehicle-item.row-out {
@@ -2343,7 +2352,18 @@ body {
     color: #881337 !important;
 }
 
-.admin-activity .vehicle-item:not(.row-in):not(.row-out) {
+/* Entered, already left: green */
+.admin-activity .vehicle-item.row-entered {
+    background: #dcfce7 !important;
+    border: 1px solid #86efac !important;
+    border-left: 5px solid #16a34a !important;
+}
+
+.admin-activity .vehicle-item.row-entered .plate-text {
+    color: #064e3b !important;
+}
+
+.admin-activity .vehicle-item:not(.row-in):not(.row-out):not(.row-entered) {
     background: #e2e8f0;
     border: 1px solid #cbd5e1;
     border-left: 5px solid #64748b;
@@ -2719,17 +2739,18 @@ body {
                         $vType    = secsysNormalizeVehicleType(trim((string)($vehicle['vehicle_type'] ?? 'Car')));
                         $vPurpose = trim((string)($vehicle['purpose'] ?? ''));
                         $isOutVis = strtoupper(trim((string)($vehicle['direction'] ?? 'IN'))) === 'OUT';
+                        $isInsideVis = !$isOutVis && !empty($vehicle['still_inside']);
                         $vTime    = !empty($vehicle['date_created']) ? date('h:i A', strtotime($vehicle['date_created'])) : '';
                     ?>
-                        <div class="vehicle-item <?php echo $isOutVis ? 'row-out' : 'row-in'; ?>">
+                        <div class="vehicle-item <?php echo $isOutVis ? 'row-out' : ($isInsideVis ? 'row-in' : 'row-entered'); ?>">
                             <div class="vehicle-info">
                                 <div class="vehicle-plate">
                                     <span class="plate-text"><?php echo htmlspecialchars($vPlate); ?></span>
                                 </div>
                                 <div class="vehicle-direction">
                                     <span class="type-text"><?php echo htmlspecialchars($vType); ?></span>
-                                    <span class="dir-badge <?php echo $isOutVis ? 'dir-badge-out' : 'dir-badge-in'; ?>">
-                                        <?php echo $isOutVis ? '🔴 OUT' : '🟢 IN'; ?>
+                                    <span class="dir-badge <?php echo $isOutVis ? 'dir-badge-out' : ($isInsideVis ? 'dir-badge-inside' : 'dir-badge-in'); ?>">
+                                        <?php echo $isOutVis ? '🔴 OUT' : ($isInsideVis ? '🟡 INSIDE' : '🟢 IN'); ?>
                                     </span>
                                 </div>
                             </div>
@@ -2761,9 +2782,10 @@ body {
                         $rPlate   = trim((string)($vehicle['plate_number'] ?? ''));
                         $rType    = trim((string)($vehicle['vehicle_type'] ?? ''));
                         $isOutReg = strtoupper(trim((string)($vehicle['direction'] ?? 'IN'))) === 'OUT';
+                        $isInsideReg = !$isOutReg && !empty($vehicle['still_inside']);
                         $rTime    = !empty($vehicle['date_created']) ? date('h:i A', strtotime($vehicle['date_created'])) : '';
                     ?>
-                        <div class="vehicle-item <?php echo $isOutReg ? 'row-out' : 'row-in'; ?>">
+                        <div class="vehicle-item <?php echo $isOutReg ? 'row-out' : ($isInsideReg ? 'row-in' : 'row-entered'); ?>">
                             <div class="vehicle-info">
                                 <div class="vehicle-plate">
                                     <span class="plate-text"><?php echo htmlspecialchars($rPlate); ?></span>
@@ -2772,8 +2794,8 @@ body {
                                     <?php if ($rType !== '' && strtolower($rType) !== 'unknown'): ?>
                                         <span class="type-text"><?php echo htmlspecialchars($rType); ?></span>
                                     <?php endif; ?>
-                                    <span class="dir-badge <?php echo $isOutReg ? 'dir-badge-out' : 'dir-badge-in'; ?>">
-                                        <?php echo $isOutReg ? '🔴 OUT' : '🟢 IN'; ?>
+                                    <span class="dir-badge <?php echo $isOutReg ? 'dir-badge-out' : ($isInsideReg ? 'dir-badge-inside' : 'dir-badge-in'); ?>">
+                                        <?php echo $isOutReg ? '🔴 OUT' : ($isInsideReg ? '🟡 INSIDE' : '🟢 IN'); ?>
                                     </span>
                                 </div>
                             </div>

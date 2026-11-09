@@ -67,7 +67,8 @@ $activityTimeColumns = "
             ), vl.date_created),
             '%l:%i %p'
         ) END AS time_in_label,
-        CASE WHEN vl.direction = 'OUT' THEN DATE_FORMAT(vl.date_created, '%l:%i %p') END AS time_out_label
+        CASE WHEN vl.direction = 'OUT' THEN DATE_FORMAT(vl.date_created, '%l:%i %p') END AS time_out_label,
+        " . secsysStillInsideSql('vl') . "
 ";
 
 /** Time shown on an activity row: "In 6:34 AM" on IN rows, "Out 6:35 AM" on OUT rows. */
@@ -2618,6 +2619,13 @@ body {
     color: #15803d !important;
     border: 1px solid #86efac !important;
 }
+/* Vehicle still INSIDE the subdivision: yellow (entered, not yet exited) */
+.dir-badge-inside {
+    background: #fef9c3 !important;
+    color: #854d0e !important;
+    border: 1px solid #facc15 !important;
+}
+
 .dir-badge-out {
     background: #fee2e2 !important;
     color: #b91c1c !important;
@@ -2822,19 +2830,19 @@ body {
 
 /* VEHICLES ENTERING (IN): Entire row is soft emerald green with bold green accent bar */
 .vehicle-item.row-in {
-    background: #dcfce7 !important;
-    border: 1px solid #86efac !important;
-    border-left: 5px solid #16a34a !important;
+    background: #fef9c3 !important;
+    border: 1px solid #fde047 !important;
+    border-left: 5px solid #eab308 !important;
 }
 
 .vehicle-item.row-in:hover {
-    background: #bbf7d0 !important;
+    background: #fef08a !important;
     transform: translateY(-1px);
-    box-shadow: 0 3px 8px rgba(22, 163, 74, 0.18);
+    box-shadow: 0 3px 8px rgba(202, 138, 4, 0.20);
 }
 
 .vehicle-item.row-in .plate-text {
-    color: #064e3b !important;
+    color: #713f12 !important;
 }
 
 /* VEHICLES EXITING (OUT): Entire row is soft crimson/rose red with bold red accent bar */
@@ -2855,7 +2863,24 @@ body {
 }
 
 /* Fallback if no direction class */
-.vehicle-item:not(.row-in):not(.row-out) {
+/* ENTERED, ALREADY LEFT: green (entry of a vehicle that is no longer inside) */
+.vehicle-item.row-entered {
+    background: #dcfce7 !important;
+    border: 1px solid #86efac !important;
+    border-left: 5px solid #16a34a !important;
+}
+
+.vehicle-item.row-entered:hover {
+    background: #bbf7d0 !important;
+    transform: translateY(-1px);
+    box-shadow: 0 3px 8px rgba(22, 163, 74, 0.18);
+}
+
+.vehicle-item.row-entered .plate-text {
+    color: #064e3b !important;
+}
+
+.vehicle-item:not(.row-in):not(.row-out):not(.row-entered) {
     background: #e2e8f0;
     border: 1px solid #cbd5e1;
     border-left: 5px solid #64748b;
@@ -4254,9 +4279,10 @@ body {
 
                         <?php
                         $isOutVis = (strtoupper($vDir) === 'OUT');
+                        $isInsideVis = !$isOutVis && !empty($vehicle['still_inside']);
                         ?>
                         <div
-                            class="vehicle-item <?php echo $isOutVis ? 'row-out visitor-item-out' : 'row-in visitor-item-row'; ?>"
+                            class="vehicle-item <?php echo $isOutVis ? 'row-out visitor-item-out' : (($isInsideVis ? 'row-in' : 'row-entered') . ' visitor-item-row'); ?>"
                             data-log-id="<?php echo $vLogId; ?>"
                             data-direction="<?php echo $vDir; ?>"
                             data-plate="<?php echo htmlspecialchars($vPlate, ENT_QUOTES); ?>"
@@ -4283,8 +4309,8 @@ body {
 
                                 <div class="vehicle-direction">
                                     <span class="type-text"><?php echo htmlspecialchars($vType); ?></span>
-                                    <span class="dir-badge <?php echo $isOutVis ? 'dir-badge-out' : 'dir-badge-in'; ?>">
-                                        <?php echo $isOutVis ? '🔴 OUT' : '🟢 IN'; ?>
+                                    <span class="dir-badge <?php echo $isOutVis ? 'dir-badge-out' : ($isInsideVis ? 'dir-badge-inside' : 'dir-badge-in'); ?>">
+                                        <?php echo $isOutVis ? '🔴 OUT' : ($isInsideVis ? '🟡 INSIDE' : '🟢 IN'); ?>
                                     </span>
                                 </div>
 
@@ -4362,9 +4388,10 @@ body {
 
                         <?php
                         $isOutReg = (strtoupper($rDir) === 'OUT');
+                        $isInsideReg = !$isOutReg && !empty($vehicle['still_inside']);
                         ?>
                         <div
-                            class="vehicle-item <?php echo $isOutReg ? 'row-out' : 'row-in'; ?>"
+                            class="vehicle-item <?php echo $isOutReg ? 'row-out' : ($isInsideReg ? 'row-in' : 'row-entered'); ?>"
                             data-log-id="<?php echo $rLogId; ?>"
                             data-direction="<?php echo $rDir; ?>"
                             data-plate="<?php echo htmlspecialchars($rPlate, ENT_QUOTES); ?>"
@@ -4380,8 +4407,8 @@ body {
                                     <?php if ($rType !== '' && strtolower($rType) !== 'unknown'): ?>
                                         <span class="type-text"><?php echo htmlspecialchars($rType); ?></span>
                                     <?php endif; ?>
-                                    <span class="dir-badge <?php echo $isOutReg ? 'dir-badge-out' : 'dir-badge-in'; ?>">
-                                        <?php echo $isOutReg ? '🔴 OUT' : '🟢 IN'; ?>
+                                    <span class="dir-badge <?php echo $isOutReg ? 'dir-badge-out' : ($isInsideReg ? 'dir-badge-inside' : 'dir-badge-in'); ?>">
+                                        <?php echo $isOutReg ? '🔴 OUT' : ($isInsideReg ? '🟡 INSIDE' : '🟢 IN'); ?>
                                     </span>
                                 </div>
 
@@ -5876,6 +5903,12 @@ function stackVehicleItem(logData) {
     }
 
     const isOut = direction === "OUT";
+    // Yellow INSIDE while the vehicle has not left; green IN for an entry whose vehicle already left
+    const isInside = !isOut && (logData.still_inside === undefined || logData.still_inside === null || Number(logData.still_inside) === 1);
+    const inBadgeHtml = isInside
+        ? '<span class="dir-badge dir-badge-inside">🟡 INSIDE</span>'
+        : '<span class="dir-badge dir-badge-in">🟢 IN</span>';
+    const inRowClass = isInside ? "row-in" : "row-entered";
 
     if (existingItem) {
         existingItem.setAttribute("data-plate", plate);
@@ -5888,8 +5921,8 @@ function stackVehicleItem(logData) {
         if (logData.id_number) existingItem.setAttribute("data-id-number", logData.id_number);
 
         // Update entire row color based on IN vs OUT
-        existingItem.classList.remove("row-in", "row-out");
-        existingItem.classList.add(isOut ? "row-out" : "row-in");
+        existingItem.classList.remove("row-in", "row-out", "row-entered");
+        existingItem.classList.add(isOut ? "row-out" : inRowClass);
 
         const plateSpan = existingItem.querySelector(".plate-text");
         if (plateSpan) {
@@ -5900,7 +5933,7 @@ function stackVehicleItem(logData) {
         if (subContainer) {
             const dirHtml = isOut
                 ? '<span class="dir-badge dir-badge-out">🔴 OUT</span>'
-                : '<span class="dir-badge dir-badge-in">🟢 IN</span>';
+                : inBadgeHtml;
             const typeStr = isVisitor
                 ? escapeHtmlText(vType)
                 : ((rawType && rawType.toLowerCase() !== "unknown") ? escapeHtmlText(rawType) : "");
@@ -5965,7 +5998,7 @@ function stackVehicleItem(logData) {
 
     // Build new item element and prepend to top of stack
     const itemDiv = document.createElement("div");
-    const rowColorClass = isOut ? "row-out" : "row-in";
+    const rowColorClass = isOut ? "row-out" : inRowClass;
     itemDiv.className = isVisitor
         ? ("vehicle-item " + rowColorClass + (isOut ? " visitor-item-out" : " visitor-item-row"))
         : ("vehicle-item " + rowColorClass);
@@ -6010,7 +6043,7 @@ function stackVehicleItem(logData) {
                 '<div class="vehicle-plate"><span class="plate-text">' + clickablePlateLink + '</span></div>' +
                 '<div class="vehicle-direction">' +
                     '<span class="type-text">' + escapeHtmlText(vType) + '</span> ' +
-                    (isOut ? '<span class="dir-badge dir-badge-out">🔴 OUT</span>' : '<span class="dir-badge dir-badge-in">🟢 IN</span>') +
+                    (isOut ? '<span class="dir-badge dir-badge-out">🔴 OUT</span>' : inBadgeHtml) +
                 '</div>' +
             '</div>' +
             '<div class="vehicle-badges">' +
@@ -6026,7 +6059,7 @@ function stackVehicleItem(logData) {
                 '<div class="vehicle-plate"><span class="plate-text">' + clickablePlateLink + '</span></div>' +
                 '<div class="vehicle-direction">' +
                     ((rawType && rawType.toLowerCase() !== "unknown") ? '<span class="type-text">' + escapeHtmlText(rawType) + '</span> ' : '') +
-                    (isOut ? '<span class="dir-badge dir-badge-out">🔴 OUT</span>' : '<span class="dir-badge dir-badge-in">🟢 IN</span>') +
+                    (isOut ? '<span class="dir-badge dir-badge-out">🔴 OUT</span>' : inBadgeHtml) +
                 '</div>' +
             '</div>' +
             '<div class="vehicle-badges">' +
