@@ -967,23 +967,29 @@ function secsysNetworkAccessInfo(): ?array
 function secsysNetworkAccessHtml(bool $compact = false): string
 {
     $info = secsysNetworkAccessInfo();
-    if ($info === null) {
+    if ($info === null && !$compact) {
         return '';
     }
-    $url = htmlspecialchars($info['url'], ENT_QUOTES, 'UTF-8');
-    $copy = '<button type="button" onclick="(function(b){var t=' . htmlspecialchars(json_encode($info['url']), ENT_QUOTES, 'UTF-8') . ';'
+    $rawUrl = $info['url'] ?? '';
+    $url = htmlspecialchars($rawUrl, ENT_QUOTES, 'UTF-8');
+    // Copy reads the current address from the chip (it can change live)
+    $copy = '<button type="button" class="net-chip-copy" onclick="(function(b){var c=b.closest(\'[data-url]\');var t=c?c.getAttribute(\'data-url\'):\'\';if(!t){return;}'
         . 'var done=function(){b.textContent=\'Copied!\';setTimeout(function(){b.textContent=\'Copy\';},1500);};'
         . 'if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(t).then(done);}'
         . 'else{var a=document.createElement(\'textarea\');a.value=t;document.body.appendChild(a);a.select();document.execCommand(\'copy\');a.remove();done();}'
-        . '})(this)" style="border:1px solid #93c5fd; background:#fff; color:#1d4ed8; border-radius:999px; padding:2px 10px; font-size:12px; font-weight:600; cursor:pointer; width:auto; height:auto; margin:0;">Copy</button>';
+        . '})(this)" style="border:1px solid #93c5fd; background:#fff; color:#1d4ed8; border-radius:999px; padding:2px 10px; font-size:12px; font-weight:600; cursor:pointer; width:auto; height:auto; margin:0;' . ($rawUrl === '' ? ' display:none;' : '') . '">Copy</button>';
 
     if ($compact) {
-        return '<span title="Type this address in a browser on another device connected to the same Wi-Fi/network"'
+        // data-network-chip: the admin dashboard re-checks the address and updates this chip live
+        return '<span class="net-chip" data-network-chip data-url="' . $url . '"'
+            . ' title="Type this address in a browser on another device connected to the same Wi-Fi/network. It updates by itself when this PC joins another network."'
             . ' style="display:inline-flex; align-items:center; gap:6px; background:#eff6ff; border:1px solid #bfdbfe; color:#1e3a8a;'
-            . ' border-radius:999px; padding:3px 4px 3px 10px; font-size:12px; font-weight:600;">'
-            . '&#127760; Network address: <a href="' . $url . '" style="color:#1d4ed8;">' . $url . '</a> ' . $copy . '</span>';
+            . ' border-radius:999px; padding:3px 4px 3px 10px; font-size:12px; font-weight:600; transition:background 0.3s, border-color 0.3s;">'
+            . '&#127760; <span class="net-chip-label">' . ($rawUrl !== '' ? 'Network address:' : 'Not connected to a network') . '</span> '
+            . '<a class="net-chip-url" href="' . $url . '" style="color:#1d4ed8;' . ($rawUrl === '' ? ' display:none;' : '') . '">' . $url . '</a> '
+            . $copy . '</span>';
     }
-    return '<div style="margin-top:16px; padding:10px 12px; background:#eff6ff; border:1px solid #bfdbfe; border-radius:12px; font-size:13px; color:#1e3a8a; text-align:center;">'
+    return '<div data-url="' . $url . '" style="margin-top:16px; padding:10px 12px; background:#eff6ff; border:1px solid #bfdbfe; border-radius:12px; font-size:13px; color:#1e3a8a; text-align:center;">'
         . '&#127760; To open this system on another device on the same Wi-Fi/network, go to:<br>'
         . '<a href="' . $url . '" style="font-weight:700; color:#1d4ed8; font-size:15px;">' . $url . '</a> ' . $copy
         . '</div>';
